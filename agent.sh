@@ -2,11 +2,12 @@
 set -euo pipefail
 
 # ── Customize this ────────────────────────────────────────────────────────────
-AGENT_CMD=(pi)
+AGENT_CMD=(pi -c)
 
 # Additional dirs outside the project the agent may write to.
 WRITABLE_DIRS=(
     "$HOME/.pi"
+    "$HOME/.cargo"
 )
 
 # Credential/auth dirs to hide from the agent.
