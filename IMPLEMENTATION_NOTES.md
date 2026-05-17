@@ -60,6 +60,32 @@ with decisions, deviations, bugs, and verification commands.
 - `rebuild_index()` extension check: `{id}.meta.json` has extension `.json`, not `.meta`.
   Fixed to check `fname.ends_with(".meta.json")`
 
-**Verification:** `cargo test --workspace` — 8 tests pass (config: 2, logging: 1, store: 5)
+**Verification:** `cargo test --workspace` — 9 tests pass (config: 3, logging: 1, store: 5)
+
+---
+
+## Step 3 — Provider (LLM API client)
+
+- [x] ✅ Done
+
+**Created:**
+- `agent-core/src/provider.rs`:
+  - `Provider` struct (base_url, api_key, model)
+  - `stream_chat()` — streaming POST to `/v1/chat/completions`, returns `ChatStream`
+  - `chat()` — non-streaming chat returning `ChatResponse`
+  - `generate_continuation_brief()` — summarization via separate LLM call
+  - `serialize_message()` — converts `Message` → OpenAI API JSON format
+  - `build_body()` — constructs request body with streaming options
+- Wire `pub mod provider` in `lib.rs` in `lib.rs`
+- Enabled `features = [\"json\"]` on ureq dependency
+
+**Deviations from PLAN.md:**
+- ureq 3 uses `.header()` not `.send_json()` returns errors as `ureq::Error::StatusCode` for non-2xx
+- `generate_continuation_brief()` includes fallback text when LLM returns empty brief
+
+**Bugs fixed:**
+- ureq `json` feature not in defaults — had to add `features = [\"json\"]`
+
+**Verification:** `cargo test --workspace` — 14 tests pass (5 new provider tests)
 
 ---
