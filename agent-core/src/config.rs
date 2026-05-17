@@ -84,8 +84,9 @@ pub fn load_config() -> Config {
     let config_path = agent_dir().join("config.toml");
     if let Ok(content) = std::fs::read_to_string(&config_path) {
         if !content.trim().is_empty() {
-            let parsed = parse_toml(&content);
-            apply_toml(&mut cfg, &parsed);
+            if let Ok(table) = content.parse::<toml::Table>() {
+                apply_toml(&mut cfg, &table);
+            }
         }
     }
 
@@ -122,124 +123,70 @@ pub fn agent_dir() -> PathBuf {
     PathBuf::from(home).join(".agent")
 }
 
-// ── TOML parsing (minimal, no toml crate dependency) ──
-//
-// We parse the TOML the config manually to avoid pulling in the `toml` crate.
-// The format is a subset of TOML: `[section]\nkey = "value"\nkey = 123`.
-// This is enough for our config file. If more complex TOML is needed later,
-// swap to the `toml` crate.
+// ── TOML parsing via toml crate ──
 
-type TomlTable = std::collections::HashMap<String, TomlSection>;
-type TomlSection = std::collections::HashMap<String, TomlValue>;
+fn apply_toml(cfg: &mut Config, table: &toml::Table) {
+    use toml::Value;
 
-#[derive(Debug)]
-enum TomlValue {
-    String(String),
-    Integer(i64),
-    Bool(bool),
-}
-
-fn parse_toml(content: &str) -> TomlTable {
-    let mut table = TomlTable::new();
-    let mut current_section: Option<String> = None;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            let section = line.trim_matches('[').trim_matches(']').trim().to_string();
-            table.entry(section.clone()).or_default();
-            current_section = Some(section);
-            continue;
-        }
-        if let Some(eq_pos) = line.find('=') {
-            let key = line[..eq_pos].trim().to_string();
-            let raw_val = line[eq_pos + 1..].trim();
-
-            let value = if raw_val.starts_with('"') && raw_val.ends_with('"') {
-                TomlValue::String(raw_val[1..raw_val.len() - 1].to_string())
-            } else if raw_val == "true" {
-                TomlValue::Bool(true)
-            } else if raw_val == "false" {
-                TomlValue::Bool(false)
-            } else if let Ok(n) = raw_val.parse::<i64>() {
-                TomlValue::Integer(n)
-            } else {
-                // Fallback: treat as string without quotes
-                TomlValue::String(raw_val.to_string())
-            };
-
-            if let Some(section) = &current_section {
-                table.entry(section.clone()).or_default().insert(key, value);
-            }
-        }
-    }
-
-    table
-}
-
-fn apply_toml(cfg: &mut Config, table: &TomlTable) {
     // [server]
-    if let Some(section) = table.get("server") {
-        if let Some(TomlValue::String(v)) = section.get("host") {
-            cfg.server.host = v.clone();
+    if let Some(Value::Table(section)) = table.get("server") {
+        if let Some(v) = section.get("host").and_then(|v| v.as_str()) {
+            cfg.server.host = v.to_string();
         }
-        if let Some(TomlValue::Integer(v)) = section.get("port") {
-            cfg.server.port = *v as u16;
+        if let Some(v) = section.get("port").and_then(|v| v.as_integer()) {
+            cfg.server.port = v as u16;
         }
     }
 
     // [provider]
-    if let Some(section) = table.get("provider") {
-        if let Some(TomlValue::String(v)) = section.get("base_url") {
-            cfg.provider.base_url = v.clone();
+    if let Some(Value::Table(section)) = table.get("provider") {
+        if let Some(v) = section.get("base_url").and_then(|v| v.as_str()) {
+            cfg.provider.base_url = v.to_string();
         }
-        if let Some(TomlValue::String(v)) = section.get("api_key") {
-            cfg.provider.api_key = v.clone();
+        if let Some(v) = section.get("api_key").and_then(|v| v.as_str()) {
+            cfg.provider.api_key = v.to_string();
         }
-        if let Some(TomlValue::String(v)) = section.get("model") {
-            cfg.provider.model = v.clone();
+        if let Some(v) = section.get("model").and_then(|v| v.as_str()) {
+            cfg.provider.model = v.to_string();
         }
     }
 
     // [summary]
-    if let Some(section) = table.get("summary") {
-        if let Some(TomlValue::String(v)) = section.get("model") {
-            cfg.summary.model = v.clone();
+    if let Some(Value::Table(section)) = table.get("summary") {
+        if let Some(v) = section.get("model").and_then(|v| v.as_str()) {
+            cfg.summary.model = v.to_string();
         }
-        if let Some(TomlValue::String(v)) = section.get("base_url") {
-            cfg.summary.base_url = v.clone();
+        if let Some(v) = section.get("base_url").and_then(|v| v.as_str()) {
+            cfg.summary.base_url = v.to_string();
         }
-        if let Some(TomlValue::String(v)) = section.get("api_key") {
-            cfg.summary.api_key = v.clone();
+        if let Some(v) = section.get("api_key").and_then(|v| v.as_str()) {
+            cfg.summary.api_key = v.to_string();
         }
     }
 
     // [session]
-    if let Some(section) = table.get("session") {
-        if let Some(TomlValue::Integer(v)) = section.get("soft_cap_pct") {
-            cfg.session.soft_cap_pct = *v as u8;
+    if let Some(Value::Table(section)) = table.get("session") {
+        if let Some(v) = section.get("soft_cap_pct").and_then(|v| v.as_integer()) {
+            cfg.session.soft_cap_pct = v as u8;
         }
-        if let Some(TomlValue::Integer(v)) = section.get("hard_cap_pct") {
-            cfg.session.hard_cap_pct = *v as u8;
+        if let Some(v) = section.get("hard_cap_pct").and_then(|v| v.as_integer()) {
+            cfg.session.hard_cap_pct = v as u8;
         }
-        if let Some(TomlValue::Integer(v)) = section.get("max_tool_calls_per_turn") {
-            cfg.session.max_tool_calls_per_turn = *v as usize;
+        if let Some(v) = section.get("max_tool_calls_per_turn").and_then(|v| v.as_integer()) {
+            cfg.session.max_tool_calls_per_turn = v as usize;
         }
     }
 
     // [logging]
-    if let Some(section) = table.get("logging") {
-        if let Some(TomlValue::String(v)) = section.get("level") {
-            cfg.logging.level = v.clone();
+    if let Some(Value::Table(section)) = table.get("logging") {
+        if let Some(v) = section.get("level").and_then(|v| v.as_str()) {
+            cfg.logging.level = v.to_string();
         }
-        if let Some(TomlValue::String(v)) = section.get("to_file") {
+        if let Some(v) = section.get("to_file").and_then(|v| v.as_str()) {
             cfg.logging.to_file = Some(PathBuf::from(v));
         }
-        if let Some(TomlValue::Bool(v)) = section.get("to_stderr") {
-            cfg.logging.to_stderr = *v;
+        if let Some(v) = section.get("to_stderr").and_then(|v| v.as_bool()) {
+            cfg.logging.to_stderr = v;
         }
     }
 }
@@ -267,11 +214,49 @@ port = 9090
 model = "test-model"
 api_key = "sk-123"
 "#;
-        let table = parse_toml(content);
-        let srv = table.get("server").unwrap();
-        assert_eq!(srv.get("host").map(|v| match v { TomlValue::String(s) => s.as_str(), _ => "" }), Some("0.0.0.0"));
-        let prv = table.get("provider").unwrap();
-        assert_eq!(prv.get("model").map(|v| match v { TomlValue::String(s) => s.as_str(), _ => "" }), Some("test-model"));
-        assert_eq!(prv.get("api_key").map(|v| match v { TomlValue::String(s) => s.as_str(), _ => "" }), Some("sk-123"));
+        let table: toml::Table = content.parse().unwrap();
+        let srv = table.get("server").unwrap().as_table().unwrap();
+        assert_eq!(srv.get("host").unwrap().as_str(), Some("0.0.0.0"));
+        assert_eq!(srv.get("port").unwrap().as_integer(), Some(9090));
+        let prv = table.get("provider").unwrap().as_table().unwrap();
+        assert_eq!(prv.get("model").unwrap().as_str(), Some("test-model"));
+        assert_eq!(prv.get("api_key").unwrap().as_str(), Some("sk-123"));
+    }
+
+    #[test]
+    fn test_apply_toml() {
+        let content = r#"
+[server]
+host = "0.0.0.0"
+port = 9090
+
+[provider]
+base_url = "http://custom:8080/v1"
+model = "custom-model"
+
+[session]
+soft_cap_pct = 50
+hard_cap_pct = 90
+max_tool_calls_per_turn = 10
+
+[logging]
+level = "debug"
+to_file = "/tmp/custom.log"
+to_stderr = false
+"#;
+        let table: toml::Table = content.parse().unwrap();
+        let mut cfg = Config::default();
+        apply_toml(&mut cfg, &table);
+
+        assert_eq!(cfg.server.host, "0.0.0.0");
+        assert_eq!(cfg.server.port, 9090);
+        assert_eq!(cfg.provider.base_url, "http://custom:8080/v1");
+        assert_eq!(cfg.provider.model, "custom-model");
+        assert_eq!(cfg.session.soft_cap_pct, 50);
+        assert_eq!(cfg.session.hard_cap_pct, 90);
+        assert_eq!(cfg.session.max_tool_calls_per_turn, 10);
+        assert_eq!(cfg.logging.level, "debug");
+        assert_eq!(cfg.logging.to_file, Some("/tmp/custom.log".into()));
+        assert!(!cfg.logging.to_stderr);
     }
 }
