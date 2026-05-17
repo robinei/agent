@@ -31,3 +31,35 @@ with decisions, deviations, bugs, and verification commands.
 **Verification:** `cargo build --workspace` compiles with zero warnings from our code.
 
 ---
+
+## Step 2 — Config + logging + store (JSONL I/O)
+
+- [x] ✅ Done
+
+**Created:**
+- `agent-core/src/config.rs` — `Config` struct (5 subsections), `load_config()` with env var
+  overrides, minimal TOML parser (no extra dep), `agent_dir()` helper
+- `agent-core/src/logging.rs` — `FileLogger` implementing `log::Log`, thread-local `AGENT_TREE_ID`,
+  `init_logging()` registering env_logger + file logger
+- `agent-core/src/store.rs` — `Store` struct with base_dir, all JSONL I/O:
+  - `create_tree_file()` / `append_entry()` / `read_all_entries()`
+  - `load_tree_meta()` / `save_tree_meta()` (atomic write+rename)
+  - `get_tree()` / `update_tree()` / `list_trees()` (backed by INDEX_CACHE)
+  - `rebuild_index()` (scans `trees/*.meta.json`)
+  - `update_header()` / `reset_header_tokens()`
+- Wired all 3 modules into `lib.rs`
+
+**Deviations from PLAN.md:**
+- `Store` is a struct with `base_dir` field instead of free functions — enables test
+  isolation with tempdirs instead of global env var
+- Minimal TOML parser instead of `toml` crate — our config is simple enough
+- `FileLogger` registered via `log::set_boxed_logger` (takes `Box<dyn Log>`), not `set_logger`
+  (requires `&'static`)
+
+**Bugs fixed:**
+- `rebuild_index()` extension check: `{id}.meta.json` has extension `.json`, not `.meta`.
+  Fixed to check `fname.ends_with(".meta.json")`
+
+**Verification:** `cargo test --workspace` — 8 tests pass (config: 2, logging: 1, store: 5)
+
+---
