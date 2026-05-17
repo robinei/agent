@@ -1,0 +1,26 @@
+# Default agent-server configuration.
+# Copy to ~/.agent/config.toml and edit as needed.
+# Environment variable overrides are applied on top of this file (see config.rs).
+
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[provider]
+base_url = "http://localhost:8080/v1"
+api_key = ""
+model = "qwen2.5-coder-7b-instruct"
+
+[summary]
+model = "qwen2.5-coder-1.5b-instruct"
+# base_url and api_key default to [provider] values if omitted
+
+[session]
+soft_cap_pct = 65
+hard_cap_pct = 85
+max_tool_calls_per_turn = 25
+
+[logging]
+level = "info"
+to_file = "/tmp/agent-server.log"
+to_stderr = true

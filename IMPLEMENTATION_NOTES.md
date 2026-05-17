@@ -132,3 +132,69 @@ with decisions, deviations, bugs, and verification commands.
 
 **Verification:** `cargo test --workspace` — 40 tests pass (26 new tests across 7 tool modules)
 `cargo clippy --lib -p agent-core` — no warnings in tools code
+
+---
+
+## Step 5 — Server skeleton + tree CRUD routes
+
+- [x] ✅ Done
+
+**Created/modified:**
+- `config.toml` — example dev config at project root (reference for `~/.agent/config.toml`)
+- `agent/agent-server/src/main.rs` — rewritten: loads config, inits logging (env_logger + file logger),
+  initializes Store, rebuilds index from disk, starts rouille HTTP server
+- `agent/agent-server/src/routes.rs` — route handler with `rouille::router!`:
+  - `GET /` — service info ({"service": "agent-server", "version": "0.1.0"})
+  - `GET /trees` — list all trees (returns `Vec<TreeMeta>` as JSON)
+  - `POST /trees` — create tree (body: `{"title": "...", "repo_path": "...", "model": "..."}`)
+    - Generates UUID for tree id
+    - Creates JSONL file with header, writes `session_start` entry
+    - If model specified, writes `model_set` entry and updates header `current_model`
+    - Returns 201 with `TreeMeta`
+  - `GET /trees/{id}` — get tree metadata (returns `TreeMeta` or 404)
+  - `PATCH /trees/{id}` — update title (body: `{"title": "..."}`)
+  - `GET /trees/{id}/entries` — list all entries (returns `Vec<Entry>`)
+- `agent/agent-server/src/lifecycle.rs` — stubs for agent lifecycle:
+  - `AgentHandle` struct (thread_id, input_tx, stop flag, event_buffer, event_broadcast)
+  - `ACTIVE_AGENTS` static map (`LazyLock<Mutex<HashMap<TreeId, AgentHandle>>>`)
+  - `spawn()` — registers agent handle (no actual thread yet)
+  - `stop()` — signals stop flag
+  - `send_message()` — sends message over mpsc channel
+  - `emit_event()` — ring buffer + broadcast helper
+- `agent-server/Cargo.toml` — added `log`, `uuid`, `chrono` deps
+
+**Deviations from PLAN.md:**
+- `agent/config.toml` is at project root as an example; actual config loading
+  uses `~/.agent/config.toml` (existing behavior from Step 2)
+- `handler_request` takes `&Arc<Store>` not `&Store` — needed because rouille
+  closures own their data; we clone `Arc<Store>` per request
+- Route captures use typed syntax `{id: String}` in `rouille::router!` macro
+- `POST /trees` generates `session_start` entry automatically; the PLAN mentions
+  this implicitly in the session lifecycle but doesn't specify it in the step 5
+  route description
+- Entry IDs generated with simple hash-based 8-char hex (not UUID — UUID for trees
+  is sufficient for global uniqueness)
+
+**Bugs fixed:**
+- `serde_json` dependency in agent-server Cargo.toml was on a broken line (newline
+  inside key-value), fixed to single line
+- `&request` unnecessary borrow flagged by clippy in main.rs — changed to `request`
+- Moved `AtomicBool` to `std::sync::atomic` and `VecDeque` to `std::collections`
+  in lifecycle.rs
+
+**Verification:**
+- `cargo build --workspace` — compiles cleanly
+- `cargo test --workspace` — 40 tests pass (all pre-existing)
+- `cargo clippy -p agent-server` — zero warnings in agent-server (only pre-existing
+  warnings in agent-core)
+- Manual server test:
+  ```
+  curl http://localhost:8080/trees          # → []
+  curl -X POST http://localhost:8080/trees   # → 201 TreeMeta
+    -d '{"title":"Test","model":"my-model"}'
+  curl http://localhost:8080/trees/{id}      # → TreeMeta with entries
+  curl http://localhost:8080/trees/{id}/entries  # → [session_start, model_set]
+  curl -X PATCH http://localhost:8080/trees/{id} # → updated TreeMeta
+    -d '{"title":"Updated"}'
+  ```
+- Disk layout verified: `.jsonl` (header + entries) + `.meta.json` written correctly

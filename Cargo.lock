@@ -54,9 +54,12 @@ version = "0.1.0"
 dependencies = [
  "agent-core",
  "anyhow",
+ "chrono",
+ "log",
  "rouille",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
