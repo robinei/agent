@@ -198,3 +198,43 @@ with decisions, deviations, bugs, and verification commands.
     -d '{"title":"Updated"}'
   ```
 - Disk layout verified: `.jsonl` (header + entries) + `.meta.json` written correctly
+
+---
+
+## Step 6 — Edit + Bash + Search tools
+
+- [x] ✅ Done
+
+**Created:**
+- `agent-core/src/tools/edit.rs` — text replacement tool with:
+  - Exact match first, then fuzzy fallback (NFKC normalize, trim trailing whitespace,
+    normalize smart quotes→ASCII, dashes→`-`, special spaces→` `)
+  - BOM stripping and CRLF→LF normalization
+  - Multiple disjoint edits in one call (applied in reverse order for offset stability)
+  - Per-file locking via `with_file_lock()` using canonicalized paths
+  - Overlapping edit detection and error reporting
+  - `resolve_path()` safety checks against repo root
+- `agent-core/src/tools/bash.rs` — shell execution tool with:
+  - Process group creation via `nix::unistd::setpgid` + `CommandExt::process_group(0)`
+  - Timeout with SIGTERM escalation to SIGKILL after 5s grace period
+  - Concurrent stdout/stderr reading via separate OS pipes
+  - 2000-line / 50 KB output truncation
+  - Environment variable passthrough
+- `agent-core/src/tools/search.rs` — session/tree search tools:
+  - `SearchMessagesTool` — scans JSONL files via `serde_json::StreamDeserializer`,
+    supports filtering by tree ID, regex matching on message text and role
+  - `SearchFilesTool` — walks `~/.agent/trees/` + arbitrary paths for artifacts
+
+**Modified:**
+- `agent-core/src/tools/mod.rs` — added `BashTool`, `EditTool`, `SearchMessagesTool`,
+  `SearchFilesTool` to `all_tools()` registry (10 tools total)
+
+**Deviations from PLAN.md:**
+- `EditTool` uses a custom fuzzy normalization pipeline instead of a dedicated
+  diff crate — keeps dependency count minimal
+- `BashTool` reads stderr into the same output buffer as stdout (both are returned
+  to the LLM) rather than separate error reporting
+- `SearchFilesTool` is a simple `walkdir`-based file finder under store paths,
+  not a full index — keeps it cheap for occasional use
+
+**Verification:** `cargo test --workspace` — 58 tests pass, 0 clippy warnings in new code

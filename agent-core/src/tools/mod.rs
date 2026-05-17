@@ -8,11 +8,14 @@
 
 use std::path::Path;
 
+pub mod bash;
+pub mod edit;
 pub mod find;
 pub mod git;
 pub mod grep;
 pub mod ls;
 pub mod read;
+pub mod search;
 pub mod write;
 
 use crate::types::{ToolDefinition, ToolOutput};
@@ -38,12 +41,16 @@ pub trait Tool: Send {
 /// and reject paths escaping the repo root via `..` or symlinks.
 pub fn all_tools(cwd: &Path) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(read::ReadTool::new(cwd)),
-        Box::new(write::WriteTool::new(cwd)),
-        Box::new(ls::LsTool::new(cwd)),
-        Box::new(grep::GrepTool::new(cwd)),
+        Box::new(bash::BashTool::new(cwd)),
+        Box::new(edit::EditTool::new(cwd)),
         Box::new(find::FindTool::new(cwd)),
         Box::new(git::GitTool::new(cwd)),
+        Box::new(grep::GrepTool::new(cwd)),
+        Box::new(ls::LsTool::new(cwd)),
+        Box::new(read::ReadTool::new(cwd)),
+        Box::new(search::SearchMessagesTool::new(cwd)),
+        Box::new(search::SearchFilesTool::new(cwd)),
+        Box::new(write::WriteTool::new(cwd)),
     ]
 }
 
