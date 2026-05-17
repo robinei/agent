@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Customize this ────────────────────────────────────────────────────────────
-AGENT_CMD=(pi -c)
+AGENT_CMD=(pi)
 
 # Additional dirs outside the project the agent may write to.
 WRITABLE_DIRS=(
@@ -63,4 +63,4 @@ exec bwrap \
     --share-net \
     --new-session \
     --die-with-parent \
-    -- "${AGENT_CMD[@]}"
+    -- "${AGENT_CMD[@]}" "$@"
