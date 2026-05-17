@@ -49,6 +49,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// Manages tree data stored as JSONL files under a base directory.
 ///
 /// Default base is `~/.agent/`. Override via `Store::new()` for testing.
+#[derive(Clone)]
 pub struct Store {
     base_dir: PathBuf,
 }

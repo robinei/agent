@@ -1,6 +1,9 @@
+pub mod agent;
 pub mod config;
+pub mod context_files;
+pub mod hooks;
 pub mod logging;
 pub mod provider;
 pub mod store;
-pub mod types;
 pub mod tools;
+pub mod types;

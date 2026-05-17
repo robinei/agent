@@ -1,10 +1,14 @@
+use std::borrow::Cow;
+use std::io::{self, Read};
 use std::sync::Arc;
 
-use rouille::{router, Request, Response};
+use rouille::{router, Request, Response, ResponseBody};
 use serde::Deserialize;
 
 use agent_core::store::Store;
-use agent_core::types::{Entry, TreeMeta};
+use agent_core::types::{Entry, ServerEvent, TreeMeta};
+
+use crate::lifecycle;
 
 // ── Request body types ──
 
@@ -18,6 +22,11 @@ pub struct CreateTreeBody {
 #[derive(Deserialize)]
 pub struct UpdateTreeBody {
     pub title: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SendMessageBody {
+    pub text: String,
 }
 
 // ── Route handler ──
@@ -51,11 +60,71 @@ pub fn handle_request(request: &Request, store: &Arc<Store>) -> Response {
             handle_list_entries(&id, store)
         },
 
+        (POST) (/trees/{id: String}/message) => {
+            handle_send_message(&id, request)
+        },
+
+        (POST) (/trees/{id: String}/stop) => {
+            handle_stop_agent(&id)
+        },
+
+        (GET) (/trees/{id: String}/stream) => {
+            handle_sse_stream(&id)
+        },
+
         _ => {
             Response::json(&serde_json::json!({"error": "not found"}))
                 .with_status_code(404)
         }
     )
+}
+
+// ── SSE Streaming ──
+
+/// A Read implementation that serves SSE events with reconnection support.
+pub struct SseReconnectStream {
+    catch_up: std::vec::IntoIter<ServerEvent>,
+    rx: std::sync::mpsc::Receiver<ServerEvent>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl SseReconnectStream {
+    pub fn new(
+        catch_up: Vec<ServerEvent>,
+        rx: std::sync::mpsc::Receiver<ServerEvent>,
+    ) -> Self {
+        Self {
+            catch_up: catch_up.into_iter(),
+            rx,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl Read for SseReconnectStream {
+    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.buf.len() {
+            let event = if let Some(e) = self.catch_up.next() {
+                e
+            } else {
+                match self.rx.recv() {
+                    Ok(e) => e,
+                    Err(_) => return Ok(0),
+                }
+            };
+            self.buf = format!(
+                "data: {}\n\n",
+                serde_json::to_string(&event).unwrap()
+            )
+            .into_bytes();
+            self.pos = 0;
+        }
+        let n = (&self.buf[self.pos..]).read(dst)?;
+        self.pos += n;
+        Ok(n)
+    }
 }
 
 // ── Handlers ──
@@ -82,10 +151,8 @@ fn handle_create_tree(request: &Request, store: &Store) -> Response {
         }
     };
 
-    // Generate tree ID
     let tree_id = uuid::Uuid::new_v4().to_string();
 
-    // Canonicalize repo path if provided
     let repo_path = body.repo_path.as_ref().map(|p| {
         let path = std::path::Path::new(p);
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -97,7 +164,6 @@ fn handle_create_tree(request: &Request, store: &Store) -> Response {
         .clone()
         .unwrap_or_else(|| "qwen2.5-coder-7b-instruct".to_string());
 
-    // Create TreeMeta
     let meta = TreeMeta {
         id: tree_id.clone(),
         parent_id: None,
@@ -108,7 +174,6 @@ fn handle_create_tree(request: &Request, store: &Store) -> Response {
         leaf_id: None,
     };
 
-    // Create JSONL file with header
     if let Err(e) = store.create_tree_file(&tree_id, &model) {
         return Response::json(&serde_json::json!({
             "error": format!("failed to create tree file: {}", e)
@@ -116,7 +181,6 @@ fn handle_create_tree(request: &Request, store: &Store) -> Response {
         .with_status_code(500);
     }
 
-    // Write session_start as first entry
     let session_start_id = generate_entry_id();
     let session_start = Entry::SessionStart {
         id: session_start_id.clone(),
@@ -130,11 +194,9 @@ fn handle_create_tree(request: &Request, store: &Store) -> Response {
         .with_status_code(500);
     }
 
-    // Update leaf_id to point to session_start
     let mut meta = meta;
     meta.leaf_id = Some(session_start_id.clone());
 
-    // If model was specified, write a ModelSet entry
     if body.model.is_some() {
         let model_set = Entry::ModelSet {
             id: generate_entry_id(),
@@ -148,13 +210,10 @@ fn handle_create_tree(request: &Request, store: &Store) -> Response {
             }))
             .with_status_code(500);
         }
-        // Update leaf_id to model_set
         meta.leaf_id = model_set.id().to_string().into();
-        // Update total_tokens in header
         let _ = store.update_header(&tree_id, &serde_json::json!({"current_model": model}));
     }
 
-    // Save metadata
     if let Err(e) = store.save_tree_meta(&meta) {
         return Response::json(&serde_json::json!({
             "error": format!("failed to save tree metadata: {}", e)
@@ -169,14 +228,16 @@ fn handle_create_tree(request: &Request, store: &Store) -> Response {
 fn handle_get_tree(id: &str, store: &Store) -> Response {
     match store.get_tree(id) {
         Ok(Some(meta)) => Response::json(&meta),
-        Ok(None) => Response::json(&serde_json::json!({"error": format!("tree {} not found", id)}))
-            .with_status_code(404),
+        Ok(None) => {
+            Response::json(&serde_json::json!({"error": format!("tree {} not found", id)}))
+                .with_status_code(404)
+        }
         Err(e) => Response::json(&serde_json::json!({"error": format!("{}", e)}))
             .with_status_code(500),
     }
 }
 
-/// PATCH /trees/{id} — update tree metadata (title, etc.)
+/// PATCH /trees/{id} — update tree metadata
 fn handle_update_tree(id: &str, request: &Request, store: &Store) -> Response {
     let body: UpdateTreeBody = match request
         .data()
@@ -218,7 +279,6 @@ fn handle_update_tree(id: &str, request: &Request, store: &Store) -> Response {
 
 /// GET /trees/{id}/entries — list all entries for a tree
 fn handle_list_entries(id: &str, store: &Store) -> Response {
-    // First verify the tree exists
     match store.get_tree(id) {
         Ok(None) => {
             return Response::json(&serde_json::json!({"error": format!("tree {} not found", id)}))
@@ -228,7 +288,7 @@ fn handle_list_entries(id: &str, store: &Store) -> Response {
             return Response::json(&serde_json::json!({"error": format!("{}", e)}))
                 .with_status_code(500);
         }
-        Ok(Some(_)) => {} // tree exists, continue
+        Ok(Some(_)) => {}
     }
 
     match store.read_all_entries(id) {
@@ -236,6 +296,73 @@ fn handle_list_entries(id: &str, store: &Store) -> Response {
         Err(e) => Response::json(&serde_json::json!({"error": format!("{}", e)}))
             .with_status_code(500),
     }
+}
+
+/// POST /trees/{id}/message — send a user message to an active agent
+fn handle_send_message(id: &str, request: &Request) -> Response {
+    let body: SendMessageBody = match request
+        .data()
+        .and_then(|d| serde_json::from_reader(d).ok())
+    {
+        Some(b) => b,
+        None => {
+            return Response::json(&serde_json::json!({"error": "invalid JSON body"}))
+                .with_status_code(400);
+        }
+    };
+
+    if body.text.trim().is_empty() {
+        return Response::json(&serde_json::json!({"error": "message text cannot be empty"}))
+            .with_status_code(400);
+    }
+
+    match lifecycle::send_message(id, &body.text) {
+        Ok(()) => Response::json(&serde_json::json!({"status": "sent"})),
+        Err(e) => {
+            Response::json(&serde_json::json!({"error": e})).with_status_code(409)
+        }
+    }
+}
+
+/// POST /trees/{id}/stop — stop an active agent
+fn handle_stop_agent(id: &str) -> Response {
+    match lifecycle::stop(id) {
+        Ok(()) => Response::json(&serde_json::json!({"status": "stopping"})),
+        Err(e) => Response::json(&serde_json::json!({"error": e})).with_status_code(404),
+    }
+}
+
+/// GET /trees/{id}/stream — SSE event stream for an active agent
+fn handle_sse_stream(id: &str) -> Response {
+    let handle = match lifecycle::get_handle(id) {
+        Some(h) => h,
+        None => {
+            return Response::json(&serde_json::json!({
+                "error": format!("No active agent for tree {}", id)
+            }))
+            .with_status_code(404)
+        }
+    };
+
+    let catch_up: Vec<ServerEvent> = {
+        let buf = handle.event_buffer.lock().unwrap();
+        buf.iter().cloned().collect()
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    handle.event_broadcast.lock().unwrap().push(tx);
+
+    let stream = SseReconnectStream::new(catch_up, rx);
+
+    Response {
+            status_code: 200,
+            headers: vec![
+                (Cow::Borrowed("Content-Type"), Cow::Borrowed("text/event-stream")),
+                (Cow::Borrowed("Cache-Control"), Cow::Borrowed("no-cache")),
+            ],
+            data: ResponseBody::from_reader(stream),
+            upgrade: None,
+        }
 }
 
 // ── Helpers ──

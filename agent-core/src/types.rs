@@ -164,7 +164,7 @@ pub struct Message {
     pub is_error: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum MessageRole {
     System,
     User,

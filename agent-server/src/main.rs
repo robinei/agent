@@ -36,7 +36,12 @@ fn main() {
         Err(e) => log::warn!("Index rebuild issue: {}", e),
     }
 
-    // 5. Start HTTP server
+    // 5. Run startup hooks
+    if let Err(e) = agent_core::hooks::run_startup_hooks() {
+        log::warn!("Startup hooks issue: {}", e);
+    }
+
+    // 6. Start HTTP server
     let addr = format!("{}:{}", config.server.host, config.server.port);
     log::info!("Listening on http://{}", addr);
 
