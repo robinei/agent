@@ -89,3 +89,46 @@ with decisions, deviations, bugs, and verification commands.
 **Verification:** `cargo test --workspace` — 14 tests pass (5 new provider tests)
 
 ---
+
+## Step 4 — Tool system (trait + initial tools)
+
+- [x] ✅ Done
+
+**Created:**
+- `agent-core/src/tools/mod.rs` — `Tool` trait (`definition()` + `execute()`), `ToolResult` type alias,
+  `all_tools()` registry function, `resolve_path()` helper (path safety guard), `truncate_output()` helper
+- `agent-core/src/tools/read.rs` — `ReadTool`: reads files with 2000 line / 50 KB limit, offset/limit params,
+  line numbers, filesystem safety checks
+- `agent-core/src/tools/write.rs` — `WriteTool`: writes files, creates parent dirs, path escape detection
+  by normalizing `..` components against canonicalized `cwd`
+- `agent-core/src/tools/ls.rs` — `LsTool`: directory listing with permissions, size, type. 500 entry max.
+- `agent-core/src/tools/grep.rs` — `GrepTool`: recursive regex file search, skips `.git`/`node_modules`/`target`,
+  context lines support, binary detection via null byte check
+- `agent-core/src/tools/find.rs` — `FindTool`: glob/substring filename search via `walkdir`, type filter
+  (file/dir/both), skips common non-source dirs
+- `agent-core/src/tools/git.rs` — `GitTool`: wraps `git` subprocess, subcommands: status/diff/log/show/
+  add/commit/push/pull, structured output with branch info and ahead/behind
+
+**Deviations from PLAN.md:**
+- `Tool` trait uses `Box<dyn std::error::Error + Send + Sync>` for errors instead of a custom `ToolError`
+- `resolve_path()` returns `Option<PathBuf>` instead of `Result` — simpler to chain
+- `truncate_output()` is a module-level utility (not per-method) — shared by multiple tools
+- `all_tools()` takes `&Path`; tools store a `PathBuf` copy of the cwd
+- `WriteTool` path safety uses manual `..` resolution + canonicalized `cwd` comparison,
+  since the target file (and its parents) may not exist yet
+- `GitTool` returns raw stdout/stderr rather than fully structured JSON — simpler and more
+  flexible for the LLM to interpret
+- `GrepTool` binary detection checks for null bytes in first 8 KB — fast heuristic, not full MIME
+- `FindTool` glob matching is a simplified custom implementation (no glob crate dependency)
+
+**Bugs fixed:**
+- `WriteTool` path check failed on nonexistent parent directories — replaced canonicalize-based
+  check with manual `..` component resolution against canonical cwd
+- `GitTool` `run_git()` returns `Result` but was destructured as tuple — fixed to propagate `?`
+  properly
+- Use-after-move on `content.len()` / `stdout.len()` in `ToolOutput` construction — fixed to
+  compute length before move
+- Redundant `pattern == "*" || pattern == "*"` in find.rs — simplified to single check
+
+**Verification:** `cargo test --workspace` — 40 tests pass (26 new tests across 7 tool modules)
+`cargo clippy --lib -p agent-core` — no warnings in tools code
