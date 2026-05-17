@@ -140,3 +140,54 @@
 **Verification:** `cargo check --workspace` — no warnings (dead code warnings
 resolved since `lifecycle::spawn()` is now called from routes).
 `cargo test --workspace` — 75 tests pass.
+
+---
+
+## Step 9 — CLI: HTTP client + interactive TUI
+
+- [x] ✅ Done
+
+**Created:**
+- `agent-cli/src/client.rs` — ureq 3.x HTTP client with:
+  - `AgentClient` struct wrapping all server API calls (list_trees, create_tree, get_tree,
+    send_message, stop_agent, get_entries)
+  - `SseEventStream` — streaming SSE parser that yields `ServerEvent` values from
+    `data: {json}\n\n` lines, with graceful error handling for malformed chunks
+  - Helper methods: `get_json()`, `post_json()`, `post_empty()` for clean request plumbing
+- `agent-cli/src/interactive.rs` — interactive TUI mode with:
+  - Tree selection screen (list trees, select by number or ID prefix, create new)
+  - Prompt loop with command parsing: `/trees`, `/create`, `/switch`, `/stop`, `/show`,
+    `/entries`, `/help`, `/quit`
+  - SSE event rendering with termion formatting (`●` for user messages, `🛠` for tool calls,
+    `│` for tool output, `🎯` for goals, `🤖` for model changes, `📝` for session end,
+    `⚠` for cap warnings, `CapWarning`, `✖` for errors, color coding)
+  - Entry dedup: skips `Entry(message)` for assistant messages (already rendered via
+    `TextChunk`), skips `Entry(bash_exec)` (already via `ToolStart`+`ToolResult`)
+  - Message sending with synchronous streaming (blocking per-event in main thread)
+
+**Modified:**
+- `agent-cli/src/main.rs` — full clap CLI with subcommands:
+  - `serve` — spawns the server binary
+  - `trees` — lists all trees
+  - `create <title>` — creates a new tree
+  - `msg <tree_id> <message>` — one-shot send+stream
+  - `stop <tree_id>` — stops an active agent
+  - (no subcommand) — interactive TUI mode
+  - Server address configurable via `--server` / `-s` flag (default `localhost:8080`)
+  - One-shot `msg` subcommand renders events with simple text formatting
+- `agent-core/src/types.rs` — added `Deserialize` derive to `ServerEvent` so CLI can
+  deserialize SSE events
+
+**Deviations from PLAN.md:**
+- `agent-cli/src/client.rs` uses ureq 3.x API (`Agent::new_with_defaults()` not `new()`,
+  response is `http::Response<Body>`, error handling via `ureq::Error::StatusCode`).
+  This is unavoidable since the workspace already depends on ureq 3.
+- Interactive mode is single-threaded (blocking SSE read in main thread) rather than the
+  two-thread (SSE thread + main thread) design in PLAN.md. This keeps the implementation
+  simpler and avoids thread synchronization issues for a personal-use tool. Queued input
+  while agent works is a stretch goal for a future iteration.
+- `DedupTracker` is declared but its dedup-by-entry-ID logic is not yet wired — the current
+  implementation skips events by type rather than by ID, which is simpler and covers the
+  same cases. The struct is kept for future enhancement.
+
+**Verification:** `cargo test --workspace` — 76 tests pass (75 existing + 1 new CLI test)

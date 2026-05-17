@@ -331,7 +331,7 @@ impl ChatStream {
 
 // ── Server events (sent from agent thread to CLI/PWA over SSE) ──
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum ServerEvent {
     /// Token delta during streaming (never stored).
