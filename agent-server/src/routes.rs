@@ -5,6 +5,7 @@ use std::sync::Arc;
 use rouille::{router, Request, Response, ResponseBody};
 use serde::Deserialize;
 
+use agent_core::config::Config;
 use agent_core::store::Store;
 use agent_core::types::{Entry, ServerEvent, TreeMeta};
 
@@ -31,7 +32,7 @@ pub struct SendMessageBody {
 
 // ── Route handler ──
 
-pub fn handle_request(request: &Request, store: &Arc<Store>) -> Response {
+pub fn handle_request(request: &Request, store: &Arc<Store>, config: &Config) -> Response {
     router!(request,
         (GET) (/) => {
             Response::json(&serde_json::json!({
@@ -61,7 +62,7 @@ pub fn handle_request(request: &Request, store: &Arc<Store>) -> Response {
         },
 
         (POST) (/trees/{id: String}/message) => {
-            handle_send_message(&id, request)
+            handle_send_message(&id, request, store, config)
         },
 
         (POST) (/trees/{id: String}/stop) => {
@@ -299,7 +300,14 @@ fn handle_list_entries(id: &str, store: &Store) -> Response {
 }
 
 /// POST /trees/{id}/message — send a user message to an active agent
-fn handle_send_message(id: &str, request: &Request) -> Response {
+///
+/// Auto-spawns an agent for the tree if one isn't already running.
+fn handle_send_message(
+    id: &str,
+    request: &Request,
+    store: &Arc<Store>,
+    config: &Config,
+) -> Response {
     let body: SendMessageBody = match request
         .data()
         .and_then(|d| serde_json::from_reader(d).ok())
@@ -316,11 +324,47 @@ fn handle_send_message(id: &str, request: &Request) -> Response {
             .with_status_code(400);
     }
 
-    match lifecycle::send_message(id, &body.text) {
-        Ok(()) => Response::json(&serde_json::json!({"status": "sent"})),
-        Err(e) => {
-            Response::json(&serde_json::json!({"error": e})).with_status_code(409)
+    // Verify the tree exists
+    match store.get_tree(id) {
+        Ok(None) => {
+            return Response::json(&serde_json::json!({
+                "error": format!("tree {} not found", id)
+            }))
+            .with_status_code(404);
         }
+        Err(e) => {
+            return Response::json(&serde_json::json!({
+                "error": format!("failed to read tree: {}", e)
+            }))
+            .with_status_code(500);
+        }
+        Ok(Some(_)) => {}
+    }
+
+    // Try to send message; if no active agent, spawn one first
+    let result = lifecycle::send_message(id, &body.text);
+    match result {
+        Ok(()) => Response::json(&serde_json::json!({"status": "sent"})),
+        Err(ref e) if e.contains("No active agent") => {
+            // Auto-spawn agent for this tree
+            log::info!("Auto-spawning agent for tree {}", id);
+            if let Err(spawn_err) = lifecycle::spawn(id, (*store).clone(), config) {
+                return Response::json(&serde_json::json!({
+                    "error": format!("failed to spawn agent: {}", spawn_err)
+                }))
+                .with_status_code(500);
+            }
+
+            // Retry sending the message after spawn
+            match lifecycle::send_message(id, &body.text) {
+                Ok(()) => Response::json(&serde_json::json!({"status": "sent"})),
+                Err(e) => Response::json(&serde_json::json!({
+                    "error": format!("failed to send message after spawn: {}", e)
+                }))
+                .with_status_code(500),
+            }
+        }
+        Err(e) => Response::json(&serde_json::json!({"error": e})).with_status_code(409),
     }
 }
 
@@ -333,6 +377,8 @@ fn handle_stop_agent(id: &str) -> Response {
 }
 
 /// GET /trees/{id}/stream — SSE event stream for an active agent
+///
+/// If no agent is active for this tree, returns 404.
 fn handle_sse_stream(id: &str) -> Response {
     let handle = match lifecycle::get_handle(id) {
         Some(h) => h,

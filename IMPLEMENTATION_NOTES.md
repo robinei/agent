@@ -95,3 +95,48 @@
   relevant one
 
 **Verification:** `cargo test --workspace` — 75 tests pass (10 new tests: 7 agent context building + 2 hooks + 6 context files)
+
+---
+
+## Step 8 — SSE streaming + event broadcast
+
+- [x] ✅ Done
+
+**What was implemented (mostly as part of Step 7):**
+- `SseReconnectStream` in `routes.rs` — `Read` impl that serves SSE events with
+  reconnection support. Serves catch-up events from the ring buffer first, then
+  live events from the mpsc broadcast channel.
+- `handle_sse_stream()` — `GET /trees/{id}/stream` route that creates an
+  `SseReconnectStream` with the tree's event buffer and broadcast channel.
+- Bridge thread in `lifecycle.rs::spawn()` — reads events from the agent's
+  `event_tx` mpsc channel, populates the ring buffer (`event_buffer`, 1000 cap)
+  for Entry events, and broadcasts to all SSE subscribers via `event_broadcast`.
+
+  (Vec<mpsc::Sender<ServerEvent>>). Prunes disconnected subscribers on each send.
+
+**New in Step 8:**
+- **Auto-spawn agents on message:** `handle_send_message` in `routes.rs` now
+  calls `lifecycle::spawn()` when no active agent exists for the tree, then
+  retries sending the message. This makes `POST /trees/{id}/message` work
+  without requiring a prior explicit spawn.
+- **Config passed to route handler:** `main.rs` now wraps `Config` in `Arc` and
+  passes `&Config` to `routes::handle_request()`, which threads it to
+  `handle_send_message` (needed by `lifecycle::spawn()`).
+
+**Modified:**
+- `agent-server/src/main.rs` — wrap config in `Arc`, pass to route handler
+- `agent-server/src/routes.rs`:
+  - Added `use agent_core::config::Config`
+  - `handle_request()` now takes `&Config` parameter
+  - `handle_send_message()` now takes `&Arc<Store>` and `&Config` parameters,
+    verifies tree exists, auto-spawns agent if none active
+
+**Deviations from PLAN.md:**
+- The bridge thread event emission logic is inline in `spawn()` rather than in a
+  separate `emit_event()` helper function. Equivalent in behavior.
+- `handle_sse_stream` returns 404 (not 409) when no agent is active for a tree
+  — the caller should send a message first to auto-spawn.
+
+**Verification:** `cargo check --workspace` — no warnings (dead code warnings
+resolved since `lifecycle::spawn()` is now called from routes).
+`cargo test --workspace` — 75 tests pass.

@@ -9,7 +9,7 @@ mod routes;
 
 fn main() {
     // 1. Load config
-    let config = load_config();
+    let config = Arc::new(load_config());
 
     // 2. Init logging
     let log_file = config
@@ -46,8 +46,10 @@ fn main() {
     log::info!("Listening on http://{}", addr);
 
     let store_for_server = store.clone();
+    let config_for_server = config.clone();
     rouille::start_server(addr, move |request| {
         let store = store_for_server.clone();
-        routes::handle_request(request, &store)
+        let config = config_for_server.clone();
+        routes::handle_request(request, &store, &config)
     });
 }
