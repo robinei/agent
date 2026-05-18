@@ -137,14 +137,14 @@ impl Provider {
         obj
     }
 
-    /// POST /v1/chat/completions with streaming.
+    /// POST /chat/completions with streaming.
     pub fn stream_chat(
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<ChatStream> {
         let body = self.build_body(messages, tools, true);
-        let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         info!(
             "LLM request: {} messages, {} tools, model={}",
@@ -220,7 +220,7 @@ impl Provider {
     /// Raw non-streaming call returning the full JSON value.
     fn chat_raw(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<serde_json::Value> {
         let body = self.build_body(messages, tools, false);
-        let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let resp = match ureq::post(&url)
             .header("Content-Type", "application/json")

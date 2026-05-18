@@ -113,8 +113,10 @@ pub fn spawn(tree_id: &str, store: Arc<Store>, config: &Config) -> Result<(), St
         .name(format!("bridge-{}", tree_id))
         .spawn(move || {
             for event in event_rx {
-                // Ring buffer for Entry events (SSE reconnection catch-up)
-                if matches!(event, ServerEvent::Entry(_)) {
+                // Ring buffer for ALL events (SSE reconnection catch-up),
+                // not just Entry events — TextChunk, ToolStart, etc.
+                // are also needed for late-connecting SSE clients.
+                {
                     let mut buf = handle_for_bridge.event_buffer.lock().unwrap();
                     if buf.len() >= BUFFER_CAPACITY {
                         buf.pop_front();
@@ -126,6 +128,11 @@ pub fn spawn(tree_id: &str, store: Arc<Store>, config: &Config) -> Result<(), St
                 let mut subs = handle_for_bridge.event_broadcast.lock().unwrap();
                 subs.retain(|tx| tx.send(event.clone()).is_ok());
             }
+
+            // Agent exited. Clear all broadcast senders to signal EOF
+            // to any SSE subscribers (rx.recv() -> Err -> Read::read -> Ok(0)).
+            handle_for_bridge.event_broadcast.lock().unwrap().clear();
+
             log::info!("[lifecycle] Bridge thread exited for tree {}", bridge_tid);
         })
         .map_err(|e| format!("Failed to spawn bridge thread: {}", e))?;

@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::io::{self, Read};
+use std::io::Write;
 use std::sync::Arc;
 
 use rouille::{router, Request, Response, ResponseBody};
@@ -70,7 +70,7 @@ pub fn handle_request(request: &Request, store: &Arc<Store>, config: &Config) ->
         },
 
         (GET) (/trees/{id: String}/stream) => {
-            handle_sse_stream(&id)
+            handle_sse_stream(&id, store, config)
         },
 
         _ => {
@@ -80,53 +80,7 @@ pub fn handle_request(request: &Request, store: &Arc<Store>, config: &Config) ->
     )
 }
 
-// ── SSE Streaming ──
-
-/// A Read implementation that serves SSE events with reconnection support.
-pub struct SseReconnectStream {
-    catch_up: std::vec::IntoIter<ServerEvent>,
-    rx: std::sync::mpsc::Receiver<ServerEvent>,
-    buf: Vec<u8>,
-    pos: usize,
-}
-
-impl SseReconnectStream {
-    pub fn new(
-        catch_up: Vec<ServerEvent>,
-        rx: std::sync::mpsc::Receiver<ServerEvent>,
-    ) -> Self {
-        Self {
-            catch_up: catch_up.into_iter(),
-            rx,
-            buf: Vec::new(),
-            pos: 0,
-        }
-    }
-}
-
-impl Read for SseReconnectStream {
-    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.buf.len() {
-            let event = if let Some(e) = self.catch_up.next() {
-                e
-            } else {
-                match self.rx.recv() {
-                    Ok(e) => e,
-                    Err(_) => return Ok(0),
-                }
-            };
-            self.buf = format!(
-                "data: {}\n\n",
-                serde_json::to_string(&event).unwrap()
-            )
-            .into_bytes();
-            self.pos = 0;
-        }
-        let n = (&self.buf[self.pos..]).read(dst)?;
-        self.pos += n;
-        Ok(n)
-    }
-}
+// ── SSE Upgrade (bypasses BufWriter in tiny_http) ──
 
 // ── Handlers ──
 
@@ -378,8 +332,84 @@ fn handle_stop_agent(id: &str) -> Response {
 
 /// GET /trees/{id}/stream — SSE event stream for an active agent
 ///
-/// If no agent is active for this tree, returns 404.
-fn handle_sse_stream(id: &str) -> Response {
+/// Auto-spawns the agent if it isn't already running. This allows the CLI
+/// to open the SSE stream first, then send the message via POST.
+// ── SSE Upgrade (bypasses BufWriter in tiny_http) ──
+
+
+struct SseUpgrade {
+    handle: lifecycle::AgentHandle,
+    tree_id: String,
+    headers_written: bool,
+}
+
+impl rouille::Upgrade for SseUpgrade {
+    fn build(&mut self, socket: Box<dyn rouille::ReadWrite + Send>) {
+        log::info!("[sse-upgrade] Starting SSE write loop for tree {}", self.tree_id);
+
+        let mut writer = std::io::BufWriter::with_capacity(8192, socket);
+
+        // Headers are already sent by tiny_http as part of the upgrade response.
+        // Only write headers if the initial response didn't carry them.
+        if !self.headers_written {
+            let _ = write!(
+                &mut writer,
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/event-stream\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Connection: keep-alive\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Transfer-Encoding: chunked\r\n\
+                 \r\n"
+            );
+            let _ = writer.flush();
+        }
+
+        // Send catch-up events from the ring buffer
+        {
+            let buf = self.handle.event_buffer.lock().unwrap();
+            for event in buf.iter() {
+                if let Ok(json) = serde_json::to_string(event) {
+                    let _ = write!(&mut writer, "data: {}\n\n", json);
+                }
+            }
+        }
+        let _ = writer.flush();
+
+        // Subscribe to broadcast channel and forward events until EOF
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let mut subs = self.handle.event_broadcast.lock().unwrap();
+            subs.push(tx);
+        }
+
+        // Forward events from broadcast
+        for event in &rx {
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = write!(&mut writer, "data: {}\n\n", json);
+                let _ = writer.flush();
+            }
+        }
+
+        log::info!("[sse-upgrade] SSE stream ended for tree {}", self.tree_id);
+        let _ = writer.flush();
+    }
+}
+
+fn handle_sse_stream(id: &str, store: &Arc<Store>, config: &Config) -> Response {
+    log::info!("[sse] Opening SSE stream for tree {}", id);
+
+    // Auto-spawn agent if not already running
+    if lifecycle::get_handle(id).is_none() {
+        log::info!("[sse] Auto-spawning agent for tree {}", id);
+        if let Err(e) = lifecycle::spawn(id, (*store).clone(), config) {
+            return Response::json(&serde_json::json!({
+                "error": format!("Failed to spawn agent: {}", e)
+            }))
+            .with_status_code(500);
+        }
+    }
+
     let handle = match lifecycle::get_handle(id) {
         Some(h) => h,
         None => {
@@ -390,25 +420,27 @@ fn handle_sse_stream(id: &str) -> Response {
         }
     };
 
-    let catch_up: Vec<ServerEvent> = {
-        let buf = handle.event_buffer.lock().unwrap();
-        buf.iter().cloned().collect()
-    };
+    log::info!("[sse] Using SSE upgrade for tree {}", id);
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    handle.event_broadcast.lock().unwrap().push(tx);
-
-    let stream = SseReconnectStream::new(catch_up, rx);
-
+    // SSE via Upgrade: takes over the raw socket, bypasses the BufWriter
+    // in tiny_http, ensuring real-time streaming.
+    // The upgrade response carries our SSE headers so the client sees only one
+    // HTTP response (not the double-response that comes with a separate write).
     Response {
-            status_code: 200,
-            headers: vec![
-                (Cow::Borrowed("Content-Type"), Cow::Borrowed("text/event-stream")),
-                (Cow::Borrowed("Cache-Control"), Cow::Borrowed("no-cache")),
-            ],
-            data: ResponseBody::from_reader(stream),
-            upgrade: None,
-        }
+        status_code: 200,
+        headers: vec![
+            (Cow::Borrowed("Content-Type"), Cow::Borrowed("text/event-stream")),
+            (Cow::Borrowed("Cache-Control"), Cow::Borrowed("no-cache")),
+            (Cow::Borrowed("Connection"), Cow::Borrowed("keep-alive")),
+            (Cow::Borrowed("Access-Control-Allow-Origin"), Cow::Borrowed("*")),
+        ],
+        data: ResponseBody::empty(),
+        upgrade: Some(Box::new(SseUpgrade {
+            handle,
+            tree_id: id.to_string(),
+            headers_written: true,
+        })),
+    }
 }
 
 // ── Helpers ──

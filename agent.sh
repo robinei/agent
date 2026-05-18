@@ -7,6 +7,7 @@ AGENT_CMD=(pi)
 # Additional dirs outside the project the agent may write to.
 WRITABLE_DIRS=(
     "$HOME/.pi"
+    "$HOME/.agent"
     "$HOME/.cargo"
 )
 

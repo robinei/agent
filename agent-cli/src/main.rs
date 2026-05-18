@@ -182,16 +182,8 @@ fn create_tree(server: &str, title: &str, repo_path: Option<&str>, model: Option
 fn send_and_stream(server: &str, tree_id: &str, message: &str) {
     let client = client::AgentClient::new(server);
 
-    // Send message
-    match client.send_message(tree_id, message) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    }
-
-    // Stream events
+    // Open SSE stream FIRST (this auto-spawns the agent in a waiting state).
+    // Then send the message, so we're already listening when events arrive.
     let mut stream = match client.stream_events(tree_id) {
         Ok(s) => s,
         Err(e) => {
@@ -199,6 +191,15 @@ fn send_and_stream(server: &str, tree_id: &str, message: &str) {
             std::process::exit(1);
         }
     };
+
+    // Send message SECOND
+    match client.send_message(tree_id, message) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
 
     loop {
         match stream.next_event() {
@@ -256,7 +257,7 @@ fn send_and_stream(server: &str, tree_id: &str, message: &str) {
                     agent_core::types::ServerEvent::Done { status } => {
                         println!();
                         match status.as_str() {
-                            "complete" => println!("✓ Done"),
+                            "complete" | "stop" => println!("✓ Done"),
                             s => println!("{}", s),
                         }
                     }

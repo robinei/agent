@@ -506,8 +506,22 @@ pub fn run_agent(
                     None => break 'stream,
                 };
 
-                let data = line.strip_prefix("data: ").unwrap_or(&line).trim();
+                // Debug: log raw SSE lines from the LLM provider
+                let trimmed_line = line.trim();
+                if !trimmed_line.is_empty() && !trimmed_line.starts_with(':') {
+                    info!("SSE raw: {}", &trimmed_line[..trimmed_line.len().min(500)]);
+                }
+
+                // Skip SSE event separators (blank lines) and comment lines
+                if trimmed_line.is_empty() || trimmed_line.starts_with(':') {
+                    continue;
+                }
+
+                let data = trimmed_line
+                    .strip_prefix("data: ")
+                    .unwrap_or(trimmed_line);
                 if data.is_empty() || data == "[DONE]" {
+                    info!("SSE stream ended ([DONE])");
                     break 'stream;
                 }
 
@@ -529,12 +543,15 @@ pub fn run_agent(
                     None => continue,
                 };
 
-                // Text delta
+                // Text delta (skip empty — reasoning models send empty content
+                // chunks with reasoning fields before the actual text)
                 if let Some(delta) = &choice.delta.content {
-                    response_text.push_str(delta);
-                    let _ = event_tx.send(ServerEvent::TextChunk {
-                        content: delta.clone(),
-                    });
+                    if !delta.is_empty() {
+                        response_text.push_str(delta);
+                        let _ = event_tx.send(ServerEvent::TextChunk {
+                            content: delta.clone(),
+                        });
+                    }
                 }
 
                 // Tool call deltas
