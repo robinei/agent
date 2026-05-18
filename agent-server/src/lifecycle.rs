@@ -113,15 +113,20 @@ pub fn spawn(tree_id: &str, store: Arc<Store>, config: &Config) -> Result<(), St
         .name(format!("bridge-{}", tree_id))
         .spawn(move || {
             for event in event_rx {
-                // Ring buffer for ALL events (SSE reconnection catch-up),
-                // not just Entry events — TextChunk, ToolStart, etc.
-                // are also needed for late-connecting SSE clients.
+                // Ring buffer for SSE reconnection catch-up.
+                // Clear on Done so that a new SSE subscriber opened for the
+                // next message gets a fresh start — no stale events from the
+                // previous turn.
                 {
                     let mut buf = handle_for_bridge.event_buffer.lock().unwrap();
-                    if buf.len() >= BUFFER_CAPACITY {
-                        buf.pop_front();
+                    if matches!(&event, ServerEvent::Done { .. }) {
+                        buf.clear();
+                    } else {
+                        if buf.len() >= BUFFER_CAPACITY {
+                            buf.pop_front();
+                        }
+                        buf.push_back(event.clone());
                     }
-                    buf.push_back(event.clone());
                 }
 
                 // Live broadcast to all SSE subscribers

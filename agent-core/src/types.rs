@@ -48,9 +48,14 @@ pub struct TreeHeader {
 }
 
 // ── Tree entries ──
+//
+// Uses `entry_type` (not `type`) as the tag to avoid a collision when
+// ServerEvent::Entry(Entry) is serialized — ServerEvent uses `type` as its
+// tag, and having both enums use the same tag name would produce duplicate
+// JSON keys ({"type":"entry","type":"message",...}).
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type")]
+#[serde(tag = "entry_type")]
 pub enum Entry {
     #[serde(rename = "session_start")]
     SessionStart {
@@ -351,7 +356,6 @@ pub enum ServerEvent {
         output: String,
     },
     /// Any persisted entry was just written to the tree.
-    /// The Entry enum at the storage layer IS the wire format.
     #[serde(rename = "entry")]
     Entry(Entry),
     /// Runtime advisory only (never stored).

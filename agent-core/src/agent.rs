@@ -405,8 +405,10 @@ pub fn run_agent(
         let leaf_ref = leaf_id.as_deref().unwrap_or("root");
         let mut messages = build_context(&entries, leaf_ref);
 
-        // 4. Append user message
-        messages.push(Message {
+        // 4. Append and persist user message
+        let user_msg_id = generate_entry_id();
+        let user_msg_parent = leaf_id.clone();
+        let user_msg = Message {
             role: MessageRole::User,
             content: MessageContent::Text(text),
             tool_calls: None,
@@ -415,7 +417,15 @@ pub fn run_agent(
             usage: None,
             stop_reason: None,
             is_error: None,
-        });
+        };
+
+        write_message_entry(
+            &store, tree_id, &event_tx,
+            &user_msg_id, user_msg_parent.as_deref(),
+            &user_msg, &mut leaf_id,
+        );
+
+        messages.push(user_msg);
 
         // 5. Load context files and prepend system prompt
         let ctx_files = context_files::load_context_files(&cwd, store.base_dir());

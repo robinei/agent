@@ -95,6 +95,67 @@ fn print_tree_meta(meta: &TreeMeta, index: usize) {
     println!("  [{}] {} — {} ({})", index + 1, short_id, title, status);
 }
 
+/// Replay old entries as if they just happened — seamless, no "quit" feel.
+/// Shows roles and turn boundaries for clarity.
+fn replay_entries(entries: &[Entry]) {
+    let mut in_turn = false;
+    let mut state = RenderState::default();
+
+    for entry in entries {
+        match entry {
+            Entry::SessionStart { .. } | Entry::SessionEnd { .. } | Entry::Label { .. } => continue,
+
+            Entry::Message { message, .. }
+                if message.role == agent_core::types::MessageRole::User =>
+            {
+                if in_turn {
+                    println!("{}──────────────────────{}",
+                             color::Fg(color::Blue), style::Reset);
+                }
+                in_turn = true;
+
+                // Render user message directly with role label
+                let t = match &message.content {
+                    agent_core::types::MessageContent::Text(t) => t.clone(),
+                    _ => "[content blocks]".into(),
+                };
+                println!();
+                println!("{}●  {}User:{}  {}",
+                         color::Fg(color::Green), style::Bold, style::Reset, t);
+            }
+
+            _ => {
+                if !in_turn {
+                    println!("{}·  ·  ·{}",
+                             color::Fg(color::LightBlack), style::Reset);
+                    in_turn = true;
+                }
+                render_event(&ServerEvent::Entry(entry.clone()), &mut state);
+            }
+        }
+    }
+
+    if let Some(last) = entries.last() {
+        if !matches!(last, Entry::SessionEnd { .. }) {
+            if in_turn {
+                println!("{}──────────────────────{}",
+                         color::Fg(color::Blue), style::Reset);
+            }
+            render_done("complete");
+        }
+    }
+}
+
+fn render_done(status: &str) {
+    println!();
+    match status {
+        "complete" => println!("  {}✓{} Done", color::Fg(color::Green), style::Reset),
+        "stop" => println!("  {}■{} Stopped", color::Fg(color::Yellow), style::Reset),
+        _ => println!("  {}{}", style::Bold, status),
+    }
+}
+
+
 fn print_entry_summary(entry: &Entry) {
     match entry {
         Entry::Message { message, .. } => {
@@ -129,14 +190,19 @@ fn print_entry_summary(entry: &Entry) {
 // ── Event rendering ──
 
 #[derive(Default)]
-#[allow(dead_code)]
-struct DedupTracker {
-    rendered: HashSet<String>,
+struct RenderState {
+    _rendered: HashSet<String>,
+    assistant_header_shown: bool,
 }
 
-fn render_event(event: &ServerEvent, _dedup: &mut DedupTracker) {
+fn render_event(event: &ServerEvent, state: &mut RenderState) {
     match event {
         ServerEvent::TextChunk { content } => {
+            if !state.assistant_header_shown {
+                state.assistant_header_shown = true;
+                println!();
+                println!("{}  {}:{}", color::Fg(color::Cyan), "Assistant", style::Reset);
+            }
             print!("{}", content);
             io::stdout().flush().ok();
         }
@@ -162,12 +228,13 @@ fn render_event(event: &ServerEvent, _dedup: &mut DedupTracker) {
         ServerEvent::Entry(entry) => {
             match entry {
                 Entry::Message { message, .. } if message.role == agent_core::types::MessageRole::User => {
-                    println!();
                     let t = match &message.content {
                         agent_core::types::MessageContent::Text(t) => t.clone(),
                         _ => "[content blocks]".into(),
                     };
-                    println!("●  {}", t);
+                    println!();
+                    println!("{}●  {}User:{}  {}",
+                             color::Fg(color::Green), style::Bold, style::Reset, t);
                 }
                 Entry::GoalSet { goal, .. } => { println!(); println!("🎯  {}", goal); }
                 Entry::ModelSet { model, .. } => { println!(); println!("🤖  Model: {}", model); }
@@ -179,7 +246,38 @@ fn render_event(event: &ServerEvent, _dedup: &mut DedupTracker) {
                              if s.is_empty() { String::new() } else { format!(": {}", s) },
                              style::Reset);
                 }
-                _ => {} // skip Message(assistant), BashExec, etc.
+                Entry::Message { message, .. } => {
+                    // Assistant / System / Tool messages — render body
+                    let t = match &message.content {
+                        agent_core::types::MessageContent::Text(t) => t.clone(),
+                        _ => "[content blocks]".into(),
+                    };
+                    if !t.is_empty() {
+                        let role_label = match message.role {
+                            agent_core::types::MessageRole::Assistant => "Assistant",
+                            agent_core::types::MessageRole::System => "System",
+                            agent_core::types::MessageRole::Tool => "Tool",
+                            _ => "",
+                        };
+                        println!();
+                        if !role_label.is_empty() {
+                            println!("{}  {}:{}", color::Fg(color::Cyan), role_label, style::Reset);
+                        }
+                        println!("{}", t);
+                    }
+                }
+                Entry::BashExec { command, output, exit_code, .. } => {
+                    println!();
+                    println!("{}  🛠  {}bash: {}{}",
+                             color::Fg(color::Yellow), style::Bold, command, style::Reset);
+                    let c = if *exit_code == 0 { color::Fg(color::Green).to_string() }
+                             else { color::Fg(color::Red).to_string() };
+                    println!("{}  bash (exit: {}){}", c, exit_code, style::Reset);
+                    if !output.is_empty() {
+                        print_indented(output, "│");
+                    }
+                }
+                _ => {} // skip SessionStart, Label, etc.
             }
         }
         ServerEvent::CapWarning { level, pct } => {
@@ -189,14 +287,7 @@ fn render_event(event: &ServerEvent, _dedup: &mut DedupTracker) {
             if *fatal { print_error(&format!("Fatal: {}", message)); }
             else { print_warning(&format!("Error: {}", message)); }
         }
-        ServerEvent::Done { status } => {
-            println!();
-            match status.as_str() {
-                "complete" => println!("  {}✓{} Done", color::Fg(color::Green), style::Reset),
-                "stop" => println!("  {}■{} Stopped", color::Fg(color::Yellow), style::Reset),
-                _ => println!("  {}{}", style::Bold, status),
-            }
-        }
+        ServerEvent::Done { status } => render_done(status),
         ServerEvent::FileChanged { path, kind } => {
             println!(); println!("  📄 {} ({})", path, kind);
         }
@@ -281,17 +372,19 @@ fn create_tree_interactive(client: &AgentClient) -> Result<String, String> {
 
 fn process_message(server: &str, tree_id: &str, text: &str) -> Result<(), String> {
     let client = AgentClient::new(server);
-    println!("\n●  {}", text);
-    client.send_message(tree_id, text)?;
 
+    // Open SSE stream FIRST so we don't miss any events.
+    // (The stream auto-spawns the agent if needed.)
+    // Then send the message, so we're already listening when events arrive.
     let mut stream = client.stream_events(tree_id)?;
-    let mut dedup = DedupTracker::default();
+    client.send_message(tree_id, text)?;
+    let mut state = RenderState::default();
 
     loop {
         match stream.next_event() {
             Some(event) => {
                 let is_done = matches!(&event, ServerEvent::Done { .. });
-                render_event(&event, &mut dedup);
+                render_event(&event, &mut state);
                 if is_done { break; }
             }
             None => break,
@@ -311,20 +404,36 @@ pub fn run_interactive(server: &str) -> Result<(), String> {
 
     let client = AgentClient::new(server);
     let mut current_tree_id = select_or_create_tree(&client)?;
+    let mut show_header = true;
 
     loop {
-        // Show tree context
-        match client.get_tree(&current_tree_id) {
-            Ok(meta) => {
-                let title = meta.title.as_deref().unwrap_or("untitled");
-                let short_id = if current_tree_id.len() > 8 { &current_tree_id[..8] } else { &current_tree_id };
-                println!("\n{}──────────────────────────────{}",
-                         color::Fg(color::Blue), style::Reset);
-                println!("Now talking in: {} ({})", title, short_id);
-                println!("{}──────────────────────────────{}",
-                         color::Fg(color::Blue), style::Reset);
+        // Show tree context only on first render or when tree changes
+        if show_header {
+            match client.get_tree(&current_tree_id) {
+                Ok(meta) => {
+                    let title = meta.title.as_deref().unwrap_or("untitled");
+                    let short_id = if current_tree_id.len() > 8 {
+                        &current_tree_id[..8]
+                    } else {
+                        &current_tree_id
+                    };
+                    println!("\n{}──────────────────────────────{}",
+                             color::Fg(color::Blue), style::Reset);
+                    println!("Now talking in: {} ({})", title, short_id);
+                    println!("{}──────────────────────────────{}",
+                             color::Fg(color::Blue), style::Reset);
+
+                    // Replay latest entries as if they just happened
+                    if let Ok(entries) = client.get_entries(&current_tree_id) {
+                        if !entries.is_empty() {
+                            let last: Vec<_> = entries.iter().rev().take(10).rev().cloned().collect();
+                            replay_entries(&last);
+                        }
+                    }
+                }
+                Err(e) => print_warning(&format!("Failed to load tree: {}", e)),
             }
-            Err(e) => print_warning(&format!("Failed to load tree: {}", e)),
+            show_header = false;
         }
 
         // Prompt
@@ -353,6 +462,7 @@ pub fn run_interactive(server: &str) -> Result<(), String> {
                 ) {
                     Ok(meta) => {
                         current_tree_id = meta.id.clone();
+                        show_header = true;
                         let short_id = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
                         println!("{}Created tree {} ({}){}",
                                  color::Fg(color::Green), short_id,
@@ -367,6 +477,7 @@ pub fn run_interactive(server: &str) -> Result<(), String> {
                 match client.get_tree(&id) {
                     Ok(meta) => {
                         current_tree_id = meta.id;
+                        show_header = true;
                         println!("{}Switched to tree {}{}",
                                  color::Fg(color::Green),
                                  meta.title.as_deref().unwrap_or(&id),
