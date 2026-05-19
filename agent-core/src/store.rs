@@ -75,12 +75,17 @@ impl Store {
         self.base_dir.join("trees")
     }
 
+    /// Returns the per-tree directory path (used by bwrap arg construction).
+    pub fn tree_dir_for(&self, id: &str) -> PathBuf {
+        self.tree_dir().join(id)
+    }
+
     fn meta_path(&self, id: &str) -> PathBuf {
-        self.tree_dir().join(format!("{}.meta.json", id))
+        self.tree_dir_for(id).join("meta.json")
     }
 
     pub fn jsonl_path(&self, id: &str) -> PathBuf {
-        self.tree_dir().join(format!("{}.jsonl", id))
+        self.tree_dir_for(id).join("data.jsonl")
     }
 
     // ── Index cache helpers ──
@@ -145,11 +150,14 @@ impl Store {
         }
         for entry in std::fs::read_dir(&dir)? {
             let path = entry?.path();
-            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !fname.ends_with(".meta.json") {
+            if !path.is_dir() {
                 continue;
             }
-            match std::fs::read_to_string(&path) {
+            let meta_path = path.join("meta.json");
+            if !meta_path.exists() {
+                continue;
+            }
+            match std::fs::read_to_string(&meta_path) {
                 Ok(content) => {
                     match serde_json::from_str::<TreeMeta>(&content) {
                         Ok(meta) => {
@@ -157,12 +165,12 @@ impl Store {
                             trees.push(meta);
                         }
                         Err(e) => {
-                            warn!("Skipping corrupt meta file {:?}: {}", path, e);
+                            warn!("Skipping corrupt meta file {:?}: {}", meta_path, e);
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("Skipping unreadable meta file {:?}: {}", path, e);
+                    warn!("Skipping unreadable meta file {:?}: {}", meta_path, e);
                 }
             }
         }
@@ -302,6 +310,30 @@ mod tests {
     }
 
     #[test]
+    fn test_create_tree_writes_subdir() {
+        let (store, dir) = make_store("subdir");
+        let tree_id = "subdir-001";
+
+        store.create_tree_file(tree_id, "test-model").unwrap();
+
+        let meta = TreeMeta {
+            id: tree_id.to_string(),
+            parent_id: None,
+            repo_path: None,
+            title: None,
+            created_at: 100,
+            updated_at: 100,
+            leaf_id: None,
+            sandbox: TreeSandbox::default(),
+        };
+        store.save_tree_meta(&meta).unwrap();
+
+        let tree_dir = dir.path().join("trees").join(tree_id);
+        assert!(tree_dir.join("data.jsonl").exists(), "data.jsonl should exist in tree subdir");
+        assert!(tree_dir.join("meta.json").exists(), "meta.json should exist in tree subdir");
+    }
+
+    #[test]
     fn test_create_and_read_tree() {
         let (store, _dir) = make_store("create_read");
         let tree_id = "test-001";
@@ -363,6 +395,7 @@ mod tests {
             created_at: 1000,
             updated_at: 1001,
             leaf_id: None,
+            sandbox: TreeSandbox::default(),
         };
 
         store.save_tree_meta(&meta).unwrap();
@@ -389,6 +422,7 @@ mod tests {
             created_at: 100,
             updated_at: 200,
             leaf_id: None,
+            sandbox: TreeSandbox::default(),
         };
         let m2 = TreeMeta {
             id: id2.to_string(),
@@ -398,6 +432,7 @@ mod tests {
             created_at: 100,
             updated_at: 300,
             leaf_id: None,
+            sandbox: TreeSandbox::default(),
         };
         store.save_tree_meta(&m1).unwrap();
         store.save_tree_meta(&m2).unwrap();

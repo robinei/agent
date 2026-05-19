@@ -1,4 +1,5 @@
 use std::io::BufRead;
+use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 // ── Identifiers ──
@@ -6,8 +7,27 @@ use serde::{Deserialize, Serialize};
 pub type TreeId = String;
 pub type EntryId = String; // 8-char hex
 
+// ── Tree sandbox config ──
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TreeSandbox {
+    #[serde(default)]
+    pub writable: Vec<PathBuf>,
+    #[serde(default)]
+    pub network: Option<bool>,
+    #[serde(default)]
+    pub hide: Vec<PathBuf>,
+    #[serde(default)]
+    pub unhide: Vec<PathBuf>,
+}
+
 // ── Tree metadata ──
 
+/// Tree metadata. The server is the sole writer of meta.json. Workers
+/// communicate desired meta changes via events; the server applies them.
+/// This invariant means a worker cannot redirect a future spawn by
+/// rewriting its own meta to point at a different repo_path or escalated
+/// sandbox config.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TreeMeta {
     pub id: TreeId,
@@ -19,6 +39,8 @@ pub struct TreeMeta {
     pub updated_at: i64,
     /// Points to the most recent entry. None = empty tree.
     pub leaf_id: Option<EntryId>,
+    #[serde(default)]
+    pub sandbox: TreeSandbox,
 }
 
 /// Derive the current goal from the entry tree by walking from leaf_id to root.
@@ -389,4 +411,16 @@ pub struct ToolOutput {
     pub truncated: bool,
     pub original_size: usize,
     pub exit_code: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tree_meta_sandbox_default() {
+        let json = r#"{"id":"abc","parent_id":null,"repo_path":null,"title":"test","created_at":100,"updated_at":100,"leaf_id":null}"#;
+        let meta: TreeMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.sandbox, TreeSandbox::default());
+    }
 }

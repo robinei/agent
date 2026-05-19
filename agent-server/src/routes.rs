@@ -133,6 +133,7 @@ fn handle_create_tree(request: &Request, store: &Store) -> Response {
         created_at: now,
         updated_at: now,
         leaf_id: None,
+        sandbox: agent_core::types::TreeSandbox::default(),
     };
 
     if let Err(e) = store.create_tree_file(&tree_id, &model) {

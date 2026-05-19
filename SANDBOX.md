@@ -497,7 +497,7 @@ Each step produces working, testable code. **On completion of a step, check
 its box and append a `**Notes:**` block directly below it** with: files
 created/modified, decisions made, deviations from this plan, and the verify
 command output. The notes stay in this file so the plan and the record stay
-together.
+together. **Commit the changes after updating the step notes.**
 
 Format per step:
 
@@ -554,7 +554,7 @@ These hold throughout. Don't re-explain them per step.
 
 ### Step 1 — Store restructure
 
-- [ ]
+- [x] done
 
 **Goal:** Per-tree subdirectory layout; server is sole writer of `meta.json`.
 
@@ -638,7 +638,15 @@ lifecycle. Only `store.rs` and `types.rs`.
 `~/.agent/trees/{id}/data.jsonl` + `meta.json` on disk.
 
 **Notes:**
-_(fill in on completion)_
+- Created: none
+- Modified: `agent-core/src/types.rs` — added `TreeSandbox` struct, added `sandbox` field to `TreeMeta`
+- Modified: `agent-core/src/store.rs` — changed `meta_path`/`jsonl_path` to use `{id}/meta.json` and `{id}/data.jsonl`; added public `tree_dir_for()`; changed `rebuild_index` to scan subdirectories; updated all test `TreeMeta` constructors
+- Modified: `agent-core/src/tools/search.rs` — updated `search_trees` to walk subdirectories for `data.jsonl` instead of flat `*.jsonl` files; removed unused `BufRead` import
+- Modified: `agent-server/src/routes.rs` — added `sandbox: TreeSandbox::default()` to `handle_create_tree`
+- Test added: `test_tree_meta_sandbox_default` in `types.rs`
+- Test added: `test_create_tree_writes_subdir` in `store.rs`
+- Deviation: `rebuild_index` also needed updating from flat file scan to subdirectory scan; `search_trees` in search.rs also needed updating for the same reason
+- Verified: `cargo test --workspace` → 77 passed, 0 failed
 
 ---
 

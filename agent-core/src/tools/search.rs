@@ -6,7 +6,6 @@
 //! `search_files` finds files in the store directory by path pattern.
 
 use std::fs;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
@@ -49,31 +48,28 @@ impl SearchMessagesTool {
             let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
             let path = entry.path();
 
-            // Only process .jsonl files
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            // Only process subdirectories (per-tree dirs)
+            if !path.is_dir() {
                 continue;
             }
 
-            let fname = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if let Some(tid) = tree_id {
                 if fname != tid {
                     continue;
                 }
             }
 
+            let jsonl_path = path.join("data.jsonl");
+            if !jsonl_path.exists() {
+                continue;
+            }
+
             _file_count += 1;
 
-            // Stream-deserialize the JSONL file
-            let file = fs::File::open(&path).map_err(|e| format!("Cannot open {}: {}", path.display(), e))?;
-            let reader = std::io::BufReader::new(file);
-            let mut lines = reader.lines();
-
-            // Skip header line
-            lines.next();
-
             // Parse entries via serde stream
-            let content = fs::read_to_string(&path)
-                .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+            let content = fs::read_to_string(&jsonl_path)
+                .map_err(|e| format!("Cannot read {}: {}", jsonl_path.display(), e))?;
 
             for (line_idx, line) in content.lines().enumerate() {
                 if results.len() >= limit {
