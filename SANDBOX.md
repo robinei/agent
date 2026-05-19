@@ -1720,7 +1720,7 @@ exists), tools, CLI.
 
 ### Step 7 — Unified binary + remove old code
 
-- [ ]
+- [x] done
 
 **Goal:** Remove the old thread-based agent lifecycle and the SSE path.
 
@@ -1749,7 +1749,12 @@ only its host changes), tools, hooks, store.
 still work.
 
 **Notes:**
-_(fill in on completion)_
+- Modified: `agent-server/src/lifecycle.rs` — removed `AgentHandle`, `ACTIVE_AGENTS`, `spawn()`, `stop()`, `send_message()`, `get_handle()`, and the bridge thread; removed unused imports (`agent::run_agent`, `AtomicBool`, `AgentInput`); kept all worker subprocess lifecycle code (`WorkerEntry`, `ACTIVE_WORKERS`, etc.)
+- Modified: `agent-server/src/routes.rs` — removed `SendMessageBody`, `handle_send_message()`; removed `("POST", "message")` route dispatch entry; re-wired `handle_stop_agent` to use `lifecycle::worker_stop` instead of removed `lifecycle::stop`
+- Modified: `agent-server/src/http.rs` — removed `handle_sse()` function and the `GET /trees/{id}/stream` SSE path detection
+- Modified: `agent-cli/src/client.rs` — removed unused `send_stop()` method from `AgentSession`
+- Deviation: Did not remove `POST /trees/{id}/stop` route — it's still used by CLI `Stop` subcommand and interactive `/stop` command; re-wired it to use `lifecycle::worker_stop` instead
+- Verified: `cargo build --workspace` → clean; `cargo test --workspace` → 98 passed, 0 failed; `cargo clippy --workspace` → no new warnings
 
 ---
 

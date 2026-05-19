@@ -84,90 +84,9 @@ pub fn handle_connection(mut stream: TcpStream, store: Arc<Store>, cfg: Arc<Conf
     }
     let body = &buf[header_end..need.min(buf.len())];
 
-    if method == "GET" {
-        if let Some(rest) = path.strip_prefix("/trees/") {
-            if let Some(id) = rest.strip_suffix("/stream") {
-                if !id.is_empty() && !id.contains('/') {
-                    handle_sse(id, &mut stream, &store, &cfg);
-                    return;
-                }
-            }
-        }
-    }
-
     let (status, body_bytes, content_type) =
         crate::routes::dispatch(&method, &path, body, &store, &cfg);
     write_response(&mut stream, status, &body_bytes, content_type);
-}
-
-fn handle_sse(
-    id: &str,
-    stream: &mut TcpStream,
-    store: &Arc<Store>,
-    cfg: &Arc<Config>,
-) {
-    log::info!("[sse] Opening SSE stream for tree {}", id);
-
-    if crate::lifecycle::get_handle(id).is_none() {
-        log::info!("[sse] Auto-spawning agent for tree {}", id);
-        if let Err(e) = crate::lifecycle::spawn(id, store.clone(), cfg) {
-            let body = serde_json::to_vec(&serde_json::json!({
-                "error": format!("Failed to spawn agent: {}", e)
-            }))
-            .unwrap_or_default();
-            write_response(stream, 500, &body, "application/json");
-            return;
-        }
-    }
-
-    let handle = match crate::lifecycle::get_handle(id) {
-        Some(h) => h,
-        None => {
-            let body = serde_json::to_vec(&serde_json::json!({
-                "error": format!("No active agent for tree {}", id)
-            }))
-            .unwrap_or_default();
-            write_response(stream, 404, &body, "application/json");
-            return;
-        }
-    };
-
-    let mut writer = std::io::BufWriter::with_capacity(8192, stream);
-    let _ = write!(
-        &mut writer,
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: text/event-stream\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: keep-alive\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         \r\n"
-    );
-    let _ = writer.flush();
-
-    {
-        let buf = handle.event_buffer.lock().unwrap();
-        for event in buf.iter() {
-            if let Ok(json) = serde_json::to_string(event) {
-                let _ = write!(&mut writer, "data: {}\n\n", json);
-            }
-        }
-    }
-    let _ = writer.flush();
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    {
-        let mut subs = handle.event_broadcast.lock().unwrap();
-        subs.push(tx);
-    }
-
-    for event in &rx {
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = write!(&mut writer, "data: {}\n\n", json);
-            let _ = writer.flush();
-        }
-    }
-
-    log::info!("[sse] SSE stream ended for tree {}", id);
 }
 
 fn header_get(headers: &[(String, Vec<u8>)], name: &str) -> Option<Vec<u8>> {

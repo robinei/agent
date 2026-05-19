@@ -182,12 +182,6 @@ impl AgentSession {
         self.ws.send(tungstenite::Message::Text(s)).map_err(|e| e.to_string())
     }
 
-    /// Send a stop command to the agent.
-    pub fn send_stop(&mut self) -> Result<(), String> {
-        let s = serde_json::to_string(&agent_core::rpc::WsCommand::Stop).map_err(|e| e.to_string())?;
-        self.ws.send(tungstenite::Message::Text(s)).map_err(|e| e.to_string())
-    }
-
     /// Read the next event from the WebSocket. Returns None on close/error.
     pub fn next_event(&mut self) -> Option<Result<agent_core::types::ServerEvent, String>> {
         loop {
