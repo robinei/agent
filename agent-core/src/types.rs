@@ -398,13 +398,23 @@ pub struct DeltaToolCallFunction {
 
 /// Iterator over SSE lines from the LLM streaming response.
 pub struct ChatStream {
-    reader: std::io::BufReader<ureq::BodyReader<'static>>,
+    reader: Box<dyn std::io::BufRead + Send>,
 }
 
 impl ChatStream {
     pub fn new(reader: ureq::BodyReader<'static>) -> Self {
         Self {
-            reader: std::io::BufReader::new(reader),
+            reader: Box::new(std::io::BufReader::new(reader)),
+        }
+    }
+
+    /// Construct a ChatStream from canned data (used by test stub provider).
+    /// The data should be SSE-formatted lines separated by `\n`.
+    pub fn from_canned(data: &str) -> Self {
+        Self {
+            reader: Box::new(std::io::BufReader::new(std::io::Cursor::new(
+                data.as_bytes().to_vec(),
+            ))),
         }
     }
 

@@ -1890,7 +1890,7 @@ returns 201 with sandbox echoed in the meta response. `agent create ...
 
 ### Step 10 — End-to-end worker integration test
 
-- [ ]
+- [x] done
 
 **Goal:** Single integration test that spawns a real worker and asserts
 the protocol survives.
@@ -1966,4 +1966,10 @@ Do not modify: anything else.
 **Verify:** `cargo test -p agent-worker --test end_to_end` passes.
 
 **Notes:**
-_(fill in on completion)_
+- Created: `agent-worker/tests/end_to_end.rs` — integration test that spawns the agent binary as a worker subprocess, seeds a temp store with a tree, sends a message via stdin, collects events from stdout, and asserts TextChunk/Done events plus user/assistant entries in the store
+- Modified: `agent-core/src/provider.rs` — added `AGENT_TEST_STUB=1` env var check at the top of `stream_chat()` that returns canned SSE data via `ChatStream::from_canned`; includes an explanatory comment noting the integration test dependency
+- Modified: `agent-core/src/types.rs` — changed `ChatStream` from wrapping `BufReader<ureq::BodyReader<'static>>` to `Box<dyn BufRead + Send>`; added `ChatStream::from_canned(data: &str)` constructor for injecting canned SSE data
+- Modified: `agent-worker/Cargo.toml` — added `tempfile = "3"` dev-dependency
+- Deviation: Used `CARGO_MANIFEST_DIR` + `PROFILE` env var to locate the `agent` binary instead of `env!("CARGO_BIN_EXE_agent")` (which would require `agent` as a dev-dependency of `agent-worker`, creating a circular dependency since `agent` already depends on `agent-worker`)
+- Deviation: Used runtime env var check (`AGENT_TEST_STUB=1`) rather than `#[cfg(feature = "test-stub")]` feature gate; both approaches are called out as valid in the spec; the env var approach avoids feature flag propagation across crate boundaries
+- Verified: `cargo test --workspace` → 107 passed, 0 failed; `cargo clippy --workspace` → no new warnings

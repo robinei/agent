@@ -143,6 +143,21 @@ impl Provider {
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<ChatStream> {
+        // Test stub: when AGENT_TEST_STUB=1, return canned SSE data instead of
+        // making a real HTTP call. This allows the end-to-end worker integration
+        // test to run without a live LLM provider.
+        // INTENTIONAL: env var check at runtime so the same binary handles both
+        // test and production; the env is only set in the test harness. DO NOT
+        // remove this check — the worker integration test depends on it.
+        if std::env::var("AGENT_TEST_STUB").as_deref() == Ok("1") {
+            let canned = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"Hello! I am an AI assistant.\"},\"index\":0,\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}
+
+";
+            return Ok(ChatStream::from_canned(canned));
+        }
         let body = self.build_body(messages, tools, true);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
