@@ -43,6 +43,68 @@ pub struct TreeMeta {
     pub sandbox: TreeSandbox,
 }
 
+/// Validate and canonicalize a repo_path for tree creation.
+/// Returns the canonical path on success, or an error string explaining why
+/// the path was rejected.
+pub fn validate_repo_path(
+    repo_path: &std::path::Path,
+    defaults_hide: &[PathBuf],
+    sandbox: &TreeSandbox,
+) -> Result<PathBuf, String> {
+    let canon = std::fs::canonicalize(repo_path)
+        .map_err(|e| format!("canonicalize {:?}: {}", repo_path, e))?;
+    if !canon.is_dir() {
+        return Err(format!("{:?} is not a directory", canon));
+    }
+
+    let home = dirs_home();
+    let banned: &[&std::path::Path] = &[
+        std::path::Path::new("/"),
+        &home,
+        &home.join(".agent"),
+        &home.join(".config/agent"),
+    ];
+    if banned.iter().any(|b| canon == **b) {
+        return Err(format!("repo_path {:?} is not allowed", canon));
+    }
+
+    // Reject if canon == any default-hide path (after applying unhide)
+    let effective_hide: Vec<PathBuf> = defaults_hide
+        .iter()
+        .chain(sandbox.hide.iter())
+        .filter(|p| !sandbox.unhide.contains(p))
+        .map(expand_tilde)
+        .collect();
+    if effective_hide.iter().any(|h| canon == *h || canon.starts_with(h)) {
+        return Err(format!(
+            "repo_path {:?} overlaps a hidden directory",
+            canon
+        ));
+    }
+    Ok(canon)
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+fn expand_tilde(p: &PathBuf) -> PathBuf {
+    if p.starts_with("~") {
+        let home = dirs_home();
+        if p == &PathBuf::from("~") {
+            home
+        } else {
+            let stripped = p.strip_prefix("~").unwrap();
+            home.join(stripped)
+        }
+    } else {
+        p.clone()
+    }
+}
+
 /// Derive the current goal from the entry tree by walking from leaf_id to root.
 pub fn current_goal(entries: &[Entry], leaf_id: &str) -> Option<String> {
     let map: std::collections::HashMap<&str, &Entry> =
@@ -426,5 +488,54 @@ mod tests {
         let json = r#"{"id":"abc","parent_id":null,"repo_path":null,"title":"test","created_at":100,"updated_at":100,"leaf_id":null}"#;
         let meta: TreeMeta = serde_json::from_str(json).unwrap();
         assert_eq!(meta.sandbox, TreeSandbox::default());
+    }
+
+    #[test]
+    fn test_validate_repo_path_rejects_home() {
+        let home = dirs_home();
+        let result = validate_repo_path(&home, &[], &TreeSandbox::default());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not allowed"));
+    }
+
+    #[test]
+    fn test_validate_repo_path_rejects_root() {
+        let result = validate_repo_path(std::path::Path::new("/"), &[], &TreeSandbox::default());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not allowed"));
+    }
+
+    #[test]
+    fn test_validate_repo_path_rejects_hidden_overlap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let hidden_dir = tmp.path().join(".ssh");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        let sub_path = hidden_dir.join("something");
+        std::fs::create_dir_all(&sub_path).unwrap();
+        let result = validate_repo_path(
+            &sub_path,
+            &[hidden_dir],
+            &TreeSandbox::default(),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("hidden"));
+    }
+
+    #[test]
+    fn test_validate_repo_path_accepts_normal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("Code").join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let result = validate_repo_path(&repo, &[], &TreeSandbox::default());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), std::fs::canonicalize(&repo).unwrap());
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        let home = dirs_home();
+        assert_eq!(expand_tilde(&PathBuf::from("~")), home);
+        assert_eq!(expand_tilde(&PathBuf::from("~/foo")), home.join("foo"));
+        assert_eq!(expand_tilde(&PathBuf::from("/abs/path")), PathBuf::from("/abs/path"));
     }
 }

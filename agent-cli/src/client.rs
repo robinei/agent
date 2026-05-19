@@ -93,12 +93,16 @@ impl AgentClient {
         self.get_json("/trees")
     }
 
-    /// Create a new tree with optional title, repo_path, and model.
+    /// Create a new tree with optional title, repo_path, model, and sandbox config.
     pub fn create_tree(
         &self,
         title: Option<&str>,
         repo_path: Option<&str>,
         model: Option<&str>,
+        writable: &[std::path::PathBuf],
+        network: Option<bool>,
+        hide: &[std::path::PathBuf],
+        unhide: &[std::path::PathBuf],
     ) -> Result<TreeMeta, String> {
         let mut body = serde_json::Map::new();
         if let Some(t) = title {
@@ -110,6 +114,13 @@ impl AgentClient {
         if let Some(m) = model {
             body.insert("model".into(), serde_json::Value::String(m.to_string()));
         }
+        let sandbox = serde_json::json!({
+            "writable": writable,
+            "network": network,
+            "hide": hide,
+            "unhide": unhide,
+        });
+        body.insert("sandbox".into(), sandbox);
         self.post_json("/trees", &serde_json::Value::Object(body))
     }
 

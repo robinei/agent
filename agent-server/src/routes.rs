@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use agent_core::agent;
 use agent_core::provider::Provider;
-use agent_core::types::{Entry, TreeMeta};
+use agent_core::types::{Entry, TreeMeta, TreeSandbox};
 
 use crate::lifecycle;
 
@@ -15,11 +15,13 @@ pub struct CreateTreeBody {
     pub title: Option<String>,
     pub repo_path: Option<String>,
     pub model: Option<String>,
+    pub sandbox: Option<TreeSandbox>,
 }
 
 #[derive(Deserialize)]
 pub struct UpdateTreeBody {
     pub title: Option<String>,
+    pub sandbox: Option<TreeSandbox>,
 }
 
 pub fn dispatch(
@@ -74,10 +76,18 @@ fn handle_create_tree(body: &[u8], store: &Store) -> (u16, Vec<u8>, &'static str
 
     let tree_id = uuid::Uuid::new_v4().to_string();
 
-    let repo_path = body.repo_path.as_ref().map(|p| {
-        let path = std::path::Path::new(p);
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    });
+    let sandbox = body.sandbox.unwrap_or_default();
+
+    let repo_path = match &body.repo_path {
+        Some(p) => {
+            let path = std::path::Path::new(p);
+            match agent_core::types::validate_repo_path(path, &[], &sandbox) {
+                Ok(canon) => Some(canon),
+                Err(e) => return json(400, &serde_json::json!({"error": e})),
+            }
+        }
+        None => None,
+    };
 
     let now = chrono::Utc::now().timestamp();
     let model = body
@@ -93,7 +103,7 @@ fn handle_create_tree(body: &[u8], store: &Store) -> (u16, Vec<u8>, &'static str
         created_at: now,
         updated_at: now,
         leaf_id: None,
-        sandbox: agent_core::types::TreeSandbox::default(),
+        sandbox,
     };
 
     if let Err(e) = store.create_tree_file(&tree_id, &model) {
@@ -174,6 +184,9 @@ fn handle_update_tree(id: &str, body: &[u8], store: &Store) -> (u16, Vec<u8>, &'
 
     if let Some(title) = body.title {
         meta.title = Some(title);
+    }
+    if let Some(sandbox) = body.sandbox {
+        meta.sandbox = sandbox;
     }
     meta.updated_at = chrono::Utc::now().timestamp();
 

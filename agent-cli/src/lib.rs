@@ -42,6 +42,21 @@ enum SubCommand {
         repo_path: Option<String>,
         #[arg(long)]
         model: Option<String>,
+        /// Additional writable paths (repeatable)
+        #[arg(long, action = clap::ArgAction::Append)]
+        writable: Vec<std::path::PathBuf>,
+        /// Disable network access
+        #[arg(long, conflicts_with = "net")]
+        no_net: bool,
+        /// Enable network access (explicit)
+        #[arg(long, conflicts_with = "no_net")]
+        net: bool,
+        /// Additional directories to hide (repeatable)
+        #[arg(long, action = clap::ArgAction::Append)]
+        hide: Vec<std::path::PathBuf>,
+        /// Directories to unhide from defaults (repeatable)
+        #[arg(long, action = clap::ArgAction::Append)]
+        unhide: Vec<std::path::PathBuf>,
     },
     /// Send a message to an existing tree and stream the response
     Msg {
@@ -72,8 +87,8 @@ pub fn run(args: Vec<String>) {
     match &cli.command {
         Some(SubCommand::Serve { config }) => start_server(config.as_deref()),
         Some(SubCommand::Trees) => list_trees(&cli.server),
-        Some(SubCommand::Create { title, repo_path, model }) =>
-            create_tree(&cli.server, title, repo_path.as_deref(), model.as_deref()),
+        Some(SubCommand::Create { title, repo_path, model, writable, no_net, net, hide, unhide }) =>
+            create_tree(&cli.server, title, repo_path.as_deref(), model.as_deref(), writable, *no_net, *net, hide, unhide),
         Some(SubCommand::Msg { tree_id, message }) =>
             send_and_stream(&cli.server, tree_id, message, &stop),
         Some(SubCommand::Session { repo_path, message }) =>
@@ -134,8 +149,19 @@ fn list_trees(server: &str) {
     }
 }
 
-fn create_tree(server: &str, title: &str, repo_path: Option<&str>, model: Option<&str>) {
-    match client(server).create_tree(Some(title), repo_path, model) {
+fn create_tree(
+    server: &str,
+    title: &str,
+    repo_path: Option<&str>,
+    model: Option<&str>,
+    writable: &[std::path::PathBuf],
+    no_net: bool,
+    net: bool,
+    hide: &[std::path::PathBuf],
+    unhide: &[std::path::PathBuf],
+) {
+    let network = if no_net { Some(false) } else if net { Some(true) } else { None };
+    match client(server).create_tree(Some(title), repo_path, model, writable, network, hide, unhide) {
         Ok(meta) => {
             let sid = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
             println!("Created tree {} ({})", sid, meta.title.as_deref().unwrap_or("untitled"));
@@ -190,8 +216,16 @@ fn session_and_stream(server: &str, repo_path: &str, message: &str, stop: &Atomi
     };
     let rp = abs.to_string_lossy().to_string();
 
-    let meta = c.create_tree(Some("untitled"), Some(&rp), None)
-        .unwrap_or_else(|e| exit_err(&e));
+    let meta = c.create_tree(
+        Some("untitled"),
+        Some(&rp),
+        None,
+        &[],
+        None,
+        &[],
+        &[],
+    )
+    .unwrap_or_else(|e| exit_err(&e));
     let sid = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
     println!("Created tree {} in {}", sid, rp);
 

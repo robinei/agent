@@ -418,7 +418,7 @@ fn create_tree_interactive(
     let model = model.trim().to_string();
     let model = if model.is_empty() { None } else { Some(model) };
 
-    let meta = client.create_tree(Some(&title), repo_path.as_deref(), model.as_deref())?;
+    let meta = client.create_tree(Some(&title), repo_path.as_deref(), model.as_deref(), &[], None, &[], &[])?;
     let short_id = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
     write!(out, "{}Created tree {} ({}){}\r\n",
            color::Fg(color::Green), short_id,
@@ -477,7 +477,7 @@ pub fn run_interactive(server: &str, initial_repo_path: Option<String>, stop: &A
 
     let client = AgentClient::new(server);
     let mut current_tree_id = if let Some(rp) = initial_repo_path {
-        let meta = client.create_tree(Some("untitled"), Some(&rp), None)
+        let meta = client.create_tree(Some("untitled"), Some(&rp), None, &[], None, &[], &[])
             .map_err(|e| format!("failed to create tree: {}", e))?;
         let sid = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
         write!(out, "Created tree {} in {}\r\n", sid, rp).ok();
@@ -543,6 +543,10 @@ pub fn run_interactive(server: &str, initial_repo_path: Option<String>, stop: &A
                     if title.is_empty() { None } else { Some(&title) },
                     repo_path.as_deref(),
                     model.as_deref(),
+                    &[],
+                    None,
+                    &[],
+                    &[],
                 ) {
                     Ok(meta) => {
                         current_tree_id = meta.id.clone();

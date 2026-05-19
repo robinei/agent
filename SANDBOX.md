@@ -1760,7 +1760,7 @@ still work.
 
 ### Step 8 — Per-tree sandbox config (schema + editing surface)
 
-- [ ]
+- [x] done
 
 **Goal:** Plumb the `TreeSandbox` field added in Step 1 through CLI and
 HTTP. Validate `repo_path`. Still no bwrap enforcement.
@@ -1843,7 +1843,14 @@ returns 201 with sandbox echoed in the meta response. `agent create ...
 --repo-path /` → returns 400 with a useful message.
 
 **Notes:**
-_(fill in on completion)_
+- Created: none
+- Modified: `agent-core/src/types.rs` — added `validate_repo_path`, `dirs_home`, `expand_tilde` public functions; added 5 tests: `test_validate_repo_path_rejects_home`, `test_validate_repo_path_rejects_root`, `test_validate_repo_path_rejects_hidden_overlap`, `test_validate_repo_path_accepts_normal`, `test_expand_tilde`
+- Modified: `agent-server/src/routes.rs` — `CreateTreeBody` gains `sandbox: Option<TreeSandbox>`; `UpdateTreeBody` gains `sandbox: Option<TreeSandbox>`; `handle_create_tree` calls `validate_repo_path` and returns 400 on failure; `handle_update_tree` applies sandbox changes
+- Modified: `agent-cli/src/lib.rs` — `Create` subcommand gains `--writable`, `--no-net`, `--net`, `--hide`, `--unhide` flags; `create_tree` function forwards them; `session_and_stream` passes empty defaults
+- Modified: `agent-cli/src/client.rs` — `create_tree` accepts `writable`, `network`, `hide`, `unhide` params and serializes them into the `sandbox` JSON body field
+- Modified: `agent-cli/src/interactive.rs` — all three `create_tree` call sites (`create_tree_interactive`, `run_interactive` initial tree, `CliCommand::Create`) updated to pass empty sandbox defaults
+- Deviation: `validate_repo_path` lives in `types.rs` alongside `TreeSandbox` rather than a separate `sandbox.rs`; the spec mentioned either location
+- Verified: `cargo test --workspace` → 103 passed, 0 failed
 
 ---
 
