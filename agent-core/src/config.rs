@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Full server configuration, loaded from `~/.agent/config.toml` and env vars.
 #[derive(Clone, Debug)]
@@ -75,14 +75,12 @@ impl Default for Config {
     }
 }
 
-/// Load config from the default path (`~/.agent/config.toml`), falling back to
-/// defaults and applying environment variable overrides.
-pub fn load_config() -> Config {
+/// Load config from a given path, falling back to defaults and applying
+/// environment variable overrides.
+pub fn load_config_from_path(config_path: &Path) -> Config {
     let mut cfg = Config::default();
 
-    // Try to load from file
-    let config_path = agent_dir().join("config.toml");
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
+    if let Ok(content) = std::fs::read_to_string(config_path) {
         if !content.trim().is_empty() {
             if let Ok(table) = content.parse::<toml::Table>() {
                 apply_toml(&mut cfg, &table);
@@ -110,6 +108,12 @@ pub fn load_config() -> Config {
     }
 
     cfg
+}
+
+/// Load config from the default path (`~/.agent/config.toml`), falling back to
+/// defaults and applying environment variable overrides.
+pub fn load_config() -> Config {
+    load_config_from_path(&agent_dir().join("config.toml"))
 }
 
 /// Return the agent data directory (`~/.agent`).

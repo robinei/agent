@@ -4,6 +4,7 @@ pub mod context_files;
 pub mod hooks;
 pub mod logging;
 pub mod provider;
+pub mod rpc;
 pub mod store;
 pub mod tools;
 pub mod types;

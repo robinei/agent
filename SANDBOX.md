@@ -652,7 +652,7 @@ lifecycle. Only `store.rs` and `types.rs`.
 
 ### Step 2 — Protocol types + agent-worker skeleton
 
-- [ ]
+- [x] done
 
 **Goal:** `agent worker` subcommand compiles and bridges stdin/stdout to the
 agent loop. No sandbox yet.
@@ -837,7 +837,18 @@ echo '{"method":"message","params":{"text":"list files"}}' | \
 emits JSON event lines on stdout (TextChunk + Done at minimum).
 
 **Notes:**
-_(fill in on completion)_
+- Created: `agent-core/src/rpc.rs` — `WsCommand` enum, `MessageParams`, JSON line helpers (`write_json_line`, `read_json_line`), plus roundtrip tests
+- Created: `agent-worker/Cargo.toml`, `agent-worker/src/lib.rs` — worker entry point with stdin reader thread, agent thread, stdout writer thread; simple `parse_argv` for `--tree-id` and `--config`
+- Created: `agent/Cargo.toml`, `agent/src/main.rs` — unified binary with `server`, `cli`, `worker` subcommands
+- Created: `agent-server/src/lib.rs` — `pub fn run(args)` (refactored from main)
+- Created: `agent-cli/src/lib.rs` — `pub fn run(args)` (refactored from main, all helper functions moved from main.rs)
+- Modified: `agent-core/src/lib.rs` — added `pub mod rpc`
+- Modified: `agent-core/src/config.rs` — refactored `load_config` into `load_config_from_path(path)` + `load_config()` that calls it with default path
+- Modified: `agent-server/src/main.rs` — thin wrapper calling `agent_server::run()`
+- Modified: `agent-cli/src/main.rs` — thin wrapper calling `agent_cli::run()`
+- Modified: `root Cargo.toml` — added `agent-worker` and `agent` to workspace members
+- Deviation: `agent-cli/src/lib.rs` needs `Cli::parse_from` with prepended program name since `run()` receives args without the executable name
+- Verified: `cargo test --workspace` → 79 passed, 0 failed; `cargo clippy --workspace` → no new warnings
 
 ---
 

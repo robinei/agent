@@ -4,4 +4,6 @@ members = [
     "agent-core",
     "agent-server",
     "agent-cli",
+    "agent-worker",
+    "agent",
 ]

@@ -1,0 +1,9 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+agent-server = { path = "../agent-server" }
+agent-cli = { path = "../agent-cli" }
+agent-worker = { path = "../agent-worker" }
