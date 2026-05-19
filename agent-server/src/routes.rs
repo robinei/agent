@@ -109,7 +109,7 @@ fn handle_create_tree(body: &[u8], store: &Store) -> (u16, Vec<u8>, &'static str
         );
     }
 
-    let session_start_id = generate_entry_id();
+    let session_start_id = agent_core::util::generate_entry_id();
     let session_start = Entry::SessionStart {
         id: session_start_id.clone(),
         parent_id: None,
@@ -127,7 +127,7 @@ fn handle_create_tree(body: &[u8], store: &Store) -> (u16, Vec<u8>, &'static str
 
     if body.model.is_some() {
         let model_set = Entry::ModelSet {
-            id: generate_entry_id(),
+            id: agent_core::util::generate_entry_id(),
             parent_id: Some(session_start_id),
             timestamp: chrono::Utc::now().to_rfc3339(),
             model: model.clone(),
@@ -294,15 +294,6 @@ fn json<T: serde::Serialize>(status: u16, v: &T) -> (u16, Vec<u8>, &'static str)
 
 fn not_found() -> (u16, Vec<u8>, &'static str) {
     json(404, &serde_json::json!({"error": "not found"}))
-}
-
-fn generate_entry_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    format!("{:08x}", nanos.wrapping_mul(2654435761))
 }
 
 #[cfg(test)]

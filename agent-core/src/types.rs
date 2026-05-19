@@ -278,7 +278,7 @@ pub struct TokenUsage {
     pub total_tokens: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum SessionStatus {
     #[serde(rename = "continuing")]
     Continuing,

@@ -8,3 +8,4 @@ pub mod rpc;
 pub mod store;
 pub mod tools;
 pub mod types;
+pub mod util;

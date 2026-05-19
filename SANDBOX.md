@@ -1525,7 +1525,7 @@ work end-to-end via WS.
 
 ### Step 5 — Graceful shutdown + crash recovery
 
-- [ ]
+- [x] done
 
 **Goal:** Clean shutdown on SIGINT/SIGTERM; tree recovery on worker crash
 or unclean restart.
@@ -1623,7 +1623,19 @@ Do not modify: agent-core/agent.rs, tools, CLI.
    recovery point
 
 **Notes:**
-_(fill in on completion)_
+- Created: `agent-core/src/util.rs` — `generate_entry_id()` (promoted from private copies in `agent.rs` and `routes.rs`)
+- Modified: `agent-core/src/lib.rs` — added `pub mod util;`
+- Modified: `agent-core/src/types.rs` — added `PartialEq` to `SessionStatus` (needed by test)
+- Modified: `agent-core/src/agent.rs` — switched from private `generate_entry_id` to `crate::util::generate_entry_id`
+- Modified: `agent-core/src/store.rs` — added `scan_unterminated()` with test
+- Modified: `agent-server/Cargo.toml` — added `signal-hook = "0.3"`
+- Modified: `agent-server/src/lib.rs` — added signal handler registration (SIGINT/SIGTERM), non-blocking accept loop with shutdown check, startup `scan_unterminated` recovery, calls `lifecycle::shutdown_all()` on signal
+- Modified: `agent-server/src/lifecycle.rs` — added `append_synthetic_session_end()`, `shutdown_all()`; updated `spawn_stdout_proxy` to check child exit status on EOF and broadcast error+done on crash; added `Entry` import
+- Modified: `agent-server/src/routes.rs` — switched from private `generate_entry_id` to `agent_core::util::generate_entry_id`
+- Test added: `test_scan_unterminated` in `store.rs`
+- Test added: `test_append_synthetic_session_end` in `lifecycle.rs`
+- Deviation: Used `listener.set_nonblocking(true)` + sleep loop instead of `set_read_timeout` on `TcpListener` (Rust's `TcpListener` has no `set_read_timeout`); used `Child::kill()`/`wait()` instead of `nix::sys::signal::kill` to avoid an extra dep
+- Verified: `cargo test --workspace` → 97 passed, 0 failed
 
 ---
 

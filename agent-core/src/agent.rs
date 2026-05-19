@@ -246,14 +246,7 @@ fn preview_tool_output(output: &ToolOutput) -> String {
 
 // ── Entry ID generation ──
 
-fn generate_entry_id() -> EntryId {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    format!("{:08x}", nanos.wrapping_mul(2654435761))
-}
+// Uses agent-core/src/util.rs for generate_entry_id
 
 // ── Repo path resolution ──
 
@@ -331,7 +324,7 @@ fn write_session_end(
     continuation_brief: Option<String>,
 ) {
     let entry = Entry::SessionEnd {
-        id: generate_entry_id(),
+        id: crate::util::generate_entry_id(),
         parent_id: None,
         timestamp: chrono::Utc::now().to_rfc3339(),
         summary: None,
@@ -451,7 +444,7 @@ pub fn run_agent(
         let mut messages = build_context(&entries, leaf_ref);
 
         // 4. Append and persist user message
-        let user_msg_id = generate_entry_id();
+        let user_msg_id = crate::util::generate_entry_id();
         let user_msg_parent = leaf_id.clone();
         let user_msg = Message {
             role: MessageRole::User,
@@ -651,7 +644,7 @@ pub fn run_agent(
                     }).collect();
 
                     // Persist the assistant message with tool calls
-                    let msg_id = generate_entry_id();
+                    let msg_id = crate::util::generate_entry_id();
                     let msg_parent = leaf_id.clone();
 
                     let assistant_msg = Message {
@@ -729,7 +722,7 @@ pub fn run_agent(
                         if call.name == "bash" {
                             let exit_code = result.exit_code.unwrap_or(0);
                             let bash_entry = Entry::BashExec {
-                                id: generate_entry_id(),
+                                id: crate::util::generate_entry_id(),
                                 parent_id: leaf_id.clone(),
                                 timestamp: chrono::Utc::now().to_rfc3339(),
                                 command: call.arguments.get("command")
@@ -772,7 +765,7 @@ pub fn run_agent(
 
                     // Persist the assistant message
                     if !response_text.is_empty() {
-                        let msg_id = generate_entry_id();
+                        let msg_id = crate::util::generate_entry_id();
                         let msg_parent = leaf_id.clone();
                         let assistant_msg = Message {
                             role: MessageRole::Assistant,

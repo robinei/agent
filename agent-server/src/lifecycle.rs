@@ -8,7 +8,7 @@ use agent_core::agent;
 use agent_core::config::Config;
 use agent_core::provider::Provider;
 use agent_core::store::Store;
-use agent_core::types::{AgentInput, ServerEvent, TreeId};
+use agent_core::types::{AgentInput, Entry, ServerEvent, TreeId};
 
 /// Handle for controlling an active agent thread.
 #[derive(Clone)]
@@ -321,6 +321,30 @@ fn spawn_stdout_proxy(
             guard.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
         }
         log::info!("[proxy {}] worker stdout closed", tree_id);
+
+        // Crash detection: check child exit status
+        let exit_ok = {
+            let mut guard = entry.lock().unwrap();
+            if let Some(mut child) = guard.child.take() {
+                let status = child.wait().ok();
+                matches!(status, Some(s) if s.success())
+            } else {
+                true
+            }
+        };
+
+        if !exit_ok {
+            log::warn!("[proxy {}] worker exited with error", tree_id);
+            let err_event = ServerEvent::Error {
+                message: "worker exited unexpectedly".into(),
+                fatal: true,
+            };
+            let done_event = ServerEvent::Done { status: "aborted".into() };
+            let mut guard = entry.lock().unwrap();
+            guard.subscribers.retain(|tx| tx.send(err_event.clone()).is_ok());
+            guard.subscribers.retain(|tx| tx.send(done_event.clone()).is_ok());
+        }
+
         ACTIVE_WORKERS.lock().unwrap().remove(&tree_id);
     });
 }
@@ -338,6 +362,97 @@ fn spawn_stderr_demux(tree_id: String, stderr: ChildStderr) {
             }
         }
     });
+}
+
+// ── Graceful shutdown ──
+
+/// Append a synthetic `SessionEnd` (Aborted) entry to a tree's data file.
+/// Used when a worker crashes or the server shuts down uncleanly.
+pub fn append_synthetic_session_end(store: &Store, tree_id: &str) {
+    let entry = Entry::SessionEnd {
+        id: agent_core::util::generate_entry_id(),
+        parent_id: None,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        summary: Some("session aborted (worker exit or server shutdown)".into()),
+        status: agent_core::types::SessionStatus::Aborted,
+        continuation_brief: None,
+    };
+    if let Err(e) = store.append_entry(tree_id, &entry) {
+        log::error!("[lifecycle] append synthetic session_end for {}: {}", tree_id, e);
+    }
+}
+
+/// Signal all active workers to stop, wait up to 60s, then SIGKILL any survivors.
+pub fn shutdown_all(store: &Store) {
+    let snapshot: Vec<(String, u32)> = {
+        let map = ACTIVE_WORKERS.lock().unwrap();
+        map.iter()
+            .map(|(id, entry)| {
+                let pid = entry.lock().unwrap().pid;
+                (id.clone(), pid)
+            })
+            .collect()
+    };
+    if snapshot.is_empty() {
+        log::info!("[lifecycle] no active workers to shut down");
+        return;
+    }
+    log::info!("[lifecycle] shutting down {} worker(s)", snapshot.len());
+
+    // Step 1: send stop to all workers
+    for (id, _) in &snapshot {
+        let _ = worker_stop(id);
+    }
+
+    // Step 2: wait up to 60s for each worker
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    for (id, _pid) in &snapshot {
+        let child = {
+            let map = ACTIVE_WORKERS.lock().unwrap();
+            map.get(id)
+                .and_then(|entry| entry.lock().unwrap().child.take())
+        };
+        let exited = if let Some(mut child) = child {
+            loop {
+                if std::time::Instant::now() > deadline {
+                    break false;
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        log::info!("[lifecycle] worker {} exited: {}", id, status);
+                        break true;
+                    }
+                    Ok(None) => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        log::error!("[lifecycle] wait on worker {} failed: {}", id, e);
+                        break false;
+                    }
+                }
+            }
+        } else {
+            true // no child handle, assume exited
+        };
+
+        if !exited {
+            log::warn!("[lifecycle] worker {} still alive after 60s, killing", id);
+            // Use Child::kill on the handle or fall back to OS signal
+            if let Some(mut child) = {
+                let map = ACTIVE_WORKERS.lock().unwrap();
+                map.get(id)
+                    .and_then(|entry| entry.lock().unwrap().child.take())
+            } {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            append_synthetic_session_end(store, id);
+        }
+    }
+
+    // Final cleanup: remove all workers from the map
+    ACTIVE_WORKERS.lock().unwrap().clear();
+    log::info!("[lifecycle] shutdown complete");
 }
 
 #[cfg(test)]
@@ -395,5 +510,46 @@ mod tests {
 
         // Cleanup
         ACTIVE_WORKERS.lock().unwrap().remove(tree_id);
+    }
+
+    #[test]
+    fn test_append_synthetic_session_end() {
+        use agent_core::store::Store;
+        use agent_core::types::SessionStatus;
+        use tempfile::TempDir;
+
+        let dir = TempDir::with_prefix("agent-lifecycle-test-").unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        let tree_id = "synthetic-test";
+
+        store.create_tree_file(tree_id, "model").unwrap();
+        let meta = agent_core::types::TreeMeta {
+            id: tree_id.to_string(),
+            parent_id: None,
+            repo_path: None,
+            title: None,
+            created_at: 100,
+            updated_at: 100,
+            leaf_id: None,
+            sandbox: agent_core::types::TreeSandbox::default(),
+        };
+        store.save_tree_meta(&meta).unwrap();
+
+        // Append a start entry so the tree isn't empty
+        store.append_entry(tree_id, &Entry::SessionStart {
+            id: "s1".into(), parent_id: None, timestamp: "t1".into(),
+        }).unwrap();
+
+        append_synthetic_session_end(&store, tree_id);
+
+        let entries = store.read_all_entries(tree_id).unwrap();
+        let last = entries.last().unwrap();
+        match last {
+            Entry::SessionEnd { status, summary, .. } => {
+                assert_eq!(*status, SessionStatus::Aborted);
+                assert!(summary.as_deref().unwrap_or("").contains("aborted"));
+            }
+            other => panic!("expected SessionEnd, got {:?}", other),
+        }
     }
 }
