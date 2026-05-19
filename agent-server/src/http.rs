@@ -1,0 +1,229 @@
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::Arc;
+
+use agent_core::config::Config;
+use agent_core::store::Store;
+
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+pub fn handle_connection(mut stream: TcpStream, store: Arc<Store>, cfg: Arc<Config>) {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let header_end;
+    loop {
+        if buf.len() > MAX_HEADER_BYTES {
+            write_status(&mut stream, 431, "Request Header Fields Too Large");
+            return;
+        }
+        let mut tmp = [0u8; 1024];
+        let n = match stream.read(&mut tmp) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+        let mut hs = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut hs);
+        match req.parse(&buf) {
+            Ok(httparse::Status::Complete(n)) => {
+                header_end = n;
+                break;
+            }
+            Ok(httparse::Status::Partial) => continue,
+            Err(_) => {
+                write_status(&mut stream, 400, "Bad Request");
+                return;
+            }
+        }
+    }
+
+    let mut hs = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut hs);
+    let _ = req.parse(&buf);
+
+    let method = req.method.unwrap_or("").to_string();
+    let path = req.path.unwrap_or("").to_string();
+    let headers: Vec<(String, Vec<u8>)> = hs
+        .iter()
+        .filter(|h| !h.name.is_empty())
+        .map(|h| (h.name.to_string(), h.value.to_vec()))
+        .collect();
+
+    let is_ws = method == "GET"
+        && header_contains(&headers, "upgrade", b"websocket")
+        && header_contains(&headers, "connection", b"upgrade");
+    if is_ws {
+        return;
+    }
+
+    let content_length: usize = header_get(&headers, "content-length")
+        .and_then(|v| std::str::from_utf8(&v).ok()?.parse().ok())
+        .unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        write_status(&mut stream, 413, "Payload Too Large");
+        return;
+    }
+    let need = header_end + content_length;
+    while buf.len() < need {
+        let mut tmp = [0u8; 4096];
+        match stream.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => return,
+        }
+    }
+    let body = &buf[header_end..need.min(buf.len())];
+
+    if method == "GET" {
+        if let Some(rest) = path.strip_prefix("/trees/") {
+            if let Some(id) = rest.strip_suffix("/stream") {
+                if !id.is_empty() && !id.contains('/') {
+                    handle_sse(id, &mut stream, &store, &cfg);
+                    return;
+                }
+            }
+        }
+    }
+
+    let (status, body_bytes, content_type) =
+        crate::routes::dispatch(&method, &path, body, &store, &cfg);
+    write_response(&mut stream, status, &body_bytes, content_type);
+}
+
+fn handle_sse(
+    id: &str,
+    stream: &mut TcpStream,
+    store: &Arc<Store>,
+    cfg: &Arc<Config>,
+) {
+    log::info!("[sse] Opening SSE stream for tree {}", id);
+
+    if crate::lifecycle::get_handle(id).is_none() {
+        log::info!("[sse] Auto-spawning agent for tree {}", id);
+        if let Err(e) = crate::lifecycle::spawn(id, store.clone(), cfg) {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "error": format!("Failed to spawn agent: {}", e)
+            }))
+            .unwrap_or_default();
+            write_response(stream, 500, &body, "application/json");
+            return;
+        }
+    }
+
+    let handle = match crate::lifecycle::get_handle(id) {
+        Some(h) => h,
+        None => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "error": format!("No active agent for tree {}", id)
+            }))
+            .unwrap_or_default();
+            write_response(stream, 404, &body, "application/json");
+            return;
+        }
+    };
+
+    let mut writer = std::io::BufWriter::with_capacity(8192, stream);
+    let _ = write!(
+        &mut writer,
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/event-stream\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: keep-alive\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         \r\n"
+    );
+    let _ = writer.flush();
+
+    {
+        let buf = handle.event_buffer.lock().unwrap();
+        for event in buf.iter() {
+            if let Ok(json) = serde_json::to_string(event) {
+                let _ = write!(&mut writer, "data: {}\n\n", json);
+            }
+        }
+    }
+    let _ = writer.flush();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let mut subs = handle.event_broadcast.lock().unwrap();
+        subs.push(tx);
+    }
+
+    for event in &rx {
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = write!(&mut writer, "data: {}\n\n", json);
+            let _ = writer.flush();
+        }
+    }
+
+    log::info!("[sse] SSE stream ended for tree {}", id);
+}
+
+fn header_get(headers: &[(String, Vec<u8>)], name: &str) -> Option<Vec<u8>> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+}
+
+fn header_contains(headers: &[(String, Vec<u8>)], name: &str, needle: &[u8]) -> bool {
+    header_get(headers, name)
+        .map(|v| {
+            v.split(|&b| b == b',')
+                .any(|t| t.trim_ascii().eq_ignore_ascii_case(needle))
+        })
+        .unwrap_or(false)
+}
+
+fn write_status(w: &mut TcpStream, code: u16, reason: &str) {
+    let _ = write!(
+        w,
+        "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        code, reason
+    );
+}
+
+fn write_response(w: &mut TcpStream, status: u16, body: &[u8], content_type: &str) {
+    let _ = write!(
+        w,
+        "HTTP/1.1 {} OK\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        status,
+        content_type,
+        body.len()
+    );
+    let _ = w.write_all(body);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_header_contains_case_insensitive() {
+        let h = vec![("Upgrade".into(), b"websocket".to_vec())];
+        assert!(header_contains(&h, "upgrade", b"websocket"));
+        assert!(header_contains(&h, "UPGRADE", b"websocket"));
+        assert!(!header_contains(&h, "upgrade", b"http2"));
+    }
+
+    #[test]
+    fn test_header_contains_comma_separated() {
+        let h = vec![("Connection".into(), b"keep-alive, upgrade".to_vec())];
+        assert!(header_contains(&h, "connection", b"upgrade"));
+        assert!(header_contains(&h, "connection", b"keep-alive"));
+        assert!(!header_contains(&h, "connection", b"close"));
+    }
+
+    #[test]
+    fn test_header_get_nonexistent() {
+        let h: Vec<(String, Vec<u8>)> = vec![];
+        assert!(header_get(&h, "x-missing").is_none());
+    }
+}

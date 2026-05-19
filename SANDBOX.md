@@ -854,7 +854,7 @@ emits JSON event lines on stdout (TextChunk + Done at minimum).
 
 ### Step 3a — Hand-rolled HTTP layer on TcpListener + httparse
 
-- [ ]
+- [x] done
 
 **Goal:** Replace `rouille` with a small in-tree HTTP layer built on
 `std::net::TcpListener` + `httparse`. All seven routes (Connection: close,
@@ -1065,7 +1065,14 @@ Do not modify: `agent-core`, `agent-cli`, `agent-worker`, `lifecycle.rs`
 through the new layer.
 
 **Notes:**
-_(fill in on completion)_
+- Created: `agent-server/src/http.rs` — per-connection handler with header parsing, body reading, SSE streaming, WS detection (stub until 3c), and dispatch
+- Modified: `agent-server/Cargo.toml` — removed `rouille`, added `httparse = "1"` and `tempfile` dev-dependency
+- Modified: `agent-server/src/lib.rs` — replaced `rouille::start_server` with `TcpListener::bind` + accept loop spawning threads via `http::handle_connection`
+- Modified: `agent-server/src/routes.rs` — replaced `router!` with `dispatch()` returning `(u16, Vec<u8>, &'static str)`; all handlers refactored from `rouille::Response` return type; `handle_create_tree`, `handle_update_tree`, `handle_send_message` now take `body: &[u8]` parsed via `serde_json::from_slice`; SSE upgrade (SseUpgrade struct via `rouille::Upgrade`) replaced by inline `handle_sse` function in `http.rs` that writes SSE headers + loops over broadcast receiver on the raw TcpStream
+- Test added: `test_dispatch_static`, `test_dispatch_not_found`, `test_dispatch_create_tree_bad_body`, `test_dispatch_tree_entries_not_found`, `test_json_helper`, `test_dispatch_get_tree_no_such`, `test_dispatch_create_and_get_tree` in `routes.rs`
+- Test added: `test_header_contains_case_insensitive`, `test_header_contains_comma_separated`, `test_header_get_nonexistent` in `http.rs`
+- Deviation: WS check in `http.rs` is a stub (just `return;`) — will be wired to `ws::accept` in Step 3c when the ws module exists
+- Verified: `cargo test --workspace` → 89 passed, 0 failed (79 + 10 new); `cargo clippy` → no new warnings
 
 ---
 

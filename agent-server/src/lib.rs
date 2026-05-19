@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+mod http;
 mod lifecycle;
 mod routes;
 
@@ -34,14 +35,16 @@ pub fn run(args: Vec<String>) {
         log::warn!("Startup hooks issue: {}", e);
     }
 
-    let addr = format!("{}:{}", config.server.host, config.server.port);
-    log::info!("Listening on http://{}", addr);
+    let bind = format!("{}:{}", config.server.host, config.server.port);
+    let listener = std::net::TcpListener::bind(&bind).expect("bind");
+    log::info!("Listening on http://{}", bind);
 
-    let store_for_server = store.clone();
-    let config_for_server = config.clone();
-    rouille::start_server(addr, move |request| {
-        let store = store_for_server.clone();
-        let config = config_for_server.clone();
-        routes::handle_request(request, &store, &config)
-    });
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else {
+            continue;
+        };
+        let store = store.clone();
+        let cfg = config.clone();
+        std::thread::spawn(move || http::handle_connection(stream, store, cfg));
+    }
 }

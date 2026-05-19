@@ -1,19 +1,14 @@
-use std::borrow::Cow;
-use std::io::Write;
 use std::sync::Arc;
 
-use rouille::{router, Request, Response, ResponseBody};
+use agent_core::config::Config;
+use agent_core::store::Store;
 use serde::Deserialize;
 
 use agent_core::agent;
-use agent_core::config::Config;
 use agent_core::provider::Provider;
-use agent_core::store::Store;
-use agent_core::types::{Entry, ServerEvent, TreeMeta};
+use agent_core::types::{Entry, TreeMeta};
 
 use crate::lifecycle;
-
-// ── Request body types ──
 
 #[derive(Deserialize)]
 pub struct CreateTreeBody {
@@ -32,83 +27,54 @@ pub struct SendMessageBody {
     pub text: String,
 }
 
-// ── Route handler ──
-
-pub fn handle_request(request: &Request, store: &Arc<Store>, config: &Config) -> Response {
-    router!(request,
-        (GET) (/) => {
-            Response::json(&serde_json::json!({
-                "service": "agent-server",
-                "version": "0.1.0",
-            }))
-        },
-
-        (GET) (/trees) => {
-            handle_list_trees(store)
-        },
-
-        (POST) (/trees) => {
-            handle_create_tree(request, store)
-        },
-
-        (GET) (/trees/{id: String}) => {
-            handle_get_tree(&id, store)
-        },
-
-        (PATCH) (/trees/{id: String}) => {
-            handle_update_tree(&id, request, store)
-        },
-
-        (GET) (/trees/{id: String}/entries) => {
-            handle_list_entries(&id, store)
-        },
-
-        (POST) (/trees/{id: String}/message) => {
-            handle_send_message(&id, request, store, config)
-        },
-
-        (POST) (/trees/{id: String}/auto-title) => {
-            handle_auto_title(&id, store, config)
-        },
-
-        (POST) (/trees/{id: String}/stop) => {
-            handle_stop_agent(&id)
-        },
-
-        (GET) (/trees/{id: String}/stream) => {
-            handle_sse_stream(&id, store, config)
-        },
-
-        _ => {
-            Response::json(&serde_json::json!({"error": "not found"}))
-                .with_status_code(404)
-        }
-    )
+pub fn dispatch(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    store: &Arc<Store>,
+    cfg: &Arc<Config>,
+) -> (u16, Vec<u8>, &'static str) {
+    if method == "GET" && path == "/" {
+        return json(
+            200,
+            &serde_json::json!({"service": "agent-server", "version": "0.1.0"}),
+        );
+    }
+    if method == "GET" && path == "/trees" {
+        return handle_list_trees(store);
+    }
+    if method == "POST" && path == "/trees" {
+        return handle_create_tree(body, store);
+    }
+    if let Some(rest) = path.strip_prefix("/trees/") {
+        let (id, suffix) = rest.split_once('/').unwrap_or((rest, ""));
+        return match (method, suffix) {
+            ("GET", "") => handle_get_tree(id, store),
+            ("PATCH", "") => handle_update_tree(id, body, store),
+            ("GET", "entries") => handle_list_entries(id, store),
+            ("POST", "message") => handle_send_message(id, body, store, cfg),
+            ("POST", "stop") => handle_stop_agent(id),
+            ("POST", "auto-title") => handle_auto_title(id, store, cfg),
+            _ => not_found(),
+        };
+    }
+    not_found()
 }
 
-// ── SSE Upgrade (bypasses BufWriter in tiny_http) ──
-
-// ── Handlers ──
-
-/// GET /trees — list all trees
-fn handle_list_trees(store: &Store) -> Response {
+fn handle_list_trees(store: &Store) -> (u16, Vec<u8>, &'static str) {
     match store.list_trees() {
-        Ok(trees) => Response::json(&trees),
-        Err(e) => Response::json(&serde_json::json!({"error": format!("{}", e)}))
-            .with_status_code(500),
+        Ok(trees) => json(200, &trees),
+        Err(e) => {
+            json(500, &serde_json::json!({"error": format!("{}", e)}))
+        }
     }
 }
 
-/// POST /trees — create a new tree
-fn handle_create_tree(request: &Request, store: &Store) -> Response {
-    let body: CreateTreeBody = match request
-        .data()
-        .and_then(|d| serde_json::from_reader(d).ok())
-    {
-        Some(b) => b,
-        None => {
-            return Response::json(&serde_json::json!({"error": "invalid JSON body"}))
-                .with_status_code(400);
+fn handle_create_tree(body: &[u8], store: &Store) -> (u16, Vec<u8>, &'static str) {
+    let body: CreateTreeBody = match serde_json::from_slice(body) {
+        Ok(b) => b,
+        Err(_) => {
+            return json(400, &serde_json::json!({"error": "invalid JSON body"}));
         }
     };
 
@@ -137,10 +103,10 @@ fn handle_create_tree(request: &Request, store: &Store) -> Response {
     };
 
     if let Err(e) = store.create_tree_file(&tree_id, &model) {
-        return Response::json(&serde_json::json!({
-            "error": format!("failed to create tree file: {}", e)
-        }))
-        .with_status_code(500);
+        return json(
+            500,
+            &serde_json::json!({"error": format!("failed to create tree file: {}", e)}),
+        );
     }
 
     let session_start_id = generate_entry_id();
@@ -150,10 +116,10 @@ fn handle_create_tree(request: &Request, store: &Store) -> Response {
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
     if let Err(e) = store.append_entry(&tree_id, &session_start) {
-        return Response::json(&serde_json::json!({
-            "error": format!("failed to write session_start: {}", e)
-        }))
-        .with_status_code(500);
+        return json(
+            500,
+            &serde_json::json!({"error": format!("failed to write session_start: {}", e)}),
+        );
     }
 
     let mut meta = meta;
@@ -167,60 +133,48 @@ fn handle_create_tree(request: &Request, store: &Store) -> Response {
             model: model.clone(),
         };
         if let Err(e) = store.append_entry(&tree_id, &model_set) {
-            return Response::json(&serde_json::json!({
-                "error": format!("failed to write model_set: {}", e)
-            }))
-            .with_status_code(500);
+            return json(
+                500,
+                &serde_json::json!({"error": format!("failed to write model_set: {}", e)}),
+            );
         }
         meta.leaf_id = model_set.id().to_string().into();
         let _ = store.update_header(&tree_id, &serde_json::json!({"current_model": model}));
     }
 
     if let Err(e) = store.save_tree_meta(&meta) {
-        return Response::json(&serde_json::json!({
-            "error": format!("failed to save tree metadata: {}", e)
-        }))
-        .with_status_code(500);
+        return json(
+            500,
+            &serde_json::json!({"error": format!("failed to save tree metadata: {}", e)}),
+        );
     }
 
-    Response::json(&meta).with_status_code(201)
+    json(201, &meta)
 }
 
-/// GET /trees/{id} — get tree metadata
-fn handle_get_tree(id: &str, store: &Store) -> Response {
+fn handle_get_tree(id: &str, store: &Store) -> (u16, Vec<u8>, &'static str) {
     match store.get_tree(id) {
-        Ok(Some(meta)) => Response::json(&meta),
-        Ok(None) => {
-            Response::json(&serde_json::json!({"error": format!("tree {} not found", id)}))
-                .with_status_code(404)
-        }
-        Err(e) => Response::json(&serde_json::json!({"error": format!("{}", e)}))
-            .with_status_code(500),
+        Ok(Some(meta)) => json(200, &meta),
+        Ok(None) => json(404, &serde_json::json!({"error": format!("tree {} not found", id)})),
+        Err(e) => json(500, &serde_json::json!({"error": format!("{}", e)})),
     }
 }
 
-/// PATCH /trees/{id} — update tree metadata
-fn handle_update_tree(id: &str, request: &Request, store: &Store) -> Response {
-    let body: UpdateTreeBody = match request
-        .data()
-        .and_then(|d| serde_json::from_reader(d).ok())
-    {
-        Some(b) => b,
-        None => {
-            return Response::json(&serde_json::json!({"error": "invalid JSON body"}))
-                .with_status_code(400);
+fn handle_update_tree(id: &str, body: &[u8], store: &Store) -> (u16, Vec<u8>, &'static str) {
+    let body: UpdateTreeBody = match serde_json::from_slice(body) {
+        Ok(b) => b,
+        Err(_) => {
+            return json(400, &serde_json::json!({"error": "invalid JSON body"}));
         }
     };
 
     let mut meta = match store.get_tree(id) {
         Ok(Some(m)) => m,
         Ok(None) => {
-            return Response::json(&serde_json::json!({"error": format!("tree {} not found", id)}))
-                .with_status_code(404);
+            return json(404, &serde_json::json!({"error": format!("tree {} not found", id)}));
         }
         Err(e) => {
-            return Response::json(&serde_json::json!({"error": format!("{}", e)}))
-                .with_status_code(500);
+            return json(500, &serde_json::json!({"error": format!("{}", e)}));
         }
     };
 
@@ -230,238 +184,118 @@ fn handle_update_tree(id: &str, request: &Request, store: &Store) -> Response {
     meta.updated_at = chrono::Utc::now().timestamp();
 
     if let Err(e) = store.save_tree_meta(&meta) {
-        return Response::json(&serde_json::json!({
-            "error": format!("failed to update tree: {}", e)
-        }))
-        .with_status_code(500);
+        return json(
+            500,
+            &serde_json::json!({"error": format!("failed to update tree: {}", e)}),
+        );
     }
 
-    Response::json(&meta)
+    json(200, &meta)
 }
 
-/// GET /trees/{id}/entries — list all entries for a tree
-fn handle_list_entries(id: &str, store: &Store) -> Response {
+fn handle_list_entries(id: &str, store: &Store) -> (u16, Vec<u8>, &'static str) {
     match store.get_tree(id) {
         Ok(None) => {
-            return Response::json(&serde_json::json!({"error": format!("tree {} not found", id)}))
-                .with_status_code(404);
+            return json(404, &serde_json::json!({"error": format!("tree {} not found", id)}));
         }
         Err(e) => {
-            return Response::json(&serde_json::json!({"error": format!("{}", e)}))
-                .with_status_code(500);
+            return json(500, &serde_json::json!({"error": format!("{}", e)}));
         }
         Ok(Some(_)) => {}
     }
 
     match store.read_all_entries(id) {
-        Ok(entries) => Response::json(&entries),
-        Err(e) => Response::json(&serde_json::json!({"error": format!("{}", e)}))
-            .with_status_code(500),
+        Ok(entries) => json(200, &entries),
+        Err(e) => json(500, &serde_json::json!({"error": format!("{}", e)})),
     }
 }
 
-/// POST /trees/{id}/message — send a user message to an active agent
-///
-/// Auto-spawns an agent for the tree if one isn't already running.
 fn handle_send_message(
     id: &str,
-    request: &Request,
+    body: &[u8],
     store: &Arc<Store>,
-    config: &Config,
-) -> Response {
-    let body: SendMessageBody = match request
-        .data()
-        .and_then(|d| serde_json::from_reader(d).ok())
-    {
-        Some(b) => b,
-        None => {
-            return Response::json(&serde_json::json!({"error": "invalid JSON body"}))
-                .with_status_code(400);
+    cfg: &Arc<Config>,
+) -> (u16, Vec<u8>, &'static str) {
+    let body: SendMessageBody = match serde_json::from_slice(body) {
+        Ok(b) => b,
+        Err(_) => {
+            return json(400, &serde_json::json!({"error": "invalid JSON body"}));
         }
     };
 
     if body.text.trim().is_empty() {
-        return Response::json(&serde_json::json!({"error": "message text cannot be empty"}))
-            .with_status_code(400);
+        return json(
+            400,
+            &serde_json::json!({"error": "message text cannot be empty"}),
+        );
     }
 
-    // Verify the tree exists
     match store.get_tree(id) {
         Ok(None) => {
-            return Response::json(&serde_json::json!({
-                "error": format!("tree {} not found", id)
-            }))
-            .with_status_code(404);
+            return json(404, &serde_json::json!({"error": format!("tree {} not found", id)}));
         }
         Err(e) => {
-            return Response::json(&serde_json::json!({
-                "error": format!("failed to read tree: {}", e)
-            }))
-            .with_status_code(500);
+            return json(
+                500,
+                &serde_json::json!({"error": format!("failed to read tree: {}", e)}),
+            );
         }
         Ok(Some(_)) => {}
     }
 
-    // Try to send message; if no active agent, spawn one first
     let result = lifecycle::send_message(id, &body.text);
     match result {
-        Ok(()) => Response::json(&serde_json::json!({"status": "sent"})),
+        Ok(()) => json(200, &serde_json::json!({"status": "sent"})),
         Err(ref e) if e.contains("No active agent") => {
-            // Auto-spawn agent for this tree
             log::info!("Auto-spawning agent for tree {}", id);
-            if let Err(spawn_err) = lifecycle::spawn(id, (*store).clone(), config) {
-                return Response::json(&serde_json::json!({
-                    "error": format!("failed to spawn agent: {}", spawn_err)
-                }))
-                .with_status_code(500);
+            if let Err(spawn_err) = lifecycle::spawn(id, store.clone(), cfg) {
+                return json(
+                    500,
+                    &serde_json::json!({
+                        "error": format!("failed to spawn agent: {}", spawn_err)
+                    }),
+                );
             }
-
-            // Retry sending the message after spawn
             match lifecycle::send_message(id, &body.text) {
-                Ok(()) => Response::json(&serde_json::json!({"status": "sent"})),
-                Err(e) => Response::json(&serde_json::json!({
-                    "error": format!("failed to send message after spawn: {}", e)
-                }))
-                .with_status_code(500),
+                Ok(()) => json(200, &serde_json::json!({"status": "sent"})),
+                Err(e) => json(
+                    500,
+                    &serde_json::json!({"error": format!("failed to send message after spawn: {}", e)}),
+                ),
             }
         }
-        Err(e) => Response::json(&serde_json::json!({"error": e})).with_status_code(409),
+        Err(e) => json(409, &serde_json::json!({"error": e})),
     }
 }
 
-/// POST /trees/{id}/stop — stop an active agent
-fn handle_stop_agent(id: &str) -> Response {
+fn handle_stop_agent(id: &str) -> (u16, Vec<u8>, &'static str) {
     match lifecycle::stop(id) {
-        Ok(()) => Response::json(&serde_json::json!({"status": "stopping"})),
-        Err(e) => Response::json(&serde_json::json!({"error": e})).with_status_code(404),
+        Ok(()) => json(200, &serde_json::json!({"status": "stopping"})),
+        Err(e) => json(404, &serde_json::json!({"error": e})),
     }
 }
 
-/// POST /trees/{id}/auto-title — ask LLM to generate a title
-fn handle_auto_title(id: &str, _store: &Store, config: &Config) -> Response {
+fn handle_auto_title(id: &str, _store: &Store, config: &Config) -> (u16, Vec<u8>, &'static str) {
     let provider = Provider::new(
         config.summary.base_url.clone(),
         config.summary.api_key.clone(),
         config.summary.model.clone(),
     );
     match agent::auto_title(_store, &provider, id) {
-        Ok(title) => Response::json(&serde_json::json!({"title": title})),
-        Err(e) => Response::json(&serde_json::json!({"error": e})).with_status_code(500),
+        Ok(title) => json(200, &serde_json::json!({"title": title})),
+        Err(e) => json(500, &serde_json::json!({"error": e})),
     }
 }
 
-// ── SSE Upgrade (bypasses BufWriter in tiny_http) ──
-
-
-struct SseUpgrade {
-    handle: lifecycle::AgentHandle,
-    tree_id: String,
-    headers_written: bool,
+fn json<T: serde::Serialize>(status: u16, v: &T) -> (u16, Vec<u8>, &'static str) {
+    let body = serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec());
+    (status, body, "application/json")
 }
 
-impl rouille::Upgrade for SseUpgrade {
-    fn build(&mut self, socket: Box<dyn rouille::ReadWrite + Send>) {
-        log::info!("[sse-upgrade] Starting SSE write loop for tree {}", self.tree_id);
-
-        let mut writer = std::io::BufWriter::with_capacity(8192, socket);
-
-        // Headers are already sent by tiny_http as part of the upgrade response.
-        // Only write headers if the initial response didn't carry them.
-        if !self.headers_written {
-            let _ = write!(
-                &mut writer,
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/event-stream\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Connection: keep-alive\r\n\
-                 Access-Control-Allow-Origin: *\r\n\
-                 Transfer-Encoding: chunked\r\n\
-                 \r\n"
-            );
-            let _ = writer.flush();
-        }
-
-        // Send catch-up events from the ring buffer
-        {
-            let buf = self.handle.event_buffer.lock().unwrap();
-            for event in buf.iter() {
-                if let Ok(json) = serde_json::to_string(event) {
-                    let _ = write!(&mut writer, "data: {}\n\n", json);
-                }
-            }
-        }
-        let _ = writer.flush();
-
-        // Subscribe to broadcast channel and forward events until EOF
-        let (tx, rx) = std::sync::mpsc::channel();
-        {
-            let mut subs = self.handle.event_broadcast.lock().unwrap();
-            subs.push(tx);
-        }
-
-        // Forward events from broadcast
-        for event in &rx {
-            if let Ok(json) = serde_json::to_string(&event) {
-                let _ = write!(&mut writer, "data: {}\n\n", json);
-                let _ = writer.flush();
-            }
-        }
-
-        log::info!("[sse-upgrade] SSE stream ended for tree {}", self.tree_id);
-        let _ = writer.flush();
-    }
+fn not_found() -> (u16, Vec<u8>, &'static str) {
+    json(404, &serde_json::json!({"error": "not found"}))
 }
 
-fn handle_sse_stream(id: &str, store: &Arc<Store>, config: &Config) -> Response {
-    log::info!("[sse] Opening SSE stream for tree {}", id);
-
-    // Auto-spawn agent if not already running
-    if lifecycle::get_handle(id).is_none() {
-        log::info!("[sse] Auto-spawning agent for tree {}", id);
-        if let Err(e) = lifecycle::spawn(id, (*store).clone(), config) {
-            return Response::json(&serde_json::json!({
-                "error": format!("Failed to spawn agent: {}", e)
-            }))
-            .with_status_code(500);
-        }
-    }
-
-    let handle = match lifecycle::get_handle(id) {
-        Some(h) => h,
-        None => {
-            return Response::json(&serde_json::json!({
-                "error": format!("No active agent for tree {}", id)
-            }))
-            .with_status_code(404)
-        }
-    };
-
-    log::info!("[sse] Using SSE upgrade for tree {}", id);
-
-    // SSE via Upgrade: takes over the raw socket, bypasses the BufWriter
-    // in tiny_http, ensuring real-time streaming.
-    // The upgrade response carries our SSE headers so the client sees only one
-    // HTTP response (not the double-response that comes with a separate write).
-    Response {
-        status_code: 200,
-        headers: vec![
-            (Cow::Borrowed("Content-Type"), Cow::Borrowed("text/event-stream")),
-            (Cow::Borrowed("Cache-Control"), Cow::Borrowed("no-cache")),
-            (Cow::Borrowed("Connection"), Cow::Borrowed("keep-alive")),
-            (Cow::Borrowed("Access-Control-Allow-Origin"), Cow::Borrowed("*")),
-        ],
-        data: ResponseBody::empty(),
-        upgrade: Some(Box::new(SseUpgrade {
-            handle,
-            tree_id: id.to_string(),
-            headers_written: true,
-        })),
-    }
-}
-
-// ── Helpers ──
-
-/// Generate a random 8-character hex entry ID.
 fn generate_entry_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -469,4 +303,81 @@ fn generate_entry_id() -> String {
         .unwrap_or_default()
         .subsec_nanos();
     format!("{:08x}", nanos.wrapping_mul(2654435761))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_dispatch_static() {
+        let (status, body, ct) = dispatch("GET", "/", &[], &Arc::new(Store::default()), &Arc::new(Config::default()));
+        assert_eq!(status, 200);
+        assert_eq!(ct, "application/json");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["service"], "agent-server");
+    }
+
+    #[test]
+    fn test_dispatch_not_found() {
+        let (status, body, ct) = dispatch("GET", "/nonexistent", &[], &Arc::new(Store::default()), &Arc::new(Config::default()));
+        assert_eq!(status, 404);
+        assert_eq!(ct, "application/json");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "not found");
+    }
+
+    #[test]
+    fn test_dispatch_create_tree_bad_body() {
+        let (status, _, _) = dispatch("POST", "/trees", b"not json", &Arc::new(Store::default()), &Arc::new(Config::default()));
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn test_dispatch_tree_entries_not_found() {
+        let (status, _, _) = dispatch("GET", "/trees/no-such-tree/entries", &[], &Arc::new(Store::default()), &Arc::new(Config::default()));
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn test_json_helper() {
+        let (status, body, ct) = json(201, &serde_json::json!({"key": "val"}));
+        assert_eq!(status, 201);
+        assert_eq!(ct, "application/json");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["key"], "val");
+    }
+
+    #[test]
+    fn test_dispatch_get_tree_no_such() {
+        let store = Arc::new(Store::default());
+        let (status, _body, _) = dispatch("GET", "/trees/nonexistent", &[], &store, &Arc::new(Config::default()));
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn test_dispatch_create_and_get_tree() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(Store::new(tmp.path().join(".agent")));
+        let cfg = Arc::new(Config::default());
+
+        let create_body = serde_json::json!({"title": "test-tree"});
+        let (status, body, _) = dispatch("POST", "/trees", &serde_json::to_vec(&create_body).unwrap(), &store, &cfg);
+        assert_eq!(status, 201);
+        let meta: TreeMeta = serde_json::from_slice(&body).unwrap();
+        assert_eq!(meta.title.unwrap(), "test-tree");
+
+        let get_path = format!("/trees/{}", meta.id);
+        let (status, body, _) = dispatch("GET", &get_path, &[], &store, &cfg);
+        assert_eq!(status, 200);
+        let fetched: TreeMeta = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fetched.id, meta.id);
+
+        let entries_path = format!("/trees/{}/entries", meta.id);
+        let (status, body, _) = dispatch("GET", &entries_path, &[], &store, &cfg);
+        assert_eq!(status, 200);
+        let entries: Vec<Entry> = serde_json::from_slice(&body).unwrap();
+        assert!(entries.iter().any(|e| matches!(e, Entry::SessionStart { .. })));
+    }
 }
