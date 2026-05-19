@@ -296,6 +296,12 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
         ServerEvent::FileChanged { path, kind } => {
             write!(out, "\r\n").ok(); write!(out, "  📄 {} ({})\r\n", path, kind).ok();
         }
+        ServerEvent::MetaUpdate { title } => {
+            if let Some(t) = title {
+                write!(out, "\r\n").ok();
+                write!(out, "  {}Title: {}{}\r\n", style::Bold, t, style::Reset).ok();
+            }
+        }
     }
 }
 

@@ -11,8 +11,8 @@ pub fn accept(
     mut stream: TcpStream,
     path: &str,
     headers: &[(String, Vec<u8>)],
-    _store: Arc<Store>,
-    _cfg: Arc<Config>,
+    store: Arc<Store>,
+    cfg: Arc<Config>,
 ) {
     let tree_id = match path
         .strip_prefix("/trees/")
@@ -66,7 +66,7 @@ pub fn accept(
     );
 
     if crate::lifecycle::worker_get(&tree_id).is_none() {
-        if let Err(e) = crate::lifecycle::spawn_worker(&tree_id) {
+        if let Err(e) = crate::lifecycle::spawn_worker(&tree_id, store.clone(), cfg.clone()) {
             let _ = ws.send(Message::Text(
                 serde_json::to_string(&serde_json::json!({
                     "type": "error", "message": e, "fatal": true,

@@ -205,7 +205,18 @@ pub fn worker_get(tree_id: &str) -> Option<Arc<Mutex<WorkerEntry>>> {
     ACTIVE_WORKERS.lock().unwrap().get(tree_id).cloned()
 }
 
-pub fn spawn_worker(tree_id: &str) -> Result<(), String> {
+/// Broadcast a `MetaUpdate` event to all subscribers of a tree.
+pub fn broadcast_meta_update(tree_id: &str, title: Option<String>) {
+    let entry = match worker_get(tree_id) {
+        Some(e) => e,
+        None => return,
+    };
+    let ev = ServerEvent::MetaUpdate { title };
+    let mut guard = entry.lock().unwrap();
+    guard.subscribers.retain(|tx| tx.send(ev.clone()).is_ok());
+}
+
+pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Result<(), String> {
     let workers = ACTIVE_WORKERS.lock().map_err(|e| e.to_string())?;
     if workers.contains_key(tree_id) {
         return Err(format!("Worker already active for tree {}", tree_id));
@@ -247,7 +258,7 @@ pub fn spawn_worker(tree_id: &str) -> Result<(), String> {
         .insert(tree_id.to_string(), entry.clone());
 
     spawn_stdin_writer(stdin, stdin_rx);
-    spawn_stdout_proxy(tree_id.to_string(), stdout, entry.clone());
+    spawn_stdout_proxy(tree_id.to_string(), stdout, entry.clone(), store, cfg);
     spawn_stderr_demux(tree_id.to_string(), stderr);
     log::info!("[lifecycle] Spawned worker for tree {} (pid {})", tree_id, pid);
     Ok(())
@@ -294,6 +305,8 @@ fn spawn_stdout_proxy(
     tree_id: String,
     stdout: ChildStdout,
     entry: Arc<Mutex<WorkerEntry>>,
+    store: Arc<Store>,
+    cfg: Arc<Config>,
 ) {
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(stdout);
@@ -319,6 +332,35 @@ fn spawn_stdout_proxy(
                 guard.event_buffer.push_back(event.clone());
             }
             guard.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+
+            // Auto-title: if a Done event arrives on a tree without a title,
+            // spawn a side thread to generate one.
+            if matches!(event, ServerEvent::Done { .. }) {
+                let store_for_title = store.clone();
+                let cfg_for_title = cfg.clone();
+                let entry_for_title = entry.clone();
+                let tid = tree_id.clone();
+                std::thread::spawn(move || {
+                    let needs = match store_for_title.get_tree(&tid) {
+                        Ok(Some(m)) => m.title.is_none(),
+                        _ => false,
+                    };
+                    if !needs { return; }
+                    let provider = Provider::new(
+                        cfg_for_title.summary.base_url.clone(),
+                        cfg_for_title.summary.api_key.clone(),
+                        cfg_for_title.summary.model.clone(),
+                    );
+                    match agent_core::agent::auto_title(&store_for_title, &provider, &tid) {
+                        Ok(title) => {
+                            let ev = ServerEvent::MetaUpdate { title: Some(title) };
+                            let mut g = entry_for_title.lock().unwrap();
+                            g.subscribers.retain(|tx| tx.send(ev.clone()).is_ok());
+                        }
+                        Err(e) => log::warn!("[auto-title {}] {}", tid, e),
+                    }
+                });
+            }
         }
         log::info!("[proxy {}] worker stdout closed", tree_id);
 
@@ -551,5 +593,35 @@ mod tests {
             }
             other => panic!("expected SessionEnd, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_broadcast_meta_update() {
+        let entry = Arc::new(Mutex::new(WorkerEntry {
+            stdin_tx: mpsc::channel().0,
+            event_buffer: VecDeque::with_capacity(BUFFER_CAPACITY),
+            subscribers: Vec::new(),
+            pid: 0,
+            child: None,
+        }));
+
+        let tree_id = "test-meta-update";
+        ACTIVE_WORKERS
+            .lock()
+            .unwrap()
+            .insert(tree_id.to_string(), entry.clone());
+
+        // Subscribe to receive events
+        let (_snapshot, rx) = worker_subscribe(tree_id).unwrap();
+
+        // Broadcast a meta update
+        broadcast_meta_update(tree_id, Some("Generated Title".into()));
+
+        // Verify the subscriber received it
+        let received = rx.recv().unwrap();
+        assert!(matches!(&received, ServerEvent::MetaUpdate { title: Some(t) } if t == "Generated Title"));
+
+        // Cleanup
+        ACTIVE_WORKERS.lock().unwrap().remove(tree_id);
     }
 }

@@ -282,7 +282,10 @@ fn handle_auto_title(id: &str, _store: &Store, config: &Config) -> (u16, Vec<u8>
         config.summary.model.clone(),
     );
     match agent::auto_title(_store, &provider, id) {
-        Ok(title) => json(200, &serde_json::json!({"title": title})),
+        Ok(title) => {
+            lifecycle::broadcast_meta_update(id, Some(title.clone()));
+            json(200, &serde_json::json!({"title": title}))
+        }
         Err(e) => json(500, &serde_json::json!({"error": e})),
     }
 }

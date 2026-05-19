@@ -392,6 +392,10 @@ pub enum ServerEvent {
     /// External file change — PWA file view.
     #[serde(rename = "file_changed")]
     FileChanged { path: String, kind: String },
+    /// Meta field update (e.g., auto-title result). Broadcast by server;
+    /// never persisted in the event stream.
+    #[serde(rename = "meta_update")]
+    MetaUpdate { title: Option<String> },
 }
 
 // ── Tool system types ──

@@ -1641,7 +1641,7 @@ Do not modify: agent-core/agent.rs, tools, CLI.
 
 ### Step 6 — Server-side auto-title + meta-update events
 
-- [ ]
+- [x] done
 
 **Goal:** When the proxy thread sees `Done` on a tree whose `meta.title`
 is `None`, fire `auto_title` server-side and broadcast a `meta_update`.
@@ -1708,7 +1708,13 @@ exists), tools, CLI.
 `meta_update` event with the title after the turn completes.
 
 **Notes:**
-_(fill in on completion)_
+- Modified: `agent-core/src/types.rs` — added `ServerEvent::MetaUpdate { title: Option<String> }` variant
+- Modified: `agent-server/src/lifecycle.rs` — added `broadcast_meta_update()` helper; updated `spawn_worker` signature to accept `store: Arc<Store>` and `cfg: Arc<Config>` (forwarded to `spawn_stdout_proxy`); added auto-title hook in `spawn_stdout_proxy` that spawns a side thread after `Done` events on trees without a title, calling `agent_core::agent::auto_title()` and broadcasting the result
+- Modified: `agent-server/src/ws.rs` — changed `_store`/`_cfg` params to `store`/`cfg`; pass them to `spawn_worker`
+- Modified: `agent-server/src/routes.rs` — `handle_auto_title` now calls `lifecycle::broadcast_meta_update()` after successful title generation
+- Modified: `agent-cli/src/interactive.rs` — added `MetaUpdate` arm to the `render_event` match
+- Test added: `test_broadcast_meta_update` in `lifecycle.rs` — sets up a worker entry with subscriber, calls `broadcast_meta_update`, asserts `MetaUpdate` is received
+- Verified: `cargo test --workspace` → 98 passed, 0 failed; `cargo clippy --workspace` → no new warnings
 
 ---
 
