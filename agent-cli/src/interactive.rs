@@ -3,12 +3,18 @@
 //! Two-thread architecture:
 //! - **SSE thread:** reads events from the server's SSE stream, pushes to an mpsc queue.
 //! - **Main thread:** renders events from the queue events and polls stdin for user input.
+//!
+//! Ctrl-C is handled via termion raw mode: `Key::Ctrl('c')` is detected directly from key events.
+//! The main input loop and tree-selection prompts all use character-by-character raw input.
 
 use std::collections::HashSet;
 use std::io::{self, Write};
-
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use termion::{color, style};
+use termion::event::Key;
+use termion::input::TermRead;
+use termion::raw::IntoRawMode;
 
 use agent_core::types::{Entry, ServerEvent, TreeMeta};
 
@@ -59,45 +65,46 @@ fn parse_input(line: &str) -> CliCommand {
     }
 }
 
-// ── Rendering helpers ──
+// ── Rendering helpers (raw-mode aware ──
 
-fn print_warning(text: &str) {
-    println!("{}{}⚠ {}{}", color::Fg(color::Yellow), style::Bold, text, style::Reset);
+fn print_warning(out: &mut impl Write, text: &str) {
+    write!(out, "{}{}⚠ {}{}\r\n", color::Fg(color::Yellow), style::Bold, text, style::Reset).ok();
 }
 
-fn print_error(text: &str) {
-    println!("{}{}✖ {}{}", color::Fg(color::Red), style::Bold, text, style::Reset);
+fn print_error(out: &mut impl Write, text: &str) {
+    write!(out, "{}{}✖ {}{}\r\n", color::Fg(color::Red), style::Bold, text, style::Reset).ok();
 }
 
-fn print_indented(text: &str, prefix: &str) {
+fn print_indented(out: &mut impl Write, text: &str, prefix: &str) {
     for line in text.lines() {
-        println!("  {} {}", prefix, line);
+        write!(out, "  {} {}\r\n", prefix, line).ok();
     }
 }
 
-fn print_help() {
-    println!("{}Commands:{}", style::Bold, style::Reset);
-    println!("  /trees                      List all trees");
-    println!("  /create <title> [path] [model]  Create a new tree");
-    println!("  /switch <id>                Switch to a different tree");
-    println!("  /stop                       Stop the active agent");
-    println!("  /show                       Show current tree info");
-    println!("  /entries [n]                Show last N entries (default 10)");
-    println!("  /help                       Show this help");
-    println!("  /quit                       Exit");
-    println!("  <any text>                  Send as message to the agent");
+fn print_help(out: &mut impl Write) {
+    write!(out, "{}Commands:{}", style::Bold, style::Reset).ok();
+    writeln!(out).ok();
+    write!(out, "\r").ok();
+    write!(out, "  /trees                      List all trees\r\n").ok();
+    write!(out, "  /create <title> [path] [model]  Create a new tree\r\n").ok();
+    write!(out, "  /switch <id>                Switch to a different tree\r\n").ok();
+    write!(out, "  /stop                       Stop the active agent\r\n").ok();
+    write!(out, "  /show                       Show current tree info\r\n").ok();
+    write!(out, "  /entries [n]                Show last N entries (default 10)\r\n").ok();
+    write!(out, "  /help                       Show this help\r\n").ok();
+    write!(out, "  /quit                       Exit\r\n").ok();
+    write!(out, "  <any text>                  Send as message to the agent\r\n").ok();
 }
 
-fn print_tree_meta(meta: &TreeMeta, index: usize) {
+fn print_tree_meta(out: &mut impl Write, meta: &TreeMeta, index: usize) {
     let status = if meta.leaf_id.is_some() { "active" } else { "empty" };
     let title = meta.title.as_deref().unwrap_or("untitled");
     let short_id = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
-    println!("  [{}] {} — {} ({})", index + 1, short_id, title, status);
+    write!(out, "  [{}] {} — {} ({})\r\n", index + 1, short_id, title, status).ok();
 }
 
 /// Replay old entries as if they just happened — seamless, no "quit" feel.
-/// Shows roles and turn boundaries for clarity.
-fn replay_entries(entries: &[Entry]) {
+fn replay_entries(out: &mut impl Write, entries: &[Entry]) {
     let mut in_turn = false;
     let mut state = RenderState::default();
 
@@ -109,28 +116,27 @@ fn replay_entries(entries: &[Entry]) {
                 if message.role == agent_core::types::MessageRole::User =>
             {
                 if in_turn {
-                    println!("{}──────────────────────{}",
-                             color::Fg(color::Blue), style::Reset);
+                    write!(out, "{}──────────────────────{}\r\n",
+                           color::Fg(color::Blue), style::Reset).ok();
                 }
                 in_turn = true;
 
-                // Render user message directly with role label
                 let t = match &message.content {
                     agent_core::types::MessageContent::Text(t) => t.clone(),
                     _ => "[content blocks]".into(),
                 };
-                println!();
-                println!("{}●  {}User:{}  {}",
-                         color::Fg(color::Green), style::Bold, style::Reset, t);
+                write!(out, "\r\n").ok();
+                write!(out, "{}●  {}User:{}  {}\r\n",
+                       color::Fg(color::Green), style::Bold, style::Reset, t).ok();
             }
 
             _ => {
                 if !in_turn {
-                    println!("{}·  ·  ·{}",
-                             color::Fg(color::LightBlack), style::Reset);
+                    write!(out, "{}·  ·  ·{}\r\n",
+                           color::Fg(color::LightBlack), style::Reset).ok();
                     in_turn = true;
                 }
-                render_event(&ServerEvent::Entry(entry.clone()), &mut state);
+                render_event(out, &ServerEvent::Entry(entry.clone()), &mut state);
             }
         }
     }
@@ -138,25 +144,25 @@ fn replay_entries(entries: &[Entry]) {
     if let Some(last) = entries.last() {
         if !matches!(last, Entry::SessionEnd { .. }) {
             if in_turn {
-                println!("{}──────────────────────{}",
-                         color::Fg(color::Blue), style::Reset);
+                write!(out, "{}──────────────────────{}\r\n",
+                       color::Fg(color::Blue), style::Reset).ok();
             }
-            render_done("complete");
+            render_done(out, "complete");
         }
     }
 }
 
-fn render_done(status: &str) {
-    println!();
-    match status {
-        "complete" => println!("  {}✓{} Done", color::Fg(color::Green), style::Reset),
-        "stop" => println!("  {}■{} Stopped", color::Fg(color::Yellow), style::Reset),
-        _ => println!("  {}{}", style::Bold, status),
-    }
+fn render_done(out: &mut impl Write, status: &str) {
+    let _ = write!(out, "\r\n");
+    let _ = match status {
+        "complete" => write!(out, "  {}✓{} Done\r\n", color::Fg(color::Green), style::Reset),
+        "stop" => write!(out, "  {}■{} Stopped\r\n", color::Fg(color::Yellow), style::Reset),
+        _ => write!(out, "{}\r\n", style::Bold),
+    };
 }
 
 
-fn print_entry_summary(entry: &Entry) {
+fn print_entry_summary(out: &mut impl Write, entry: &Entry) {
     match entry {
         Entry::Message { message, .. } => {
             let role_str = match message.role {
@@ -171,19 +177,19 @@ fn print_entry_summary(entry: &Entry) {
                 }
                 agent_core::types::MessageContent::Blocks(b) => format!("[{} blocks]", b.len()),
             };
-            println!("  {} ({}): {}", entry.id(), role_str, snippet);
+            write!(out, "  {} ({}): {}\r\n", entry.id(), role_str, snippet).ok();
         }
         Entry::BashExec { command, exit_code, .. } => {
-            println!("  {} bash: {} (exit: {})", entry.id(), command, exit_code);
+            write!(out, "  {} bash: {} (exit: {})\r\n", entry.id(), command, exit_code).ok();
         }
-        Entry::GoalSet { goal, .. } => println!("  {} 🎯 Goal: {}", entry.id(), goal),
-        Entry::ModelSet { model, .. } => println!("  {} 🤖 Model: {}", entry.id(), model),
+        Entry::GoalSet { goal, .. } => { let _ = write!(out, "  {} 🎯 Goal: {}\r\n", entry.id(), goal); }
+        Entry::ModelSet { model, .. } => { let _ = write!(out, "  {} 🤖 Model: {}\r\n", entry.id(), model); }
         Entry::SessionEnd { status, summary, .. } => {
             let s = summary.as_deref().unwrap_or("no summary");
-            println!("  {} 📝 Session end ({:?}): {}", entry.id(), status, s);
+            let _ = write!(out, "  {} 📝 Session end ({:?}): {}\r\n", entry.id(), status, s);
         }
-        Entry::SessionStart { .. } => println!("  {} ▶ Session start", entry.id()),
-        Entry::Label { label, .. } => println!("  {} 🏷 Label: {}", entry.id(), label),
+        Entry::SessionStart { .. } => { let _ = write!(out, "  {} ▶ Session start\r\n", entry.id()); }
+        Entry::Label { label, .. } => { let _ = write!(out, "  {} 🏷 Label: {}\r\n", entry.id(), label); }
     }
 }
 
@@ -195,34 +201,34 @@ struct RenderState {
     assistant_header_shown: bool,
 }
 
-fn render_event(event: &ServerEvent, state: &mut RenderState) {
+fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderState) {
     match event {
         ServerEvent::TextChunk { content } => {
             if !state.assistant_header_shown {
                 state.assistant_header_shown = true;
-                println!();
-                println!("{}  {}:{}", color::Fg(color::Cyan), "Assistant", style::Reset);
+                write!(out, "\r\n").ok();
+                write!(out, "{}  Assistant:{}\r\n", color::Fg(color::Cyan), style::Reset).ok();
             }
-            print!("{}", content);
-            io::stdout().flush().ok();
+            write!(out, "{}", content).ok();
+            out.flush().ok();
         }
         ServerEvent::ToolStart { tool, input } => {
-            println!();
+            write!(out, "\r\n").ok();
             let args_str = serde_json::to_string(input).unwrap_or_default();
             let preview = if args_str.len() > 120 {
                 format!("{}...", &args_str[..120])
             } else {
                 args_str
             };
-            println!("🛠  {}{}: {}{}", style::Bold, tool, preview, style::Reset);
+            write!(out, "🛠  {}{}: {}{}\r\n", style::Bold, tool, preview, style::Reset).ok();
         }
         ServerEvent::ToolResult { tool, exit, output } => {
-            println!();
+            write!(out, "\r\n").ok();
             let c = if *exit == 0 { color::Fg(color::Green).to_string() }
                      else { color::Fg(color::Red).to_string() };
-            println!("{}  {} (exit: {}){}", c, tool, exit, style::Reset);
+            write!(out, "{}  {} (exit: {}){}\r\n", c, tool, exit, style::Reset).ok();
             if !output.is_empty() {
-                print_indented(output, "│");
+                print_indented(out, output, "│");
             }
         }
         ServerEvent::Entry(entry) => {
@@ -232,22 +238,21 @@ fn render_event(event: &ServerEvent, state: &mut RenderState) {
                         agent_core::types::MessageContent::Text(t) => t.clone(),
                         _ => "[content blocks]".into(),
                     };
-                    println!();
-                    println!("{}●  {}User:{}  {}",
-                             color::Fg(color::Green), style::Bold, style::Reset, t);
+                    write!(out, "\r\n").ok();
+                    write!(out, "{}●  {}User:{}  {}\r\n",
+                           color::Fg(color::Green), style::Bold, style::Reset, t).ok();
                 }
-                Entry::GoalSet { goal, .. } => { println!(); println!("🎯  {}", goal); }
-                Entry::ModelSet { model, .. } => { println!(); println!("🤖  Model: {}", model); }
+                Entry::GoalSet { goal, .. } => { write!(out, "\r\n").ok(); write!(out, "🎯  {}\r\n", goal).ok(); }
+                Entry::ModelSet { model, .. } => { write!(out, "\r\n").ok(); write!(out, "🤖  Model: {}\r\n", model).ok(); }
                 Entry::SessionEnd { summary, status, .. } => {
-                    println!();
+                    write!(out, "\r\n").ok();
                     let s = summary.as_deref().unwrap_or("");
-                    println!("📝 {}Session ended ({:?}){}{}",
-                             style::Bold, status,
-                             if s.is_empty() { String::new() } else { format!(": {}", s) },
-                             style::Reset);
+                    write!(out, "📝 {}Session ended ({:?}){}{}\r\n",
+                           style::Bold, status,
+                           if s.is_empty() { String::new() } else { format!(": {}", s) },
+                           style::Reset).ok();
                 }
                 Entry::Message { message, .. } => {
-                    // Assistant / System / Tool messages — render body
                     let t = match &message.content {
                         agent_core::types::MessageContent::Text(t) => t.clone(),
                         _ => "[content blocks]".into(),
@@ -259,62 +264,110 @@ fn render_event(event: &ServerEvent, state: &mut RenderState) {
                             agent_core::types::MessageRole::Tool => "Tool",
                             _ => "",
                         };
-                        println!();
+                        write!(out, "\r\n").ok();
                         if !role_label.is_empty() {
-                            println!("{}  {}:{}", color::Fg(color::Cyan), role_label, style::Reset);
+                            write!(out, "{}  {}:{}\r\n", color::Fg(color::Cyan), role_label, style::Reset).ok();
                         }
-                        println!("{}", t);
+                        write!(out, "{}\r\n", t).ok();
                     }
                 }
                 Entry::BashExec { command, output, exit_code, .. } => {
-                    println!();
-                    println!("{}  🛠  {}bash: {}{}",
-                             color::Fg(color::Yellow), style::Bold, command, style::Reset);
+                    write!(out, "\r\n").ok();
+                    write!(out, "{}  🛠  {}bash: {}{}\r\n",
+                           color::Fg(color::Yellow), style::Bold, command, style::Reset).ok();
                     let c = if *exit_code == 0 { color::Fg(color::Green).to_string() }
                              else { color::Fg(color::Red).to_string() };
-                    println!("{}  bash (exit: {}){}", c, exit_code, style::Reset);
+                    write!(out, "{}  bash (exit: {}){}\r\n", c, exit_code, style::Reset).ok();
                     if !output.is_empty() {
-                        print_indented(output, "│");
+                        print_indented(out, output, "│");
                     }
                 }
-                _ => {} // skip SessionStart, Label, etc.
+                _ => {}
             }
         }
         ServerEvent::CapWarning { level, pct } => {
-            print_warning(&format!("Context at {}% ({})", pct, level));
+            print_warning(out, &format!("Context at {}% ({})", pct, level));
         }
         ServerEvent::Error { message, fatal } => {
-            if *fatal { print_error(&format!("Fatal: {}", message)); }
-            else { print_warning(&format!("Error: {}", message)); }
+            if *fatal { print_error(out, &format!("Fatal: {}", message)); }
+            else { print_warning(out, &format!("Error: {}", message)); }
         }
-        ServerEvent::Done { status } => render_done(status),
+        ServerEvent::Done { status } => render_done(out, status),
         ServerEvent::FileChanged { path, kind } => {
-            println!(); println!("  📄 {} ({})", path, kind);
+            write!(out, "\r\n").ok(); write!(out, "  📄 {} ({})\r\n", path, kind).ok();
+        }
+    }
+}
+
+// ── Raw-mode input helper ──
+
+/// Read one line of input in raw mode, echoing characters back.
+/// Returns `None` on Ctrl-C (user wants to quit).
+fn read_line_raw(
+    keys: &mut impl Iterator<Item = Result<Key, std::io::Error>>,
+    out: &mut impl Write,
+) -> Option<String> {
+    let mut input = String::new();
+    loop {
+        match keys.next() {
+            Some(Ok(Key::Ctrl('c'))) => {
+                // Ctrl-C: signal quit
+                write!(out, "\r\n").ok();
+                out.flush().ok();
+                return None;
+            }
+            Some(Ok(Key::Char('\n'))) | Some(Ok(Key::Char('\r'))) => {
+                write!(out, "\r\n").ok();
+                out.flush().ok();
+                return Some(input);
+            }
+            Some(Ok(Key::Char(c))) => {
+                input.push(c);
+                write!(out, "{}", c).ok();
+                out.flush().ok();
+            }
+            Some(Ok(Key::Backspace)) => {
+                input.pop();
+                write!(out, "\x08 \x08").ok();
+                out.flush().ok();
+            }
+            Some(Err(e)) => {
+                write!(out, "\r\nInput error: {}\r\n", e).ok();
+                return Some(input);
+            }
+            None => return Some(input),
+            _ => {}
         }
     }
 }
 
 // ── Tree selection ──
 
-fn select_or_create_tree(client: &AgentClient) -> Result<String, String> {
+fn select_or_create_tree(
+    keys: &mut impl Iterator<Item = Result<Key, std::io::Error>>,
+    out: &mut impl Write,
+    client: &AgentClient,
+) -> Result<String, String> {
     loop {
         let trees = client.list_trees()?;
 
         if !trees.is_empty() {
-            println!("\nYour trees:");
+            write!(out, "\r\nYour trees:\r\n").ok();
             for (i, tree) in trees.iter().enumerate() {
-                print_tree_meta(tree, i);
+                print_tree_meta(out, tree, i);
             }
-            println!();
-            print!("Select a tree (number), 'new', or 'q' to quit: ");
-            io::stdout().flush().ok();
+            write!(out, "\r\n").ok();
+            write!(out, "Select a tree (number), 'new', or 'q' to quit: ").ok();
+            out.flush().ok();
 
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).ok();
-            let input = input.trim().to_lowercase();
+            let input = read_line_raw(keys, out);
+            let input = match input {
+                None => std::process::exit(0),
+                Some(s) => s.trim().to_lowercase(),
+            };
 
             if input == "q" || input == "quit" { std::process::exit(0); }
-            if input == "new" { return create_tree_interactive(client); }
+            if input == "new" { return create_tree_interactive(keys, out, client); }
 
             if let Ok(idx) = input.parse::<usize>() {
                 if idx > 0 && idx <= trees.len() {
@@ -322,72 +375,81 @@ fn select_or_create_tree(client: &AgentClient) -> Result<String, String> {
                 }
             }
 
-            // Try as tree ID prefix
             if !input.is_empty() {
                 let matches: Vec<&TreeMeta> = trees.iter().filter(|t| t.id.starts_with(&input)).collect();
                 if matches.len() == 1 { return Ok(matches[0].id.clone()); }
-                if matches.len() > 1 { println!("Multiple matches, be more specific."); continue; }
+                if matches.len() > 1 { write!(out, "Multiple matches, be more specific.\r\n").ok(); continue; }
             }
 
-            println!("Invalid selection.");
+            write!(out, "Invalid selection.\r\n").ok();
         } else {
-            println!("No trees found. Let's create one.");
-            return create_tree_interactive(client);
+            write!(out, "No trees found. Let's create one.\r\n").ok();
+            return create_tree_interactive(keys, out, client);
         }
     }
 }
 
-fn create_tree_interactive(client: &AgentClient) -> Result<String, String> {
-    print!("Enter a title (or press Enter for 'default'): ");
-    io::stdout().flush().ok();
-    let mut title = String::new();
-    io::stdin().read_line(&mut title).ok();
+fn create_tree_interactive(
+    keys: &mut impl Iterator<Item = Result<Key, std::io::Error>>,
+    out: &mut impl Write,
+    client: &AgentClient,
+) -> Result<String, String> {
+    write!(out, "Enter a title (or press Enter for 'default'): ").ok();
+    out.flush().ok();
+    let title = read_line_raw(keys, out).unwrap_or_default();
     let title = title.trim().to_string();
     let title = if title.is_empty() { "default".into() } else { title };
 
-    print!("Enter repo path (optional): ");
-    io::stdout().flush().ok();
-    let mut repo_path = String::new();
-    io::stdin().read_line(&mut repo_path).ok();
+    write!(out, "Enter repo path (optional): ").ok();
+    out.flush().ok();
+    let repo_path = read_line_raw(keys, out).unwrap_or_default();
     let repo_path = repo_path.trim().to_string();
     let repo_path = if repo_path.is_empty() { None } else { Some(repo_path) };
 
-    print!("Enter model (optional): ");
-    io::stdout().flush().ok();
-    let mut model = String::new();
-    io::stdin().read_line(&mut model).ok();
+    write!(out, "Enter model (optional): ").ok();
+    out.flush().ok();
+    let model = read_line_raw(keys, out).unwrap_or_default();
     let model = model.trim().to_string();
     let model = if model.is_empty() { None } else { Some(model) };
 
     let meta = client.create_tree(Some(&title), repo_path.as_deref(), model.as_deref())?;
     let short_id = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
-    println!("{}Created tree {} ({}){}",
-             color::Fg(color::Green), short_id,
-             meta.title.as_deref().unwrap_or("untitled"),
-             style::Reset);
+    write!(out, "{}Created tree {} ({}){}\r\n",
+           color::Fg(color::Green), short_id,
+           meta.title.as_deref().unwrap_or("untitled"),
+           style::Reset).ok();
     Ok(meta.id)
 }
 
 // ── Message processing ──
 
-fn process_message(server: &str, tree_id: &str, text: &str) -> Result<(), String> {
+fn process_message(
+    server: &str,
+    tree_id: &str,
+    text: &str,
+    out: &mut impl Write,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     let client = AgentClient::new(server);
 
-    // Open SSE stream FIRST so we don't miss any events.
-    // (The stream auto-spawns the agent if needed.)
-    // Then send the message, so we're already listening when events arrive.
     let mut stream = client.stream_events(tree_id)?;
     client.send_message(tree_id, text)?;
     let mut state = RenderState::default();
 
     loop {
-        match stream.next_event() {
+        if stop.load(Ordering::Relaxed) {
+            write!(out, "\r\nInterrupted\r\n").ok();
+            break;
+        }
+        match stream.poll_event() {
             Some(event) => {
                 let is_done = matches!(&event, ServerEvent::Done { .. });
-                render_event(&event, &mut state);
+                render_event(out, &event, &mut state);
                 if is_done { break; }
             }
-            None => break,
+            None => {
+                // Timeout — loop back to check stop
+            }
         }
     }
     Ok(())
@@ -396,18 +458,32 @@ fn process_message(server: &str, tree_id: &str, text: &str) -> Result<(), String
 // ── Prompt loop ──
 
 /// Run the interactive TUI.
-pub fn run_interactive(server: &str) -> Result<(), String> {
-    println!("{}Connected to server at {}{}",
-             color::Fg(color::Green), server, style::Reset);
-    print_help();
-    println!();
+pub fn run_interactive(server: &str, initial_repo_path: Option<String>, stop: &AtomicBool) -> Result<(), String> {
+    let mut out = io::stdout().into_raw_mode().map_err(|e| format!("raw mode: {}", e))?;
+    let mut keys = io::stdin().keys();
+
+    write!(out, "{}Connected to server at {}{}\r\n",
+           color::Fg(color::Green), server, style::Reset).ok();
+    print_help(&mut out);
+    write!(out, "\r\n").ok();
 
     let client = AgentClient::new(server);
-    let mut current_tree_id = select_or_create_tree(&client)?;
+    let mut current_tree_id = if let Some(rp) = initial_repo_path {
+        let meta = client.create_tree(Some("untitled"), Some(&rp), None)
+            .map_err(|e| format!("failed to create tree: {}", e))?;
+        let sid = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
+        write!(out, "Created tree {} in {}\r\n", sid, rp).ok();
+        meta.id
+    } else {
+        select_or_create_tree(&mut keys, &mut out, &client)?
+    };
     let mut show_header = true;
 
     loop {
-        // Show tree context only on first render or when tree changes
+        if stop.load(Ordering::Relaxed) {
+            write!(out, "\r\nInterrupted\r\n").ok();
+            break;
+        }
         if show_header {
             match client.get_tree(&current_tree_id) {
                 Ok(meta) => {
@@ -417,41 +493,41 @@ pub fn run_interactive(server: &str) -> Result<(), String> {
                     } else {
                         &current_tree_id
                     };
-                    println!("\n{}──────────────────────────────{}",
-                             color::Fg(color::Blue), style::Reset);
-                    println!("Now talking in: {} ({})", title, short_id);
-                    println!("{}──────────────────────────────{}",
-                             color::Fg(color::Blue), style::Reset);
+                    write!(out, "\r\n{}──────────────────────────────{}\r\n",
+                           color::Fg(color::Blue), style::Reset).ok();
+                    write!(out, "Now talking in: {} ({})\r\n", title, short_id).ok();
+                    write!(out, "{}──────────────────────────────{}\r\n",
+                           color::Fg(color::Blue), style::Reset).ok();
 
-                    // Replay latest entries as if they just happened
                     if let Ok(entries) = client.get_entries(&current_tree_id) {
                         if !entries.is_empty() {
                             let last: Vec<_> = entries.iter().rev().take(10).rev().cloned().collect();
-                            replay_entries(&last);
+                            replay_entries(&mut out, &last);
                         }
                     }
                 }
-                Err(e) => print_warning(&format!("Failed to load tree: {}", e)),
+                Err(e) => print_warning(&mut out, &format!("Failed to load tree: {}", e)),
             }
             show_header = false;
         }
 
-        // Prompt
-        print!("\n> ");
-        io::stdout().flush().ok();
+        write!(out, "\r\n> ").ok();
+        out.flush().ok();
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).ok();
+        let input = match read_line_raw(&mut keys, &mut out) {
+            None => { write!(out, "Goodbye!\r\n").ok(); break; }
+            Some(s) => s,
+        };
         let input = input.trim().to_string();
         if input.is_empty() { continue; }
 
         match parse_input(&input) {
-            CliCommand::Quit => { println!("Goodbye!"); break; }
-            CliCommand::Help => print_help(),
+            CliCommand::Quit => { write!(out, "Goodbye!\r\n").ok(); break; }
+            CliCommand::Help => print_help(&mut out),
             CliCommand::ListTrees => {
                 match client.list_trees() {
-                    Ok(trees) => { println!(); for (i, t) in trees.iter().enumerate() { print_tree_meta(t, i); } }
-                    Err(e) => print_error(&format!("Failed to list trees: {}", e)),
+                    Ok(trees) => { write!(out, "\r\n").ok(); for (i, t) in trees.iter().enumerate() { print_tree_meta(&mut out, t, i); } }
+                    Err(e) => print_error(&mut out, &format!("Failed to list trees: {}", e)),
                 }
             }
             CliCommand::Create { title, repo_path, model } => {
@@ -464,44 +540,44 @@ pub fn run_interactive(server: &str) -> Result<(), String> {
                         current_tree_id = meta.id.clone();
                         show_header = true;
                         let short_id = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
-                        println!("{}Created tree {} ({}){}",
-                                 color::Fg(color::Green), short_id,
-                                 meta.title.as_deref().unwrap_or("untitled"),
-                                 style::Reset);
+                        write!(out, "{}Created tree {} ({}){}\r\n",
+                               color::Fg(color::Green), short_id,
+                               meta.title.as_deref().unwrap_or("untitled"),
+                               style::Reset).ok();
                     }
-                    Err(e) => print_error(&format!("Failed to create tree: {}", e)),
+                    Err(e) => print_error(&mut out, &format!("Failed to create tree: {}", e)),
                 }
             }
             CliCommand::Switch(id) => {
-                if id.is_empty() { print_error("Usage: /switch <tree_id>"); continue; }
+                if id.is_empty() { print_error(&mut out, "Usage: /switch <tree_id>"); continue; }
                 match client.get_tree(&id) {
                     Ok(meta) => {
                         current_tree_id = meta.id;
                         show_header = true;
-                        println!("{}Switched to tree {}{}",
-                                 color::Fg(color::Green),
-                                 meta.title.as_deref().unwrap_or(&id),
-                                 style::Reset);
+                        write!(out, "{}Switched to tree {}{}\r\n",
+                               color::Fg(color::Green),
+                               meta.title.as_deref().unwrap_or(&id),
+                               style::Reset).ok();
                     }
-                    Err(e) => print_error(&format!("Tree not found: {}", e)),
+                    Err(e) => print_error(&mut out, &format!("Tree not found: {}", e)),
                 }
             }
             CliCommand::Stop => {
                 match client.stop_agent(&current_tree_id) {
-                    Ok(()) => println!("{}Stop signaled{}", color::Fg(color::Yellow), style::Reset),
-                    Err(e) => print_error(&format!("Failed to stop: {}", e)),
+                    Ok(()) => { let _ = write!(out, "{}Stop signaled{}\r\n", color::Fg(color::Yellow), style::Reset); }
+                    Err(e) => print_error(&mut out, &format!("Failed to stop: {}", e)),
                 }
             }
             CliCommand::Show => {
                 match client.get_tree(&current_tree_id) {
                     Ok(meta) => {
-                        println!("{}Tree info:{}", style::Bold, style::Reset);
-                        println!("  ID:        {}", meta.id);
-                        println!("  Title:     {}", meta.title.as_deref().unwrap_or("(none)"));
-                        println!("  Repo path: {}", meta.repo_path.as_deref().map(|p| p.display().to_string()).unwrap_or("(none)".into()));
-                        println!("  Active:    {}", if meta.leaf_id.is_some() { "yes" } else { "no" });
+                        write!(out, "{}Tree info:{}\r\n", style::Bold, style::Reset).ok();
+                        write!(out, "  ID:        {}\r\n", meta.id).ok();
+                        write!(out, "  Title:     {}\r\n", meta.title.as_deref().unwrap_or("(none)")).ok();
+                        write!(out, "  Repo path: {}\r\n", meta.repo_path.as_deref().map(|p| p.display().to_string()).unwrap_or("(none)".into())).ok();
+                        write!(out, "  Active:    {}\r\n", if meta.leaf_id.is_some() { "yes" } else { "no" }).ok();
                     }
-                    Err(e) => print_error(&format!("Failed to load tree: {}", e)),
+                    Err(e) => print_error(&mut out, &format!("Failed to load tree: {}", e)),
                 }
             }
             CliCommand::Entries(n) => {
@@ -509,14 +585,14 @@ pub fn run_interactive(server: &str) -> Result<(), String> {
                 match client.get_entries(&current_tree_id) {
                     Ok(entries) => {
                         let last: Vec<_> = entries.iter().rev().take(limit).rev().collect();
-                        println!("{}Last {} entries:{}", style::Bold, last.len(), style::Reset);
-                        for e in &last { print_entry_summary(e); }
+                        write!(out, "{}Last {} entries:{}\r\n", style::Bold, last.len(), style::Reset).ok();
+                        for e in &last { print_entry_summary(&mut out, e); }
                     }
-                    Err(e) => print_error(&format!("Failed to load entries: {}", e)),
+                    Err(e) => print_error(&mut out, &format!("Failed to load entries: {}", e)),
                 }
             }
             CliCommand::Message(text) => {
-                process_message(server, &current_tree_id, &text)?;
+                process_message(server, &current_tree_id, &text, &mut out, stop)?;
             }
         }
     }

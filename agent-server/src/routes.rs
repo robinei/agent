@@ -5,7 +5,9 @@ use std::sync::Arc;
 use rouille::{router, Request, Response, ResponseBody};
 use serde::Deserialize;
 
+use agent_core::agent;
 use agent_core::config::Config;
+use agent_core::provider::Provider;
 use agent_core::store::Store;
 use agent_core::types::{Entry, ServerEvent, TreeMeta};
 
@@ -63,6 +65,10 @@ pub fn handle_request(request: &Request, store: &Arc<Store>, config: &Config) ->
 
         (POST) (/trees/{id: String}/message) => {
             handle_send_message(&id, request, store, config)
+        },
+
+        (POST) (/trees/{id: String}/auto-title) => {
+            handle_auto_title(&id, store, config)
         },
 
         (POST) (/trees/{id: String}/stop) => {
@@ -330,10 +336,19 @@ fn handle_stop_agent(id: &str) -> Response {
     }
 }
 
-/// GET /trees/{id}/stream — SSE event stream for an active agent
-///
-/// Auto-spawns the agent if it isn't already running. This allows the CLI
-/// to open the SSE stream first, then send the message via POST.
+/// POST /trees/{id}/auto-title — ask LLM to generate a title
+fn handle_auto_title(id: &str, _store: &Store, config: &Config) -> Response {
+    let provider = Provider::new(
+        config.summary.base_url.clone(),
+        config.summary.api_key.clone(),
+        config.summary.model.clone(),
+    );
+    match agent::auto_title(_store, &provider, id) {
+        Ok(title) => Response::json(&serde_json::json!({"title": title})),
+        Err(e) => Response::json(&serde_json::json!({"error": e})).with_status_code(500),
+    }
+}
+
 // ── SSE Upgrade (bypasses BufWriter in tiny_http) ──
 
 

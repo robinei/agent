@@ -3,6 +3,8 @@
 //! Uses `ureq` (v3) to communicate with the server.
 
 use std::io::{BufRead, BufReader};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use ureq::http;
 
@@ -138,9 +140,28 @@ impl AgentClient {
         self.post_empty(&format!("/trees/{}/stop", tree_id))
     }
 
-    /// Get all entries for a tree.
+/// Get all entries for a tree.
     pub fn get_entries(&self, tree_id: &str) -> Result<Vec<Entry>, String> {
-        self.get_json(&format!("/trees/{}/entries", tree_id))
+        self.get_json(&format!("/trees/{}", tree_id))
+    }
+
+    /// Ask the server to auto-generate a title for a tree.
+    pub fn auto_title(&self, tree_id: &str) -> Result<String, String> {
+        let url = format!("{}/trees/{}/auto-title", self.base, tree_id);
+        let resp = ureq::post(&url)
+            .send_json(&serde_json::json!({}))
+            .map_err(|e| format!("request failed: {}", e))?;
+        if resp.status().as_u16() >= 400 {
+            return Err(extract_error(resp));
+        }
+        let json: serde_json::Value = resp
+            .into_body()
+            .read_json()
+            .map_err(|e| format!("failed to parse response: {}", e))?;
+        json.get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "no title in response".to_string())
     }
 
     /// Open an SSE event stream for an active agent.
@@ -152,50 +173,53 @@ impl AgentClient {
         if resp.status().as_u16() >= 400 {
             return Err(extract_error(resp));
         }
-        Ok(SseEventStream {
-            reader: BufReader::new(resp.into_body().into_reader()),
-        })
+        Ok(SseEventStream::new(resp.into_body().into_reader()))
     }
 }
 
-/// Iterator over SSE events from the agent-server.
+/// Background-read SSE events and deliver via channel for pollable access.
 pub struct SseEventStream {
-    reader: BufReader<ureq::BodyReader<'static>>,
+    rx: mpsc::Receiver<Option<ServerEvent>>,
+    poll_timeout: Duration,
 }
 
 impl SseEventStream {
-    /// Read the next event, blocking until one arrives or the stream ends.
-    pub fn next_event(&mut self) -> Option<ServerEvent> {
-        let mut line = String::new();
-loop {
-            line.clear();
-            match self.reader.read_line(&mut line) {
-                Ok(0) | Err(_) => return None,
-                Ok(_) => {}
-            }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            // Parse SSE format: "data: {json}"
-            let data = trimmed
-.strip_prefix("data: ")
-                .unwrap_or(trimmed);
-
-            if data == "[DONE]" {
-                return None;
-            }
-
-            match serde_json::from_str::<ServerEvent>(data) {
-                Ok(event) => return Some(event),
-                Err(e) => {
-                    eprintln!("[client] Warning: failed to parse SSE event: {}", e);
-                    continue;
+    /// Spawn a reader thread and return a pollable stream.
+    pub fn new(reader: ureq::BodyReader<'static>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("sse-reader".into())
+            .spawn(move || {
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => { let _ = tx.send(None); break; }
+                        Ok(_) => {}
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
+                    let data = trimmed.strip_prefix("data: ").unwrap_or(trimmed);
+                    if data == "[DONE]" { let _ = tx.send(None); break; }
+                    match serde_json::from_str::<ServerEvent>(data) {
+                        Ok(event) => { if tx.send(Some(event)).is_err() { break; } }
+                        Err(e) => eprintln!("[client] Warning: failed to parse SSE event: {}", e),
+                    }
                 }
-            }
-        }
+            })
+            .ok();
+        Self { rx, poll_timeout: Duration::from_millis(200) }
+    }
+
+    /// Block until the next event arrives.
+    pub fn next_event(&mut self) -> Option<ServerEvent> {
+        self.rx.recv().ok()?
+    }
+
+    /// Return the next event, or None after `poll_timeout`.
+    pub fn poll_event(&mut self) -> Option<ServerEvent> {
+        self.rx.recv_timeout(self.poll_timeout).ok()?
     }
 }
 
