@@ -1444,7 +1444,7 @@ Do not modify: agent-core, agent-cli, agent-worker.
 
 ### Step 4 — CLI: WebSocket transport
 
-- [ ]
+- [x] done
 
 **Goal:** CLI session commands go over WebSocket. Tree CRUD stays HTTP.
 
@@ -1514,7 +1514,12 @@ Do not modify: agent-server, agent-core, agent-worker.
 work end-to-end via WS.
 
 **Notes:**
-_(fill in on completion)_
+- Modified: `agent-cli/Cargo.toml` — added `tungstenite = "0.21"` and `url = "2"`
+- Modified: `agent-cli/src/client.rs` — added `AgentSession` struct with `connect`, `send_message`, `send_stop`, `next_event`; added `parse_host_port` helper; removed `SseEventStream` and `stream_events` (no longer needed); removed `send_message` HTTP POST; added tests for `parse_host_port` and `AgentSession` URL format
+- Modified: `agent-cli/src/lib.rs` — `send_and_stream` and `session_and_stream` use `AgentSession` (WS) instead of HTTP+SSE; removed `stream_text_chunks` helper
+- Modified: `agent-cli/src/interactive.rs` — `process_message` uses `AgentSession` (WS) instead of HTTP+SSE
+- Deviation: Removed the SSE parser (`SseEventStream`) early — it's cleanup specified for Step 7, but Step 4's spec says "Drop the SSE parser" can be done now if no other code path needs it. No paths reference it after this change.
+- Verified: `cargo test --workspace` → 95 passed, 0 failed
 
 ---
 

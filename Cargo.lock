@@ -28,7 +28,9 @@ dependencies = [
  "serde",
  "serde_json",
  "termion",
+ "tungstenite",
  "ureq",
+ "url",
 ]
 
 [[package]]

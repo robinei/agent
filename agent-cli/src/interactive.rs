@@ -430,10 +430,8 @@ fn process_message(
     out: &mut impl Write,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    let client = AgentClient::new(server);
-
-    let mut stream = client.stream_events(tree_id)?;
-    client.send_message(tree_id, text)?;
+    let mut session = crate::client::AgentSession::connect(server, tree_id)?;
+    session.send_message(text)?;
     let mut state = RenderState::default();
 
     loop {
@@ -441,14 +439,18 @@ fn process_message(
             write!(out, "\r\nInterrupted\r\n").ok();
             break;
         }
-        match stream.poll_event() {
-            Some(event) => {
+        match session.next_event() {
+            Some(Ok(event)) => {
                 let is_done = matches!(&event, ServerEvent::Done { .. });
                 render_event(out, &event, &mut state);
                 if is_done { break; }
             }
+            Some(Err(e)) => {
+                write!(out, "\r\nParse error: {}\r\n", e).ok();
+                break;
+            }
             None => {
-                // Timeout — loop back to check stop
+                // Connection closed — check stop and loop back
             }
         }
     }

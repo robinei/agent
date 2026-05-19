@@ -153,13 +153,33 @@ fn stop_agent(server: &str, tree_id: &str) {
 }
 
 fn send_and_stream(server: &str, tree_id: &str, message: &str, stop: &AtomicBool) {
-    let c = client(server);
-    let mut stream = c.stream_events(tree_id).unwrap_or_else(|e| exit_err(&e));
-    c.send_message(tree_id, message).unwrap_or_else(|e| exit_err(&e));
-    stream_text_chunks(&mut stream, stop);
+    use agent_core::types::ServerEvent;
+    let mut session = client::AgentSession::connect(server, tree_id).unwrap_or_else(|e| exit_err(&e));
+    session.send_message(message).unwrap_or_else(|e| exit_err(&e));
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            println!("\nInterrupted");
+            break;
+        }
+        match session.next_event() {
+            Some(Ok(ServerEvent::TextChunk { content })) => {
+                print!("{content}");
+                io::stdout().flush().ok();
+            }
+            Some(Ok(ServerEvent::Done { .. })) => { println!(); break; }
+            Some(Ok(ServerEvent::Error { message, fatal })) => {
+                if fatal { exit_err(&message); }
+                else { eprintln!("Error: {message}"); }
+            }
+            Some(Err(e)) => { eprintln!("Parse error: {e}"); break; }
+            _ => {}
+        }
+    }
 }
 
 fn session_and_stream(server: &str, repo_path: &str, message: &str, stop: &AtomicBool) {
+    use agent_core::types::ServerEvent;
+
     let c = client(server);
 
     let abs = std::path::Path::new(repo_path);
@@ -175,35 +195,31 @@ fn session_and_stream(server: &str, repo_path: &str, message: &str, stop: &Atomi
     let sid = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
     println!("Created tree {} in {}", sid, rp);
 
-    let mut stream = c.stream_events(&meta.id).unwrap_or_else(|e| exit_err(&e));
-    c.send_message(&meta.id, message).unwrap_or_else(|e| exit_err(&e));
-    stream_text_chunks(&mut stream, stop);
+    let mut session = client::AgentSession::connect(server, &meta.id).unwrap_or_else(|e| exit_err(&e));
+    session.send_message(message).unwrap_or_else(|e| exit_err(&e));
 
-    match c.auto_title(&meta.id) {
-        Ok(title) => println!("\nTitle: {}", title),
-        Err(e) => eprintln!("Auto-title failed: {}", e),
-    }
-}
-
-fn stream_text_chunks(stream: &mut client::SseEventStream, stop: &AtomicBool) {
-    use agent_core::types::ServerEvent;
     loop {
         if stop.load(Ordering::Relaxed) {
             println!("\nInterrupted");
             break;
         }
-        match stream.poll_event() {
-            Some(ServerEvent::TextChunk { content }) => {
+        match session.next_event() {
+            Some(Ok(ServerEvent::TextChunk { content })) => {
                 print!("{content}");
                 io::stdout().flush().ok();
             }
-            Some(ServerEvent::Done { .. }) => { println!(); break; }
-            Some(ServerEvent::Error { message, fatal }) => {
+            Some(Ok(ServerEvent::Done { .. })) => { println!(); break; }
+            Some(Ok(ServerEvent::Error { message, fatal })) => {
                 if fatal { exit_err(&message); }
                 else { eprintln!("Error: {message}"); }
             }
-            Some(_) => {}
-            None => {}
+            Some(Err(e)) => { eprintln!("Parse error: {e}"); break; }
+            _ => {}
         }
+    }
+
+    match c.auto_title(&meta.id) {
+        Ok(title) => println!("\nTitle: {}", title),
+        Err(e) => eprintln!("Auto-title failed: {}", e),
     }
 }

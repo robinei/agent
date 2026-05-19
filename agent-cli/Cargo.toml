@@ -12,3 +12,5 @@ clap          = { version = "4", features = ["derive"] }
 termion       = "4"
 anyhow        = "1"
 ctrlc         = "3.4"
+tungstenite   = { version = "0.21", default-features = false }
+url           = "2"

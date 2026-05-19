@@ -2,13 +2,9 @@
 //!
 //! Uses `ureq` (v3) to communicate with the server.
 
-use std::io::{BufRead, BufReader};
-use std::sync::mpsc;
-use std::time::Duration;
-
 use ureq::http;
 
-use agent_core::types::{Entry, ServerEvent, TreeMeta};
+use agent_core::types::{Entry, TreeMeta};
 
 /// Build a base URL from the server address string.
 fn base_url(server: &str) -> String {
@@ -122,25 +118,12 @@ impl AgentClient {
         self.get_json(&format!("/trees/{}", id))
     }
 
-    /// Send a user message to an active (or auto-spawned) agent.
-    pub fn send_message(&self, tree_id: &str, text: &str) -> Result<(), String> {
-        let body = serde_json::json!({ "text": text });
-        let url = format!("{}/trees/{}/message", self.base, tree_id);
-        let resp = ureq::post(&url)
-            .send_json(&body)
-            .map_err(|e| format!("request failed: {}", e))?;
-        if resp.status().as_u16() >= 400 {
-            return Err(extract_error(resp));
-        }
-        Ok(())
-    }
-
     /// Stop the active agent for a tree.
     pub fn stop_agent(&self, tree_id: &str) -> Result<(), String> {
         self.post_empty(&format!("/trees/{}/stop", tree_id))
     }
 
-/// Get all entries for a tree.
+    /// Get all entries for a tree.
     pub fn get_entries(&self, tree_id: &str) -> Result<Vec<Entry>, String> {
         self.get_json(&format!("/trees/{}", tree_id))
     }
@@ -163,67 +146,64 @@ impl AgentClient {
             .map(|s| s.to_string())
             .ok_or_else(|| "no title in response".to_string())
     }
+}
 
-    /// Open an SSE event stream for an active agent.
-    pub fn stream_events(&self, tree_id: &str) -> Result<SseEventStream, String> {
-        let url = format!("{}/trees/{}/stream", self.base, tree_id);
-        let resp = ureq::get(&url)
-            .call()
-            .map_err(|e| format!("request failed: {}", e))?;
-        if resp.status().as_u16() >= 400 {
-            return Err(extract_error(resp));
-        }
-        Ok(SseEventStream::new(resp.into_body().into_reader()))
+// ── WebSocket session for agent communication ──
+
+/// Parse host and port from a server string like "localhost:8080" or "http://localhost:8080".
+fn parse_host_port(server: &str) -> Result<(String, u16), String> {
+    let s = server.strip_prefix("http://").or_else(|| server.strip_prefix("https://")).unwrap_or(server);
+    let s = s.trim_end_matches('/');
+    let (host, port_str) = s.split_once(':').ok_or_else(|| format!("invalid server address '{}': expected host:port", server))?;
+    let port: u16 = port_str.parse().map_err(|e| format!("invalid port '{}': {}", port_str, e))?;
+    Ok((host.to_string(), port))
+}
+
+/// WebSocket session to an agent worker.
+pub struct AgentSession {
+    ws: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+}
+
+impl AgentSession {
+    /// Connect to a tree's WebSocket session.
+    pub fn connect(server: &str, tree_id: &str) -> Result<Self, String> {
+        let (host, port) = parse_host_port(server)?;
+        let url = format!("ws://{}:{}/trees/{}/ws", host, port, tree_id);
+        let (ws, _resp) = tungstenite::connect(url).map_err(|e| format!("WS connect failed: {}", e))?;
+        Ok(Self { ws })
     }
-}
 
-/// Background-read SSE events and deliver via channel for pollable access.
-pub struct SseEventStream {
-    rx: mpsc::Receiver<Option<ServerEvent>>,
-    poll_timeout: Duration,
-}
+    /// Send a user message to the agent.
+    pub fn send_message(&mut self, text: &str) -> Result<(), String> {
+        let cmd = agent_core::rpc::WsCommand::Message {
+            params: agent_core::rpc::MessageParams { text: text.into() },
+        };
+        let s = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
+        self.ws.send(tungstenite::Message::Text(s)).map_err(|e| e.to_string())
+    }
 
-impl SseEventStream {
-    /// Spawn a reader thread and return a pollable stream.
-    pub fn new(reader: ureq::BodyReader<'static>) -> Self {
-        let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("sse-reader".into())
-            .spawn(move || {
-                let mut reader = BufReader::new(reader);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => { let _ = tx.send(None); break; }
-                        Ok(_) => {}
-                    }
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() { continue; }
-                    let data = trimmed.strip_prefix("data: ").unwrap_or(trimmed);
-                    if data == "[DONE]" { let _ = tx.send(None); break; }
-                    match serde_json::from_str::<ServerEvent>(data) {
-                        Ok(event) => { if tx.send(Some(event)).is_err() { break; } }
-                        Err(e) => eprintln!("[client] Warning: failed to parse SSE event: {}", e),
-                    }
+    /// Send a stop command to the agent.
+    pub fn send_stop(&mut self) -> Result<(), String> {
+        let s = serde_json::to_string(&agent_core::rpc::WsCommand::Stop).map_err(|e| e.to_string())?;
+        self.ws.send(tungstenite::Message::Text(s)).map_err(|e| e.to_string())
+    }
+
+    /// Read the next event from the WebSocket. Returns None on close/error.
+    pub fn next_event(&mut self) -> Option<Result<agent_core::types::ServerEvent, String>> {
+        loop {
+            match self.ws.read() {
+                Ok(tungstenite::Message::Text(s)) => {
+                    return Some(serde_json::from_str(&s).map_err(|e| e.to_string()));
                 }
-            })
-            .ok();
-        Self { rx, poll_timeout: Duration::from_millis(200) }
-    }
-
-    /// Block until the next event arrives.
-    pub fn next_event(&mut self) -> Option<ServerEvent> {
-        self.rx.recv().ok()?
-    }
-
-    /// Return the next event, or None after `poll_timeout`.
-    pub fn poll_event(&mut self) -> Option<ServerEvent> {
-        self.rx.recv_timeout(self.poll_timeout).ok()?
+                Ok(tungstenite::Message::Ping(p)) => {
+                    let _ = self.ws.send(tungstenite::Message::Pong(p));
+                }
+                Ok(tungstenite::Message::Close(_)) | Err(_) => return None,
+                _ => {}
+            }
+        }
     }
 }
-
-// ── Tests ──
 
 #[cfg(test)]
 mod tests {
@@ -235,5 +215,33 @@ mod tests {
         assert_eq!(base_url("http://localhost:8080"), "http://localhost:8080");
         assert_eq!(base_url("http://localhost:8080/"), "http://localhost:8080");
         assert_eq!(base_url("127.0.0.1:9090"), "http://127.0.0.1:9090");
+    }
+
+    #[test]
+    fn test_parse_host_port() {
+        let (h, p) = parse_host_port("localhost:8080").unwrap();
+        assert_eq!(h, "localhost");
+        assert_eq!(p, 8080);
+
+        let (h, p) = parse_host_port("http://localhost:8080").unwrap();
+        assert_eq!(h, "localhost");
+        assert_eq!(p, 8080);
+
+        let (h, p) = parse_host_port("http://192.168.1.5:9090").unwrap();
+        assert_eq!(h, "192.168.1.5");
+        assert_eq!(p, 9090);
+    }
+
+    #[test]
+    fn test_parse_host_port_bad_format() {
+        assert!(parse_host_port("localhost").is_err());
+        assert!(parse_host_port("localhost:abc").is_err());
+    }
+
+    #[test]
+    fn test_agent_session_url_format() {
+        let (host, port) = parse_host_port("localhost:8080").unwrap();
+        let url = format!("ws://{}:{}/trees/abc123/ws", host, port);
+        assert_eq!(url, "ws://localhost:8080/trees/abc123/ws");
     }
 }
