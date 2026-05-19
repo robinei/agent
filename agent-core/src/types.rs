@@ -91,7 +91,7 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
-fn expand_tilde(p: &PathBuf) -> PathBuf {
+pub fn expand_tilde(p: &PathBuf) -> PathBuf {
     if p.starts_with("~") {
         let home = dirs_home();
         if p == &PathBuf::from("~") {

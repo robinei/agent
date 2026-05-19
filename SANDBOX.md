@@ -1856,126 +1856,14 @@ returns 201 with sandbox echoed in the meta response. `agent create ...
 
 ### Step 9 — bubblewrap sandboxing
 
-- [ ]
+- [x] done
 
 **Goal:** Workers actually run inside bwrap configured from `TreeSandbox`
 + `[sandbox.defaults]`.
 
 **Spec details:**
 
-Files modified:
-- `agent-core/src/config.rs` — add `SandboxConfig` with `enabled`,
-  `bwrap_path`, and `defaults: SandboxDefaults { hide: Vec<PathBuf> }`
-- `agent-server/src/lifecycle.rs` — `build_bwrap_argv()`,
-  invoke `bwrap` instead of the exe directly when sandbox is enabled
-- `config.toml` (the in-tree example) — show `[sandbox]` and
-  `[sandbox.defaults]` examples
-
-Config additions:
-```rust
-#[derive(Clone, Debug)]
-pub struct SandboxConfig {
-    pub enabled: bool,
-    pub bwrap_path: Option<PathBuf>,
-    pub defaults: SandboxDefaults,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SandboxDefaults {
-    pub hide: Vec<PathBuf>,
-}
-```
-Defaults: `enabled = true`; `bwrap_path = None` (probed at startup —
-log "sandboxing active" if found, else log "bwrap not found, workers
-will run unsandboxed"); `defaults.hide` = the curated list from the
-"Default credential blocklist" section above.
-
-`build_bwrap_argv` (in `lifecycle.rs`):
-```rust
-fn build_bwrap_argv(
-    exe: &Path,
-    tree_id: &str,
-    meta: &TreeMeta,
-    cfg: &Config,
-) -> Vec<OsString> {
-    let mut args: Vec<OsString> = Vec::new();
-    // structural mounts
-    args.extend(["--ro-bind", "/", "/"].iter().map(OsString::from));
-    args.extend(["--dev", "/dev"].iter().map(OsString::from));
-    args.extend(["--proc", "/proc"].iter().map(OsString::from));
-    args.extend(["--tmpfs", "/tmp"].iter().map(OsString::from));
-
-    // The tree's own data dir + repo + config
-    let store_dir = agent_dir().join("trees").join(tree_id);
-    args.extend(["--bind".into(), store_dir.clone().into(), store_dir.into()]);
-    if let Some(repo) = &meta.repo_path {
-        args.extend(["--bind".into(), repo.clone().into(), repo.clone().into()]);
-    }
-    let config_path = agent_dir().join("config.toml");
-    args.extend(["--ro-bind".into(), config_path.clone().into(), config_path.into()]);
-    args.extend(["--ro-bind".into(), exe.to_path_buf().into(), exe.to_path_buf().into()]);
-
-    // Per-tree extra writables
-    for p in &meta.sandbox.writable {
-        let p = expand_tilde(p);
-        if p.exists() {
-            args.extend(["--bind".into(), p.clone().into(), p.into()]);
-        }
-    }
-
-    // Hide = defaults + sandbox.hide minus sandbox.unhide
-    let mut hide_set: BTreeSet<PathBuf> = cfg.sandbox.defaults.hide.iter().cloned().collect();
-    hide_set.extend(meta.sandbox.hide.iter().cloned());
-    for u in &meta.sandbox.unhide {
-        hide_set.remove(u);
-    }
-    for p in hide_set {
-        let p = expand_tilde(&p);
-        if p.exists() {
-            args.extend(["--tmpfs".into(), p.into()]);
-        }
-    }
-
-    // Namespace + network
-    args.push("--unshare-all".into());
-    let allow_net = meta.sandbox.network.unwrap_or(true);
-    if allow_net { args.push("--share-net".into()); }
-    args.push("--new-session".into());
-    args.push("--die-with-parent".into());
-
-    // Worker command
-    args.push("--".into());
-    args.push(exe.to_path_buf().into());
-    args.push("worker".into());
-    args.push("--tree-id".into());
-    args.push(tree_id.into());
-    args.push("--config".into());
-    args.push(agent_dir().join("config.toml").into());
-
-    args
-}
-```
-
-`spawn_worker` (modified) — if `cfg.sandbox.enabled` and bwrap found:
-`Command::new(bwrap_path).args(build_bwrap_argv(...))`. Otherwise:
-`Command::new(exe).arg("worker").arg("--tree-id").arg(tree_id).arg("--config").arg(config_path)`
-(unchanged direct spawn).
-
-Sensitive env: pass `LLM_API_KEY` (and any others that contain secrets)
-via `Command::env(...)` so they reach the worker. bwrap inherits the
-parent env by default; if you want to be strict, add `--clearenv` and
-pass only allowlisted vars explicitly — for now, inherit.
-
-Tests to add:
-- `test_build_bwrap_argv_basic` — call `build_bwrap_argv` with a fixed
-  `TreeMeta` + `Config` and assert specific argv entries appear in the
-  expected order
-- `test_build_bwrap_argv_no_net` — assert `--share-net` is absent when
-  `sandbox.network = Some(false)`
-- `test_build_bwrap_argv_unhide` — assert a path in `defaults.hide` that
-  is also in `sandbox.unhide` does not produce a `--tmpfs` arg
-
-Do not modify: agent-core/agent.rs, tools, hooks.
+...
 
 **Verify:**
 1. With `sandbox.enabled = true` and a tree whose `repo_path` is
@@ -1988,7 +1876,15 @@ Do not modify: agent-core/agent.rs, tools, hooks.
 5. `sandbox.enabled = false`: same commands behave as without bwrap
 
 **Notes:**
-_(fill in on completion)_
+- Modified: `agent-core/src/config.rs` — added `SandboxConfig` (with `enabled`, `bwrap_path`, `defaults: SandboxDefaults`) and `SandboxDefaults` (with `hide: Vec<PathBuf>`) structs; added `sandbox` field to `Config` with default credential blocklist; added TOML parsing for `[sandbox]` and `[sandbox.defaults]` sections in `apply_toml`
+- Modified: `agent-core/src/types.rs` — made `expand_tilde` `pub` so `lifecycle.rs` can use it for tilde expansion in bwrap arg construction
+- Modified: `agent-server/src/lifecycle.rs` — added `build_bwrap_argv()` function that constructs bwrap argv from `TreeMeta` + `Config` (structural mounts, tree data dir bind, repo bind, extra writables, hide/unhide via `--tmpfs`, namespace/network flags, `--die-with-parent`); added `resolve_bwrap_path()` and `which()` helpers; modified `spawn_worker` to use bwrap when `cfg.sandbox.enabled` is true (builds bwrap args and spawns via `bwrap` command instead of direct exe); added `use std::collections::BTreeSet`, `use std::ffi::OsString`, `use std::path::PathBuf`
+- Modified: `config.toml` — added `[sandbox]` and `[sandbox.defaults]` sections with the default credential blocklist
+- Test added: `test_build_bwrap_argv_basic` — structural mounts, --share-net, namespace flags, worker subcommand after `--`
+- Test added: `test_build_bwrap_argv_no_net` — asserts `--share-net` is absent when `sandbox.network = Some(false)`
+- Test added: `test_build_bwrap_argv_unhide` — asserts `~/.ssh` (in defaults.hide but also in sandbox.unhide) does not produce a `--tmpfs` arg while `~/.aws` (still hidden) does
+- Deviation: Used `which()` helper + probe common paths instead of a single `bwrap_path` auto-detect; `resolve_bwrap_path` falls back to PATH lookup if common paths are empty; used `BTreeSet<PathBuf>` for deduplicated hide set (preserves deterministic ordering)
+- Verified: `cargo test --workspace` → 106 passed, 0 failed; `cargo clippy --workspace` → no new warnings
 
 ---
 

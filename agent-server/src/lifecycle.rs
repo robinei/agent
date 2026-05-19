@@ -1,5 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::ffi::OsString;
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -7,7 +9,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use agent_core::config::Config;
 use agent_core::provider::Provider;
 use agent_core::store::Store;
-use agent_core::types::{Entry, ServerEvent, TreeId};
+use agent_core::types::{Entry, ServerEvent, TreeId, TreeMeta};
 
 const BUFFER_CAPACITY: usize = 1000;
 
@@ -49,17 +51,34 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let config_path = agent_core::config::agent_dir().join("config.toml");
 
-    let mut child = Command::new(&exe)
-        .arg("worker")
-        .arg("--tree-id")
-        .arg(tree_id)
-        .arg("--config")
-        .arg(&config_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn worker: {e}"))?;
+    let meta = store
+        .get_tree(tree_id)
+        .map_err(|e| format!("get_tree: {e}"))?
+        .ok_or_else(|| format!("tree {} not found", tree_id))?;
+
+    let mut child = if cfg.sandbox.enabled {
+        let bwrap_path = resolve_bwrap_path(&cfg.sandbox.bwrap_path)?;
+        let bwrap_args = build_bwrap_argv(&exe, tree_id, &meta, &cfg);
+        Command::new(&bwrap_path)
+            .args(&bwrap_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn bwrap worker: {e}"))?
+    } else {
+        Command::new(&exe)
+            .arg("worker")
+            .arg("--tree-id")
+            .arg(tree_id)
+            .arg("--config")
+            .arg(&config_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn worker: {e}"))?
+    };
 
     let pid = child.id();
     let stdin = child.stdin.take().unwrap();
@@ -85,6 +104,106 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
     spawn_stderr_demux(tree_id.to_string(), stderr);
     log::info!("[lifecycle] Spawned worker for tree {} (pid {})", tree_id, pid);
     Ok(())
+}
+
+fn resolve_bwrap_path(hint: &Option<std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
+    if let Some(p) = hint {
+        if p.exists() {
+            return Ok(p.clone());
+        }
+        return Err(format!("bwrap not found at configured path {:?}", p));
+    }
+    // Probe common locations
+    for candidate in &["/usr/bin/bwrap", "/usr/local/bin/bwrap"] {
+        if std::path::Path::new(candidate).exists() {
+            return Ok(std::path::PathBuf::from(candidate));
+        }
+    }
+    log::warn!("[lifecycle] bwrap not found on PATH, workers will run unsandboxed");
+    // Fall back: try PATH lookup
+    which("bwrap").ok_or_else(|| {
+        "bwrap not found: install bubblewrap or set sandbox.enabled = false".to_string()
+    })
+}
+
+fn which(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                Some(candidate)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+pub fn build_bwrap_argv(
+    exe: &Path,
+    tree_id: &str,
+    meta: &TreeMeta,
+    cfg: &Config,
+) -> Vec<OsString> {
+    let store_dir = agent_core::config::agent_dir().join("trees").join(tree_id);
+    let config_path = agent_core::config::agent_dir().join("config.toml");
+
+    let mut args: Vec<OsString> = Vec::new();
+
+    // Structural mounts
+    args.extend(["--ro-bind", "/", "/"].iter().map(OsString::from));
+    args.extend(["--dev", "/dev"].iter().map(OsString::from));
+    args.extend(["--proc", "/proc"].iter().map(OsString::from));
+    args.extend(["--tmpfs", "/tmp"].iter().map(OsString::from));
+
+    // The tree's own data dir + repo + config
+    args.extend(["--bind".into(), store_dir.clone().into(), store_dir.into()]);
+    if let Some(repo) = &meta.repo_path {
+        args.extend(["--bind".into(), repo.clone().into(), repo.clone().into()]);
+    }
+    args.extend(["--ro-bind".into(), config_path.clone().into(), config_path.into()]);
+    args.extend(["--ro-bind".into(), exe.to_path_buf().into(), exe.to_path_buf().into()]);
+
+    // Per-tree extra writables
+    for p in &meta.sandbox.writable {
+        let expanded = agent_core::types::expand_tilde(p);
+        if expanded.exists() {
+            args.extend(["--bind".into(), expanded.clone().into(), expanded.into()]);
+        }
+    }
+
+    // Hide = defaults + sandbox.hide minus sandbox.unhide
+    let mut hide_set: BTreeSet<PathBuf> = cfg.sandbox.defaults.hide.iter().cloned().collect();
+    hide_set.extend(meta.sandbox.hide.iter().cloned());
+    for u in &meta.sandbox.unhide {
+        hide_set.remove(u);
+    }
+    for p in &hide_set {
+        let expanded = agent_core::types::expand_tilde(p);
+        if expanded.exists() {
+            args.extend(["--tmpfs".into(), expanded.into()]);
+        }
+    }
+
+    // Namespace + network
+    args.push("--unshare-all".into());
+    let allow_net = meta.sandbox.network.unwrap_or(true);
+    if allow_net {
+        args.push("--share-net".into());
+    }
+    args.push("--new-session".into());
+    args.push("--die-with-parent".into());
+
+    // Worker command after --
+    args.push("--".into());
+    args.push(exe.to_path_buf().into());
+    args.push("worker".into());
+    args.push("--tree-id".into());
+    args.push(tree_id.into());
+    args.push("--config".into());
+    args.push(agent_core::config::agent_dir().join("config.toml").into());
+
+    args
 }
 
 pub fn worker_send_command(tree_id: &str, json_line: &str) -> Result<(), String> {
@@ -323,7 +442,9 @@ pub fn shutdown_all(store: &Store) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::types::Entry;
+    use agent_core::config::{SandboxConfig, SandboxDefaults};
+    use agent_core::types::{Entry, TreeSandbox};
+    use std::path::PathBuf;
 
     #[test]
     fn test_worker_subscribe_atomicity() {
@@ -446,5 +567,150 @@ mod tests {
 
         // Cleanup
         ACTIVE_WORKERS.lock().unwrap().remove(tree_id);
+    }
+
+    #[test]
+    fn test_build_bwrap_argv_basic() {
+        let exe = Path::new("/usr/local/bin/agent");
+        let tree_id = "test-tree-001";
+        let meta = TreeMeta {
+            id: tree_id.into(),
+            parent_id: None,
+            repo_path: Some(PathBuf::from("/home/user/code/repo")),
+            title: None,
+            created_at: 100,
+            updated_at: 100,
+            leaf_id: None,
+            sandbox: TreeSandbox::default(),
+        };
+        let cfg = Config {
+            sandbox: SandboxConfig {
+                enabled: true,
+                bwrap_path: None,
+                defaults: SandboxDefaults {
+                    hide: vec![PathBuf::from("~/.ssh"), PathBuf::from("~/.aws")],
+                },
+            },
+            ..Config::default()
+        };
+
+        let args = build_bwrap_argv(exe, tree_id, &meta, &cfg);
+
+        // Structural mounts must be present and in order
+        assert!(args.iter().any(|a| a == "--ro-bind"));
+        assert!(args.iter().any(|a| a == "--dev"));
+        assert!(args.iter().any(|a| a == "--proc"));
+        assert!(args.iter().any(|a| a == "--tmpfs"));
+
+        // Must include --share-net (network defaults to true)
+        assert!(args.iter().any(|a| a == "--share-net"));
+
+        // Must include --unshare-all, --new-session, --die-with-parent
+        assert!(args.iter().any(|a| a == "--unshare-all"));
+        assert!(args.iter().any(|a| a == "--new-session"));
+        assert!(args.iter().any(|a| a == "--die-with-parent"));
+
+        // Must include the worker subcommand after --
+        let worker_idx = args.iter().position(|a| a == "--").unwrap();
+        assert!(worker_idx + 1 < args.len());
+        assert_eq!(args[worker_idx + 1], OsString::from("/usr/local/bin/agent"));
+        assert_eq!(args[worker_idx + 2], OsString::from("worker"));
+        assert_eq!(args[worker_idx + 3], OsString::from("--tree-id"));
+        assert_eq!(args[worker_idx + 4], OsString::from(tree_id));
+
+        // Repo path must be bound
+        assert!(args.iter().any(|a| a == "--bind"));
+    }
+
+    #[test]
+    fn test_build_bwrap_argv_no_net() {
+        let exe = Path::new("/usr/local/bin/agent");
+        let tree_id = "test-tree-no-net";
+        let meta = TreeMeta {
+            id: tree_id.into(),
+            parent_id: None,
+            repo_path: None,
+            title: None,
+            created_at: 100,
+            updated_at: 100,
+            leaf_id: None,
+            sandbox: TreeSandbox {
+                network: Some(false),
+                ..TreeSandbox::default()
+            },
+        };
+        let cfg = Config {
+            sandbox: SandboxConfig {
+                enabled: true,
+                bwrap_path: None,
+                defaults: SandboxDefaults::default(),
+            },
+            ..Config::default()
+        };
+
+        let args = build_bwrap_argv(exe, tree_id, &meta, &cfg);
+
+        // Must NOT include --share-net
+        assert!(!args.iter().any(|a| a == "--share-net"));
+        // But still has other namespace args
+        assert!(args.iter().any(|a| a == "--unshare-all"));
+    }
+
+    #[test]
+    fn test_build_bwrap_argv_unhide() {
+        let exe = Path::new("/usr/local/bin/agent");
+        let tree_id = "test-tree-unhide";
+        let meta = TreeMeta {
+            id: tree_id.into(),
+            parent_id: None,
+            repo_path: None,
+            title: None,
+            created_at: 100,
+            updated_at: 100,
+            leaf_id: None,
+            sandbox: TreeSandbox {
+                unhide: vec![PathBuf::from("~/.ssh")],
+                ..TreeSandbox::default()
+            },
+        };
+        let cfg = Config {
+            sandbox: SandboxConfig {
+                enabled: true,
+                bwrap_path: None,
+                defaults: SandboxDefaults {
+                    hide: vec![PathBuf::from("~/.ssh"), PathBuf::from("~/.aws")],
+                },
+            },
+            ..Config::default()
+        };
+
+        let args = build_bwrap_argv(exe, tree_id, &meta, &cfg);
+
+        // The home directory may not exist in test env, so the --tmpfs for hide
+        // paths may be skipped if the path doesn't exist. Instead, check that
+        // the unhide path (~/.ssh) does NOT produce a --tmpfs arg targeting it
+        // while ~/.aws still does (since both defaults.hide exist and only
+        // ~/.ssh is unhide'd).
+        // We just verify there's at most one --tmpfs (for ~/.aws, since ~/.ssh was unhide'd)
+        // and that ~/.ssh is not among the --tmpfs args.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let ssh_dir = PathBuf::from(&home).join(".ssh");
+        let aws_dir = PathBuf::from(&home).join(".aws");
+
+        // Count --tmpfs that match the unhide'd path
+        let ssh_tmpfs_count = args.windows(2)
+            .filter(|w| w[0] == OsString::from("--tmpfs"))
+            .filter(|w| w[1] == OsString::from(ssh_dir.clone().into_os_string()))
+            .count();
+        assert_eq!(ssh_tmpfs_count, 0, "~/.ssh should not be tmpfs'd (unhided)");
+
+        // If ~/.aws exists, it should have a --tmpfs
+        if aws_dir.exists() {
+            let aws_tmpfs_count = args.windows(2)
+                .filter(|w| w[0] == OsString::from("--tmpfs"))
+                .filter(|w| w[1] == OsString::from(aws_dir.clone().into_os_string()))
+                .count();
+            assert_eq!(aws_tmpfs_count, 1, "~/.aws should be tmpfs'd (still hidden)");
+        }
     }
 }

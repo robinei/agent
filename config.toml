@@ -24,3 +24,20 @@ max_tool_calls_per_turn = 25
 level = "info"
 to_file = "/tmp/agent-server.log"
 to_stderr = true
+
+[sandbox]
+enabled = true
+# bwrap_path = "/usr/bin/bwrap"  # auto-detected if omitted
+
+[sandbox.defaults]
+hide = [
+    "~/.ssh", "~/.aws", "~/.azure", "~/.config/gcloud", "~/.config/heroku",
+    "~/.config/gh", "~/.config/glab", "~/.kube", "~/.docker",
+    "~/.git-credentials", "~/.netrc",
+    "~/.npmrc", "~/.pypirc", "~/.cargo/credentials.toml",
+    "~/.gnupg", "~/.password-store",
+    "~/.local/share/keyrings", "~/.config/keybase",
+    "~/.bash_history", "~/.zsh_history", "~/.local/share/fish/fish_history",
+    "~/.mozilla", "~/.config/google-chrome", "~/.config/chromium",
+    "~/.config/Slack", "~/.config/discord",
+]

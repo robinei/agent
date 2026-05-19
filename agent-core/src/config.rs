@@ -8,6 +8,19 @@ pub struct Config {
     pub summary: SummaryConfig,
     pub session: SessionConfig,
     pub logging: LoggingConfig,
+    pub sandbox: SandboxConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct SandboxConfig {
+    pub enabled: bool,
+    pub bwrap_path: Option<PathBuf>,
+    pub defaults: SandboxDefaults,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SandboxDefaults {
+    pub hide: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +83,40 @@ impl Default for Config {
                 level: "info".into(),
                 to_file: Some("/tmp/agent-server.log".into()),
                 to_stderr: true,
+            },
+            sandbox: SandboxConfig {
+                enabled: true,
+                bwrap_path: None,
+                defaults: SandboxDefaults {
+                    hide: vec![
+                        PathBuf::from("~/.ssh"),
+                        PathBuf::from("~/.aws"),
+                        PathBuf::from("~/.azure"),
+                        PathBuf::from("~/.config/gcloud"),
+                        PathBuf::from("~/.config/heroku"),
+                        PathBuf::from("~/.config/gh"),
+                        PathBuf::from("~/.config/glab"),
+                        PathBuf::from("~/.kube"),
+                        PathBuf::from("~/.docker"),
+                        PathBuf::from("~/.git-credentials"),
+                        PathBuf::from("~/.netrc"),
+                        PathBuf::from("~/.npmrc"),
+                        PathBuf::from("~/.pypirc"),
+                        PathBuf::from("~/.cargo/credentials.toml"),
+                        PathBuf::from("~/.gnupg"),
+                        PathBuf::from("~/.password-store"),
+                        PathBuf::from("~/.local/share/keyrings"),
+                        PathBuf::from("~/.config/keybase"),
+                        PathBuf::from("~/.bash_history"),
+                        PathBuf::from("~/.zsh_history"),
+                        PathBuf::from("~/.local/share/fish/fish_history"),
+                        PathBuf::from("~/.mozilla"),
+                        PathBuf::from("~/.config/google-chrome"),
+                        PathBuf::from("~/.config/chromium"),
+                        PathBuf::from("~/.config/Slack"),
+                        PathBuf::from("~/.config/discord"),
+                    ],
+                },
             },
         }
     }
@@ -191,6 +238,28 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
         }
         if let Some(v) = section.get("to_stderr").and_then(|v| v.as_bool()) {
             cfg.logging.to_stderr = v;
+        }
+    }
+
+    // [sandbox]
+    if let Some(Value::Table(section)) = table.get("sandbox") {
+        if let Some(v) = section.get("enabled").and_then(|v| v.as_bool()) {
+            cfg.sandbox.enabled = v;
+        }
+        if let Some(v) = section.get("bwrap_path").and_then(|v| v.as_str()) {
+            cfg.sandbox.bwrap_path = Some(PathBuf::from(v));
+        }
+        // [sandbox.defaults]
+        if let Some(Value::Table(defaults)) = section.get("defaults") {
+            if let Some(Value::Array(hide)) = defaults.get("hide") {
+                let paths: Vec<PathBuf> = hide
+                    .iter()
+                    .filter_map(|v| v.as_str().map(PathBuf::from))
+                    .collect();
+                if !paths.is_empty() {
+                    cfg.sandbox.defaults.hide = paths;
+                }
+            }
         }
     }
 }
