@@ -3,6 +3,7 @@ use std::sync::Arc;
 mod http;
 mod lifecycle;
 mod routes;
+mod ws;
 
 pub fn run(args: Vec<String>) {
     let _ = args;

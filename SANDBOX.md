@@ -549,6 +549,13 @@ These hold throughout. Don't re-explain them per step.
 - **Tests live with the code:** `#[cfg(test)] mod tests { ... }` at the
   bottom of the file containing the unit under test. Integration tests
   go in a `tests/` directory at the crate root.
+- **Transcribe explanatory comments from the spec into code.** When a
+  spec snippet contains a comment that explains *why* a line is the way
+  it is — especially "INTENTIONAL:", "DO NOT...", "Required, not
+  optional", or any "what would go wrong if you changed this" rationale
+  — copy that comment verbatim into the implementation. These comments
+  exist to stop a later reader (human or model) from "improving" the
+  code into a bug. Strip them and the safeguard is gone.
 
 ---
 
@@ -1245,7 +1252,7 @@ once the real WS endpoint exists.)
 
 ### Step 3c — WS endpoint + keepalive
 
-- [ ]
+- [x] done
 
 **Goal:** `GET /trees/{id}/ws` upgrades to a WebSocket on the same
 TcpListener as HTTP. Events flow from the worker via the proxy thread
@@ -1261,7 +1268,7 @@ Files modified:
 
 New deps:
 ```toml
-tungstenite = { version = "0.21", default-features = false }
+tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
 ```
 
 New file: `agent-server/src/ws.rs`
@@ -1425,7 +1432,13 @@ Do not modify: agent-core, agent-cli, agent-worker.
 `{"method":"message","params":{"text":"hi"}}`, see streamed events.
 
 **Notes:**
-_(fill in on completion)_
+- Created: `agent-server/src/ws.rs` — WS accept, handshake, session loop with ping/pong keepalive (30s interval, 90s timeout), 10ms sleep poll
+- Modified: `agent-server/Cargo.toml` — added `tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }`
+- Modified: `agent-server/src/lib.rs` — added `pub mod ws;`
+- Modified: `agent-server/src/http.rs` — wired WS detection to call `crate::ws::accept` instead of bare `return;`
+- Modified: `agent-server/src/routes.rs` — removed temporary `_test_spawn` and `_test_send` test routes (now WS does the job)
+- Test added: `test_derive_accept_key_matches_rfc` in `ws.rs`
+- Verified: `cargo test --workspace` → 92 passed, 0 failed
 
 ---
 

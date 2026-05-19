@@ -9,6 +9,9 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn handle_connection(mut stream: TcpStream, store: Arc<Store>, cfg: Arc<Config>) {
+    // Slowloris guard: a misbehaving client could open a TCP connection and
+    // dribble bytes forever, pinning a thread. 30s read timeout closes the
+    // connection if no progress is made between reads. Required, not optional.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
 
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
@@ -40,6 +43,9 @@ pub fn handle_connection(mut stream: TcpStream, store: Arc<Store>, cfg: Arc<Conf
         }
     }
 
+    // Re-parse to get owned views of method/path/headers. The borrow
+    // checker prevents us from holding the previous parser across the
+    // loop boundary, so we extract everything into owned data here.
     let mut hs = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut hs);
     let _ = req.parse(&buf);
@@ -56,6 +62,7 @@ pub fn handle_connection(mut stream: TcpStream, store: Arc<Store>, cfg: Arc<Conf
         && header_contains(&headers, "upgrade", b"websocket")
         && header_contains(&headers, "connection", b"upgrade");
     if is_ws {
+        crate::ws::accept(stream, &path, &headers, store, cfg);
         return;
     }
 
