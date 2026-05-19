@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+use std::io::{BufRead, Write};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, LazyLock, Mutex};
 
@@ -184,4 +186,214 @@ pub fn send_message(tree_id: &str, text: &str) -> Result<(), String> {
 /// Get a clone of the agent handle for a tree (for SSE streaming).
 pub fn get_handle(tree_id: &str) -> Option<AgentHandle> {
     ACTIVE_AGENTS.lock().ok()?.get(tree_id).cloned()
+}
+
+// ── Worker subprocess lifecycle ──
+
+pub struct WorkerEntry {
+    pub stdin_tx: mpsc::Sender<String>,
+    pub event_buffer: VecDeque<ServerEvent>,
+    pub subscribers: Vec<mpsc::Sender<ServerEvent>>,
+    pub pid: u32,
+    pub child: Option<Child>,
+}
+
+pub static ACTIVE_WORKERS: LazyLock<Mutex<HashMap<TreeId, Arc<Mutex<WorkerEntry>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn worker_get(tree_id: &str) -> Option<Arc<Mutex<WorkerEntry>>> {
+    ACTIVE_WORKERS.lock().unwrap().get(tree_id).cloned()
+}
+
+pub fn spawn_worker(tree_id: &str) -> Result<(), String> {
+    let workers = ACTIVE_WORKERS.lock().map_err(|e| e.to_string())?;
+    if workers.contains_key(tree_id) {
+        return Err(format!("Worker already active for tree {}", tree_id));
+    }
+    drop(workers);
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let config_path = agent_core::config::agent_dir().join("config.toml");
+
+    let mut child = Command::new(&exe)
+        .arg("worker")
+        .arg("--tree-id")
+        .arg(tree_id)
+        .arg("--config")
+        .arg(&config_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn worker: {e}"))?;
+
+    let pid = child.id();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (stdin_tx, stdin_rx) = mpsc::channel::<String>();
+
+    let entry = Arc::new(Mutex::new(WorkerEntry {
+        stdin_tx,
+        event_buffer: VecDeque::with_capacity(BUFFER_CAPACITY),
+        subscribers: Vec::new(),
+        pid,
+        child: Some(child),
+    }));
+
+    ACTIVE_WORKERS
+        .lock()
+        .unwrap()
+        .insert(tree_id.to_string(), entry.clone());
+
+    spawn_stdin_writer(stdin, stdin_rx);
+    spawn_stdout_proxy(tree_id.to_string(), stdout, entry.clone());
+    spawn_stderr_demux(tree_id.to_string(), stderr);
+    log::info!("[lifecycle] Spawned worker for tree {} (pid {})", tree_id, pid);
+    Ok(())
+}
+
+pub fn worker_send_command(tree_id: &str, json_line: &str) -> Result<(), String> {
+    let entry = worker_get(tree_id).ok_or_else(|| format!("No active worker for tree {}", tree_id))?;
+    let guard = entry.lock().unwrap();
+    guard
+        .stdin_tx
+        .send(json_line.to_string())
+        .map_err(|e| format!("Failed to send command to worker: {}", e))
+}
+
+pub fn worker_stop(tree_id: &str) -> Result<(), String> {
+    worker_send_command(tree_id, r#"{"method":"stop"}"#)
+}
+
+pub fn worker_subscribe(
+    tree_id: &str,
+) -> Option<(Vec<ServerEvent>, mpsc::Receiver<ServerEvent>)> {
+    let entry = worker_get(tree_id)?;
+    let mut guard = entry.lock().unwrap();
+    let snapshot: Vec<ServerEvent> = guard.event_buffer.iter().cloned().collect();
+    let (tx, rx) = mpsc::channel();
+    guard.subscribers.push(tx);
+    Some((snapshot, rx))
+}
+
+fn spawn_stdin_writer(mut stdin: ChildStdin, rx: mpsc::Receiver<String>) {
+    std::thread::spawn(move || {
+        while let Ok(line) = rx.recv() {
+            if writeln!(stdin, "{}", line).is_err() {
+                break;
+            }
+            if stdin.flush().is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_stdout_proxy(
+    tree_id: String,
+    stdout: ChildStdout,
+    entry: Arc<Mutex<WorkerEntry>>,
+) {
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let event: ServerEvent = match serde_json::from_str(buf.trim_end()) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("[proxy {}] bad event JSON: {}", tree_id, e);
+                    continue;
+                }
+            };
+            let mut guard = entry.lock().unwrap();
+            if matches!(event, ServerEvent::Entry(_)) {
+                if guard.event_buffer.len() >= BUFFER_CAPACITY {
+                    guard.event_buffer.pop_front();
+                }
+                guard.event_buffer.push_back(event.clone());
+            }
+            guard.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+        }
+        log::info!("[proxy {}] worker stdout closed", tree_id);
+        ACTIVE_WORKERS.lock().unwrap().remove(&tree_id);
+    });
+}
+
+fn spawn_stderr_demux(tree_id: String, stderr: ChildStderr) {
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut buf = String::new();
+        let short = &tree_id[..tree_id.len().min(8)];
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => log::info!("[worker {}] {}", short, buf.trim_end()),
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::types::Entry;
+
+    #[test]
+    fn test_worker_subscribe_atomicity() {
+        let entry = Arc::new(Mutex::new(WorkerEntry {
+            stdin_tx: mpsc::channel().0,
+            event_buffer: VecDeque::with_capacity(BUFFER_CAPACITY),
+            subscribers: Vec::new(),
+            pid: 0,
+            child: None,
+        }));
+
+        // Pre-populate with some events
+        {
+            let mut g = entry.lock().unwrap();
+            let e = ServerEvent::Entry(Entry::SessionStart {
+                id: "1".into(),
+                parent_id: None,
+                timestamp: "t1".into(),
+            });
+            g.event_buffer.push_back(e);
+        }
+
+        // Insert into ACTIVE_WORKERS
+        let tree_id = "test-atomicity";
+        ACTIVE_WORKERS
+            .lock()
+            .unwrap()
+            .insert(tree_id.to_string(), entry.clone());
+
+        // Subscribe — gets snapshot + live rx
+        let (snapshot, rx) = worker_subscribe(tree_id).unwrap();
+        assert_eq!(snapshot.len(), 1);
+
+        // Append event while subscriber is live
+        let e2 = ServerEvent::Entry(Entry::SessionStart {
+            id: "2".into(),
+            parent_id: None,
+            timestamp: "t2".into(),
+        });
+        {
+            let mut g = entry.lock().unwrap();
+            g.event_buffer.push_back(e2.clone());
+            g.subscribers.retain(|tx| tx.send(e2.clone()).is_ok());
+        }
+
+        // Live subscriber should receive it
+        let received = rx.recv().unwrap();
+        assert!(matches!(received, ServerEvent::Entry(_)));
+
+        // Cleanup
+        ACTIVE_WORKERS.lock().unwrap().remove(tree_id);
+    }
 }

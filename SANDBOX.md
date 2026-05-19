@@ -1078,7 +1078,7 @@ through the new layer.
 
 ### Step 3b — Worker subprocess lifecycle
 
-- [ ]
+- [x] done
 
 **Goal:** Server can spawn worker subprocesses and proxy their stdin/stdout
 to/from in-process channels. Still no WS endpoint — sessions can be exercised
@@ -1236,7 +1236,10 @@ inspect server logs for proxied events. (Remove these test routes in 3c
 once the real WS endpoint exists.)
 
 **Notes:**
-_(fill in on completion)_
+- Modified: `agent-server/src/lifecycle.rs` — added `WorkerEntry`, `ACTIVE_WORKERS`, `spawn_worker`, `worker_get`, `worker_send_command`, `worker_stop`, `worker_subscribe`, `spawn_stdin_writer`, `spawn_stdout_proxy`, `spawn_stderr_demux`; fixed duplicate `BUFFER_CAPACITY` const; added unused import cleanup
+- Modified: `agent-server/src/routes.rs` — added temporary `_test_spawn` and `_test_send` routes (to be removed in Step 3c)
+- Test added: `test_worker_subscribe_atomicity` in `lifecycle.rs`
+- Verified: `cargo test --workspace` → 91 passed, 0 failed
 
 ---
 

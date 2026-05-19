@@ -55,6 +55,8 @@ pub fn dispatch(
             ("POST", "message") => handle_send_message(id, body, store, cfg),
             ("POST", "stop") => handle_stop_agent(id),
             ("POST", "auto-title") => handle_auto_title(id, store, cfg),
+            ("POST", "_test_spawn") => handle_test_spawn(id),
+            ("POST", "_test_send") => handle_test_send(id, body),
             _ => not_found(),
         };
     }
@@ -303,6 +305,27 @@ fn generate_entry_id() -> String {
         .unwrap_or_default()
         .subsec_nanos();
     format!("{:08x}", nanos.wrapping_mul(2654435761))
+}
+
+// Temporary test routes for Step 3b — remove in Step 3c
+
+fn handle_test_spawn(id: &str) -> (u16, Vec<u8>, &'static str) {
+    match crate::lifecycle::spawn_worker(id) {
+        Ok(()) => json(200, &serde_json::json!({"status": "worker spawned"})),
+        Err(e) => json(500, &serde_json::json!({"error": e})),
+    }
+}
+
+fn handle_test_send(id: &str, body: &[u8]) -> (u16, Vec<u8>, &'static str) {
+    let body: SendMessageBody = match serde_json::from_slice(body) {
+        Ok(b) => b,
+        Err(_) => return json(400, &serde_json::json!({"error": "invalid JSON body"})),
+    };
+    let cmd = serde_json::json!({"method":"message","params":{"text":body.text}});
+    match crate::lifecycle::worker_send_command(id, &serde_json::to_string(&cmd).unwrap()) {
+        Ok(()) => json(200, &serde_json::json!({"status": "sent"})),
+        Err(e) => json(500, &serde_json::json!({"error": e})),
+    }
 }
 
 #[cfg(test)]
