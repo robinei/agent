@@ -112,7 +112,9 @@ impl Tool for BashTool {
         // Spawn a timeout thread that also checks the stop flag
         let stop_for_thread = stop.clone();
         let timeout_handle = std::thread::spawn(move || {
-            for _ in 0..(timeout_secs * 10) {
+            let poll_ms: u64 = 5;
+            let iterations = (timeout_secs * 1000) / poll_ms;
+            for _ in 0..iterations {
                 if done_clone.load(Ordering::Relaxed) {
                     return;
                 }
@@ -124,7 +126,7 @@ impl Tool for BashTool {
                     let _ = signal::killpg(pgid, signal::Signal::SIGKILL);
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(poll_ms));
             }
             // Timeout expired — kill the process group
             timed_out_clone.store(true, Ordering::Relaxed);

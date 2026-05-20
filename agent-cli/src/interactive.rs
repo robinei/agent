@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-use termion::{color, style};
+use termion::{clear, color, style};
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
@@ -332,51 +332,212 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
     }
 }
 
-// ── Raw-mode input helper ──
+// ── Input line editor with history and multiline support ──
 
-/// Read one line of input in raw mode, echoing characters back.
-/// Returns `None` on Ctrl-C (user wants to quit).
-fn read_line_raw(
-    keys: &mut impl Iterator<Item = Result<Key, std::io::Error>>,
-    out: &mut impl Write,
-) -> Option<String> {
-    let mut input = String::new();
-    loop {
-        match keys.next() {
-            Some(Ok(Key::Ctrl('c'))) => {
-                // Ctrl-C: signal quit
-                write!(out, "\r\n").ok();
-                out.flush().ok();
-                return None;
-            }
-            Some(Ok(Key::Char('\n'))) | Some(Ok(Key::Char('\r'))) => {
-                write!(out, "\r\n").ok();
-                out.flush().ok();
-                return Some(input);
-            }
-            Some(Ok(Key::Char(c))) => {
-                input.push(c);
-                write!(out, "{}", c).ok();
-                out.flush().ok();
-            }
-            Some(Ok(Key::Backspace)) => {
-                input.pop();
-                write!(out, "\x08 \x08").ok();
-                out.flush().ok();
-            }
-            Some(Err(e)) => {
-                write!(out, "\r\nInput error: {}\r\n", e).ok();
-                return Some(input);
-            }
-            None => return Some(input),
-            _ => {}
+struct InputLine {
+    buf: Vec<char>,
+    cursor: usize,
+    history: Vec<String>,
+    history_idx: Option<usize>,
+    draft: String,
+}
+
+impl InputLine {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            cursor: 0,
+            history: Vec::new(),
+            history_idx: None,
+            draft: String::new(),
         }
     }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.cursor = 0;
+        self.history_idx = None;
+    }
+
+    fn handle_key(&mut self, key: Key, out: &mut impl Write, prompt: &str, prev_lines: &mut usize) -> LineEvent {
+        match key {
+            Key::Char('\n') | Key::Char('\r') => {
+                let line: String = self.buf.iter().collect();
+                if !line.is_empty() && self.history.last() != Some(&line) {
+                    self.history.push(line.clone());
+                }
+                self.buf.clear();
+                self.cursor = 0;
+                self.history_idx = None;
+                write!(out, "\r\n").ok();
+                out.flush().ok();
+                LineEvent::Submit(line)
+            }
+            Key::Alt('\n') => {
+                self.buf.insert(self.cursor, '\n');
+                self.cursor += 1;
+                self.redraw(out, prompt, prev_lines);
+                LineEvent::Continue
+            }
+            Key::Backspace => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                    self.buf.remove(self.cursor);
+                    self.redraw(out, prompt, prev_lines);
+                }
+                LineEvent::Continue
+            }
+            Key::Delete | Key::Ctrl('d') => {
+                if self.cursor < self.buf.len() {
+                    self.buf.remove(self.cursor);
+                    self.redraw(out, prompt, prev_lines);
+                }
+                LineEvent::Continue
+            }
+            Key::Left | Key::Ctrl('b') => {
+                self.cursor = self.cursor.saturating_sub(1);
+                self.redraw(out, prompt, prev_lines);
+                LineEvent::Continue
+            }
+            Key::Right | Key::Ctrl('f') => {
+                self.cursor = self.buf.len().min(self.cursor + 1);
+                self.redraw(out, prompt, prev_lines);
+                LineEvent::Continue
+            }
+            Key::Home | Key::Ctrl('a') => {
+                self.cursor = 0;
+                self.redraw(out, prompt, prev_lines);
+                LineEvent::Continue
+            }
+            Key::End | Key::Ctrl('e') => {
+                self.cursor = self.buf.len();
+                self.redraw(out, prompt, prev_lines);
+                LineEvent::Continue
+            }
+            Key::Up | Key::Ctrl('p') => {
+                self.history_prev();
+                self.redraw(out, prompt, prev_lines);
+                LineEvent::Continue
+            }
+            Key::Down | Key::Ctrl('n') => {
+                self.history_next();
+                self.redraw(out, prompt, prev_lines);
+                LineEvent::Continue
+            }
+            Key::Ctrl('u') => {
+                self.buf.drain(..self.cursor);
+                self.cursor = 0;
+                self.redraw(out, prompt, prev_lines);
+                LineEvent::Continue
+            }
+            Key::Ctrl('k') => {
+                self.buf.truncate(self.cursor);
+                self.redraw(out, prompt, prev_lines);
+                LineEvent::Continue
+            }
+            Key::Ctrl('w') => {
+                if self.cursor > 0 {
+                    let mut end = self.cursor;
+                    while end > 0 && self.buf[end - 1] == ' ' {
+                        end -= 1;
+                    }
+                    while end > 0 && self.buf[end - 1] != ' ' {
+                        end -= 1;
+                    }
+                    let count = self.cursor - end;
+                    for _ in 0..count {
+                        self.buf.remove(end);
+                    }
+                    self.cursor = end;
+                    self.redraw(out, prompt, prev_lines);
+                }
+                LineEvent::Continue
+            }
+            Key::Ctrl('c') => LineEvent::Quit,
+            Key::Char(c) => {
+                self.buf.insert(self.cursor, c);
+                self.cursor += 1;
+                self.redraw(out, prompt, prev_lines);
+                LineEvent::Continue
+            }
+            _ => LineEvent::Continue,
+        }
+    }
+
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        match self.history_idx {
+            None => {
+                self.draft = self.buf.iter().collect();
+                self.history_idx = Some(self.history.len() - 1);
+            }
+            Some(0) => {}
+            Some(ref mut i) => *i -= 1,
+        }
+        if let Some(i) = self.history_idx {
+            self.buf = self.history[i].chars().collect();
+            self.cursor = self.buf.len();
+        }
+    }
+
+    fn history_next(&mut self) {
+        match self.history_idx {
+            None => {}
+            Some(i) if i + 1 >= self.history.len() => {
+                self.history_idx = None;
+                self.buf = self.draft.chars().collect();
+                self.cursor = self.buf.len();
+            }
+            Some(ref mut i) => {
+                *i += 1;
+                let idx = *i;
+                self.buf = self.history[idx].chars().collect();
+                self.cursor = self.buf.len();
+            }
+        }
+    }
+
+    fn redraw(&self, out: &mut impl Write, prompt: &str, prev_lines: &mut usize) {
+        if *prev_lines > 1 {
+            write!(out, "{}", termion::cursor::Up((*prev_lines - 1) as u16)).ok();
+        }
+        write!(out, "\r{}", clear::AfterCursor).ok();
+
+        write!(out, "{}", prompt).ok();
+        let content: String = self.buf.iter().collect();
+        write!(out, "{}", content.replace('\n', "\r\n")).ok();
+
+        *prev_lines = 1 + self.buf.iter().filter(|&&c| c == '\n').count();
+
+        let chars_after = self.buf.len() - self.cursor;
+        if chars_after > 0 {
+            let suffix = &self.buf[self.cursor..];
+            let newlines_in_suffix = suffix.iter().filter(|&&c| c == '\n').count();
+            let cols_back = chars_after - newlines_in_suffix;
+            if newlines_in_suffix > 0 {
+                write!(out, "{}", termion::cursor::Up(newlines_in_suffix as u16)).ok();
+            }
+            if cols_back > 0 {
+                write!(out, "{}", termion::cursor::Left(cols_back as u16)).ok();
+            }
+        }
+
+        out.flush().ok();
+    }
+}
+
+enum LineEvent {
+    Continue,
+    Submit(String),
+    Quit,
 }
 
 // ── Tree selection ──
 
 fn select_or_create_tree(
+    input_line: &mut InputLine,
     keys: &mut impl Iterator<Item = Result<Key, std::io::Error>>,
     out: &mut impl Write,
     client: &AgentClient,
@@ -393,14 +554,25 @@ fn select_or_create_tree(
             write!(out, "Select a tree (number), 'new', or 'q' to quit: ").ok();
             out.flush().ok();
 
-            let input = read_line_raw(keys, out);
-            let input = match input {
-                None => std::process::exit(0),
-                Some(s) => s.trim().to_lowercase(),
+            input_line.clear();
+            let mut prev_lines = 1;
+            let result = loop {
+                match keys.next() {
+                    Some(Ok(k)) => match input_line.handle_key(k, out, "", &mut prev_lines) {
+                        LineEvent::Continue => {}
+                        ev => break ev,
+                    },
+                    Some(Err(_)) | None => break LineEvent::Quit,
+                }
+            };
+            let input = match result {
+                LineEvent::Submit(s) => s.trim().to_lowercase(),
+                LineEvent::Quit => std::process::exit(0),
+                LineEvent::Continue => String::new(),
             };
 
             if input == "q" || input == "quit" { std::process::exit(0); }
-            if input == "new" { return create_tree_interactive(keys, out, client); }
+            if input == "new" { return create_tree_interactive(input_line, keys, out, client); }
 
             if let Ok(idx) = input.parse::<usize>() {
                 if idx > 0 && idx <= trees.len() {
@@ -417,31 +589,46 @@ fn select_or_create_tree(
             write!(out, "Invalid selection.\r\n").ok();
         } else {
             write!(out, "No trees found. Let's create one.\r\n").ok();
-            return create_tree_interactive(keys, out, client);
+            return create_tree_interactive(input_line, keys, out, client);
         }
     }
 }
 
 fn create_tree_interactive(
+    input_line: &mut InputLine,
     keys: &mut impl Iterator<Item = Result<Key, std::io::Error>>,
     out: &mut impl Write,
     client: &AgentClient,
 ) -> Result<String, String> {
-    write!(out, "Enter a title (or press Enter for 'default'): ").ok();
-    out.flush().ok();
-    let title = read_line_raw(keys, out).unwrap_or_default();
+    let mut input_text = |prompt: &str| -> String {
+        write!(out, "{}", prompt).ok();
+        out.flush().ok();
+        input_line.clear();
+        let mut prev_lines = 1;
+        let result = loop {
+            match keys.next() {
+                Some(Ok(k)) => match input_line.handle_key(k, out, "", &mut prev_lines) {
+                    LineEvent::Continue => {}
+                    ev => break ev,
+                },
+                Some(Err(_)) | None => break LineEvent::Quit,
+            }
+        };
+        match result {
+            LineEvent::Submit(s) => s,
+            _ => String::new(),
+        }
+    };
+
+    let title = input_text("Enter a title (or press Enter for 'default'): ");
     let title = title.trim().to_string();
     let title = if title.is_empty() { "default".into() } else { title };
 
-    write!(out, "Enter repo path (optional): ").ok();
-    out.flush().ok();
-    let repo_path = read_line_raw(keys, out).unwrap_or_default();
+    let repo_path = input_text("Enter repo path (optional): ");
     let repo_path = repo_path.trim().to_string();
     let repo_path = if repo_path.is_empty() { None } else { Some(repo_path) };
 
-    write!(out, "Enter model (optional): ").ok();
-    out.flush().ok();
-    let model = read_line_raw(keys, out).unwrap_or_default();
+    let model = input_text("Enter model (optional): ");
     let model = model.trim().to_string();
     let model = if model.is_empty() { None } else { Some(model) };
 
@@ -546,6 +733,7 @@ pub fn run_interactive(server: &str, initial_repo_path: Option<String>, stop: &A
     write!(out, "\r\n").ok();
 
     let client = AgentClient::new(server);
+    let mut input_line = InputLine::new();
     let mut current_tree_id = if let Some(rp) = initial_repo_path {
         let meta = client.create_tree(Some("untitled"), Some(&rp), None, &[], None, &[], &[])
             .map_err(|e| format!("failed to create tree: {}", e))?;
@@ -553,7 +741,7 @@ pub fn run_interactive(server: &str, initial_repo_path: Option<String>, stop: &A
         write!(out, "Created tree {} in {}\r\n", sid, rp).ok();
         meta.id
     } else {
-        select_or_create_tree(&mut keys, &mut out, &client)?
+        select_or_create_tree(&mut input_line, &mut keys, &mut out, &client)?
     };
     let mut show_header = true;
 
@@ -592,9 +780,21 @@ pub fn run_interactive(server: &str, initial_repo_path: Option<String>, stop: &A
         write!(out, "\r\n> ").ok();
         out.flush().ok();
 
-        let input = match read_line_raw(&mut keys, &mut out) {
-            None => { write!(out, "Goodbye!\r\n").ok(); break; }
-            Some(s) => s,
+        input_line.clear();
+        let mut prev_lines = 1;
+        let result = loop {
+            match keys.next() {
+                Some(Ok(k)) => match input_line.handle_key(k, &mut out, "> ", &mut prev_lines) {
+                    LineEvent::Continue => {}
+                    ev => break ev,
+                },
+                Some(Err(_)) | None => break LineEvent::Quit,
+            }
+        };
+        let input = match result {
+            LineEvent::Submit(s) => s,
+            LineEvent::Quit => { write!(out, "Goodbye!\r\n").ok(); break; }
+            LineEvent::Continue => String::new(),
         };
         let input = input.trim().to_string();
         if input.is_empty() { continue; }
@@ -761,5 +961,108 @@ mod tests {
         let input = "a\r\nb\nc\r\nd\n";
         let result = normalize_for_raw(input);
         assert_eq!(result, "a\r\nb\r\nc\r\nd\r\n");
+    }
+
+    #[test]
+    fn test_inputline_backspace_at_start_is_noop() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        let mut prev = 1;
+        il.handle_key(Key::Backspace, &mut buf, "> ", &mut prev);
+        assert!(il.buf.is_empty());
+    }
+
+    #[test]
+    fn test_inputline_cursor_movement() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        let mut prev = 1;
+        for c in "hello".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Char('X'), &mut buf, "> ", &mut prev);
+        let result: String = il.buf.iter().collect();
+        assert_eq!(result, "helXlo");
+    }
+
+    #[test]
+    fn test_inputline_history_cycle() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        let mut prev = 1;
+
+        for c in "first".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
+        assert!(matches!(result, LineEvent::Submit(s) if s == "first"));
+
+        for c in "second".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
+        assert!(matches!(result, LineEvent::Submit(s) if s == "second"));
+
+        il.handle_key(Key::Up, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Up, &mut buf, "> ", &mut prev);
+        let s: String = il.buf.iter().collect();
+        assert_eq!(s, "first");
+
+        il.handle_key(Key::Down, &mut buf, "> ", &mut prev);
+        let s: String = il.buf.iter().collect();
+        assert_eq!(s, "second");
+
+        il.handle_key(Key::Down, &mut buf, "> ", &mut prev);
+        let s: String = il.buf.iter().collect();
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn test_inputline_alt_enter_inserts_newline() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        let mut prev = 1;
+        for c in "hello".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ", &mut prev);
+        for c in "world".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
+        assert!(matches!(result, LineEvent::Submit(s) if s == "hello\nworld"));
+    }
+
+    #[test]
+    fn test_inputline_ctrl_u_kills_to_start() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        let mut prev = 1;
+        for c in "hello".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Ctrl('u'), &mut buf, "> ", &mut prev);
+        let s: String = il.buf.iter().collect();
+        assert_eq!(s, "lo");
+        assert_eq!(il.cursor, 0);
+    }
+
+    #[test]
+    fn test_inputline_ctrl_k_kills_to_end() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        let mut prev = 1;
+        for c in "hello".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Ctrl('k'), &mut buf, "> ", &mut prev);
+        let s: String = il.buf.iter().collect();
+        assert_eq!(s, "hel");
     }
 }
