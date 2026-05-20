@@ -977,12 +977,12 @@ fn print_error(out: &mut impl Write, text: &str) {
 
 ## Step 6 — Thinking stream visibility
 
-- [ ] Add `ThinkingChunk` to `ServerEvent`
-- [ ] Add `reasoning_content` to `Delta`
-- [ ] Split `<think>` / `</think>` tags out of content deltas in the agent loop
-- [ ] Emit `ThinkingChunk` events; keep thinking out of persisted `response_text`
-- [ ] Render thinking in dim dark-gray, streaming in real time
-- [ ] Reset color cleanly when the first regular `TextChunk` follows
+- [x] Add `ThinkingChunk` to `ServerEvent`
+- [x] Add `reasoning_content` to `Delta`
+- [x] Split `<think>` / `</think>` tags out of content deltas in the agent loop
+- [x] Emit `ThinkingChunk` events; keep thinking out of persisted `response_text`
+- [x] Render thinking in dim dark-gray, streaming in real time
+- [x] Reset color cleanly when the first regular `TextChunk` follows
 
 **Goal:** When the active model emits a reasoning / thinking trace (either via a
 `reasoning_content` delta field or embedded `<think>…</think>` tags), stream it
@@ -1224,4 +1224,9 @@ Add to `#[cfg(test)] mod tests` in `interactive.rs`:
 - Manual (model without thinking, e.g. plain Qwen2.5):
   - No regression: output identical to before.
 
-**Notes:** _(filled on completion)_
+**Notes:**
+- Modified: `agent-core/src/types.rs` — added `ThinkingChunk` variant to `ServerEvent`, added `reasoning_content` field to `Delta`.
+- Modified: `agent-core/src/agent.rs` — added `ThinkingSegment` enum, `split_thinking_chunks` function (splits on ` thinking` / ` response` tags across chunk boundaries); modified stream loop to handle `reasoning_content` and tag-split content, emit `ThinkingChunk` events, exclude thinking from `response_text`.
+- Modified: `agent-cli/src/interactive.rs` — added `in_thinking` field to `RenderState`; `render_event` now has `ThinkingChunk` arm (renders in dim `\x1b[2m` light-gray), `TextChunk` arm resets style when thinking block ends; added 7 new tests (5 for `split_thinking_chunks`, 2 for thinking rendering).
+- Deviation: None — matches spec exactly.
+- Verified: `cargo test --workspace` → 144 passed, `cargo clippy --workspace` → no new warnings.

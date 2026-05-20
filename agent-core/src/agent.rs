@@ -370,6 +370,58 @@ fn write_message_entry(
 
 // ── Agent loop ──
 
+enum ThinkingSegment {
+    Thinking(String),
+    Text(String),
+}
+
+/// Split a content delta into alternating thinking/text segments.
+///
+/// `in_thinking` tracks whether the parser is currently inside a ` thinking` block
+/// across chunk boundaries. Both ` thinking` and ` response` may land in the middle
+/// of a chunk or straddle two chunks; the caller preserves `in_thinking` between
+/// calls to handle the cross-boundary case.
+fn split_thinking_chunks(text: &str, in_thinking: &mut bool) -> Vec<ThinkingSegment> {
+    let mut result = Vec::new();
+    let mut rest = text;
+    loop {
+        if *in_thinking {
+            match rest.find(" response") {
+                Some(pos) => {
+                    if pos > 0 {
+                        result.push(ThinkingSegment::Thinking(rest[..pos].to_string()));
+                    }
+                    *in_thinking = false;
+                    rest = &rest[pos + " response".len()..];
+                }
+                None => {
+                    if !rest.is_empty() {
+                        result.push(ThinkingSegment::Thinking(rest.to_string()));
+                    }
+                    break;
+                }
+            }
+        } else {
+            match rest.find(" thinking") {
+                Some(pos) => {
+                    if pos > 0 {
+                        result.push(ThinkingSegment::Text(rest[..pos].to_string()));
+                    }
+                    *in_thinking = true;
+                    rest = &rest[pos + " thinking".len()..];
+                }
+                None => {
+                    if !rest.is_empty() {
+                        result.push(ThinkingSegment::Text(rest.to_string()));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Run the agent loop for a single tree.
 ///
 /// This function is spawned in a dedicated thread by the server's lifecycle module.
@@ -546,6 +598,7 @@ pub fn run_agent(
             };
 
             let mut response_text = String::new();
+            let mut in_thinking = false;
             let mut tool_calls_buf: Vec<ToolCallBuilder> = Vec::new();
             let mut round_finish_reason: Option<String> = None;
 
@@ -622,12 +675,31 @@ pub fn run_agent(
 
                 // Text delta (skip empty — reasoning models send empty content
                 // chunks with reasoning fields before the actual text)
+
+                // Explicit reasoning field (some providers like DeepSeek / Qwen)
+                if let Some(rc) = &choice.delta.reasoning_content {
+                    if !rc.is_empty() {
+                        let _ = event_tx.send(ServerEvent::ThinkingChunk { content: rc.clone() });
+                    }
+                }
+
+                // Content delta — split on  thinking /  response tags
                 if let Some(delta) = &choice.delta.content {
                     if !delta.is_empty() {
-                        response_text.push_str(delta);
-                        let _ = event_tx.send(ServerEvent::TextChunk {
-                            content: delta.clone(),
-                        });
+                        for segment in split_thinking_chunks(delta, &mut in_thinking) {
+                            match segment {
+                                ThinkingSegment::Thinking(t) => {
+                                    let _ = event_tx.send(ServerEvent::ThinkingChunk { content: t });
+                                }
+                                ThinkingSegment::Text(t) if !t.is_empty() => {
+                                    response_text.push_str(&t);
+                                    let _ = event_tx.send(ServerEvent::TextChunk {
+                                        content: t,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
 
@@ -1028,5 +1100,52 @@ mod tests {
         };
         let est = estimate_context_tokens(&[msg]);
         assert_eq!(est, estimate_tokens("hello"));
+    }
+
+    #[test]
+    fn test_split_no_tags() {
+        let mut in_thinking = false;
+        let result = split_thinking_chunks("hello world", &mut in_thinking);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], ThinkingSegment::Text(t) if t == "hello world"));
+        assert!(!in_thinking);
+    }
+
+    #[test]
+    fn test_split_full_block() {
+        let mut in_thinking = false;
+        let result = split_thinking_chunks(" thinkingreason responseanswer", &mut in_thinking);
+        assert_eq!(result.len(), 2);
+        assert!(matches!(&result[0], ThinkingSegment::Thinking(t) if t == "reason"));
+        assert!(matches!(&result[1], ThinkingSegment::Text(t) if t == "answer"));
+        assert!(!in_thinking);
+    }
+
+    #[test]
+    fn test_split_open_only() {
+        let mut in_thinking = false;
+        let result = split_thinking_chunks(" thinkingpartial", &mut in_thinking);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], ThinkingSegment::Thinking(t) if t == "partial"));
+        assert!(in_thinking);
+    }
+
+    #[test]
+    fn test_split_close_only() {
+        let mut in_thinking = true;
+        let result = split_thinking_chunks("end response rest", &mut in_thinking);
+        assert_eq!(result.len(), 2);
+        assert!(matches!(&result[0], ThinkingSegment::Thinking(t) if t == "end"));
+        assert!(matches!(&result[1], ThinkingSegment::Text(t) if t == " rest"));
+        assert!(!in_thinking);
+    }
+
+    #[test]
+    fn test_split_empty_think_block() {
+        let mut in_thinking = false;
+        let result = split_thinking_chunks(" thinking responseafter", &mut in_thinking);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], ThinkingSegment::Text(t) if t == "after"));
+        assert!(!in_thinking);
     }
 }

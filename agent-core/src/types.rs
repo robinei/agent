@@ -380,6 +380,8 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<DeltaToolCall>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -468,6 +470,10 @@ pub enum ServerEvent {
     /// never persisted in the event stream.
     #[serde(rename = "meta_update")]
     MetaUpdate { title: Option<String> },
+    /// Reasoning/thinking token from models that expose extended thinking.
+    /// Never stored. Rendered in dimmed color during streaming.
+    #[serde(rename = "thinking_chunk")]
+    ThinkingChunk { content: String },
 }
 
 // ── Tool system types ──

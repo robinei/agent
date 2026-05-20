@@ -359,6 +359,7 @@ struct RenderState {
     _rendered: HashSet<String>,
     assistant_header_shown: bool,
     last_tool_args: Option<(String, serde_json::Value)>,
+    in_thinking: bool,
 }
 
 /// Normalize bare `\n` to `\r\n` for raw-mode terminal output.
@@ -395,6 +396,10 @@ fn format_tool_args(tool: &str, input: &serde_json::Value) -> String {
 fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderState) {
     match event {
         ServerEvent::TextChunk { content } => {
+            if state.in_thinking {
+                state.in_thinking = false;
+                write!(out, "{}\r\n", style::Reset).ok();
+            }
             if !state.assistant_header_shown {
                 state.assistant_header_shown = true;
                 write!(out, "\r\n").ok();
@@ -547,6 +552,14 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
                 write!(out, "\r\n").ok();
                 write!(out, "  {}Title: {}{}\r\n", style::Bold, t, style::Reset).ok();
             }
+        }
+        ServerEvent::ThinkingChunk { content } => {
+            if !state.in_thinking {
+                state.in_thinking = true;
+                write!(out, "\r\n{}\x1b[2m", color::Fg(color::LightBlack)).ok();
+            }
+            write!(out, "{}", normalize_for_raw(content)).ok();
+            out.flush().ok();
         }
     }
 }
@@ -1724,5 +1737,47 @@ assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
     fn test_format_tool_args_fallback() {
         let result = format_tool_args("unknown_tool", &serde_json::json!({"key":"value"}));
         assert_eq!(result, "{\"key\":\"value\"}");
+    }
+
+    #[test]
+    fn test_render_thinking_chunk_faint() {
+        let mut buf = Vec::new();
+        let mut state = RenderState::default();
+        render_event(
+            &mut buf,
+            &ServerEvent::ThinkingChunk {
+                content: "think".into(),
+            },
+            &mut state,
+        );
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("\x1b[2m"), "output should contain faint marker");
+        assert!(output.contains("think"), "output should contain 'think'");
+        assert!(state.in_thinking);
+    }
+
+    #[test]
+    fn test_render_thinking_resets_on_text() {
+        let mut buf = Vec::new();
+        let mut state = RenderState::default();
+        render_event(
+            &mut buf,
+            &ServerEvent::ThinkingChunk {
+                content: "think".into(),
+            },
+            &mut state,
+        );
+        render_event(
+            &mut buf,
+            &ServerEvent::TextChunk {
+                content: "answer".into(),
+            },
+            &mut state,
+        );
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("\x1b[m"), "output should contain reset, got: {output:?}");
+        assert!(output.contains("think"), "output should contain 'think', got: {output:?}");
+        assert!(output.contains("answer"), "output should contain 'answer', got: {output:?}");
+        assert!(!state.in_thinking);
     }
 }
