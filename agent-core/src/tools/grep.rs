@@ -4,6 +4,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use regex::Regex;
 use walkdir::WalkDir;
@@ -75,7 +77,7 @@ impl Tool for GrepTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, _stop: &Arc<AtomicBool>) -> ToolResult {
         let pattern_str = params
             .get("pattern")
             .and_then(|v| v.as_str())
@@ -241,7 +243,7 @@ mod tests {
         fs::write(dir.path().join("test.txt"), "hello world\nfoo bar\nhello again\n").unwrap();
         let tool = GrepTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"pattern": "hello"}))
+            .execute(&serde_json::json!({"pattern": "hello"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("hello world"));
         assert!(result.content.contains("hello again"));
@@ -254,7 +256,7 @@ mod tests {
         fs::write(dir.path().join("test.txt"), "hello world\n").unwrap();
         let tool = GrepTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"pattern": "zzzz"}))
+            .execute(&serde_json::json!({"pattern": "zzzz"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("No matches"));
     }
@@ -269,7 +271,7 @@ mod tests {
         .unwrap();
         let tool = GrepTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"pattern": "match", "context_lines": 1}))
+            .execute(&serde_json::json!({"pattern": "match", "context_lines": 1}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("line1 before"));
         assert!(result.content.contains("line2 match"));
@@ -283,7 +285,7 @@ mod tests {
         fs::write(dir.path().join("sub").join("nested.txt"), "secret\n").unwrap();
         let tool = GrepTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"pattern": "secret", "path": "sub"}))
+            .execute(&serde_json::json!({"pattern": "secret", "path": "sub"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("nested.txt"));
     }

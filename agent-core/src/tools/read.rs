@@ -3,6 +3,8 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use super::{resolve_path, Tool, ToolResult};
 use crate::types::{ToolDefinition, ToolOutput};
@@ -50,7 +52,7 @@ impl Tool for ReadTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, _stop: &Arc<AtomicBool>) -> ToolResult {
         let path_str = params
             .get("path")
             .and_then(|v| v.as_str())
@@ -149,7 +151,7 @@ mod tests {
         fs::write(dir.path().join("test.txt"), "hello\nworld\n").unwrap();
         let tool = ReadTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"path": "test.txt"}))
+            .execute(&serde_json::json!({"path": "test.txt"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("hello"));
         assert!(result.content.contains("world"));
@@ -166,7 +168,7 @@ mod tests {
         .unwrap();
         let tool = ReadTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"path": "test.txt", "offset": 3}))
+            .execute(&serde_json::json!({"path": "test.txt", "offset": 3}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("line3"));
         assert!(result.content.contains("line4"));
@@ -178,7 +180,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = ReadTool::new(dir.path());
         let result =
-            tool.execute(&serde_json::json!({"path": "nope.txt"}));
+            tool.execute(&serde_json::json!({"path": "nope.txt"}), &Arc::new(AtomicBool::new(false)));
         assert!(result.is_err());
     }
 
@@ -187,7 +189,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = ReadTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"path": "../etc/passwd"}));
+            .execute(&serde_json::json!({"path": "../etc/passwd"}), &Arc::new(AtomicBool::new(false)));
         assert!(result.is_err());
     }
 }

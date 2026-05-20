@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use super::{Tool, ToolResult};
 use crate::types::{ToolDefinition, ToolOutput};
@@ -43,7 +45,7 @@ impl Tool for WriteTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, _stop: &Arc<AtomicBool>) -> ToolResult {
         let path_str = params
             .get("path")
             .and_then(|v| v.as_str())
@@ -115,7 +117,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = WriteTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"path": "new.txt", "content": "hello world"}))
+            .execute(&serde_json::json!({"path": "new.txt", "content": "hello world"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("11 bytes"));
 
@@ -128,7 +130,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = WriteTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"path": "sub/dir/file.txt", "content": "test"}))
+            .execute(&serde_json::json!({"path": "sub/dir/file.txt", "content": "test"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("wrote"));
         let content = fs::read_to_string(dir.path().join("sub/dir/file.txt")).unwrap();
@@ -140,7 +142,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("existing.txt"), "old").unwrap();
         let tool = WriteTool::new(dir.path());
-        tool.execute(&serde_json::json!({"path": "existing.txt", "content": "new"}))
+        tool.execute(&serde_json::json!({"path": "existing.txt", "content": "new"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         let content = fs::read_to_string(dir.path().join("existing.txt")).unwrap();
         assert_eq!(content, "new");

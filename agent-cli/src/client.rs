@@ -2,6 +2,7 @@
 //!
 //! Uses `ureq` (v3) to communicate with the server.
 
+use tungstenite::stream::MaybeTlsStream;
 use ureq::http;
 
 use agent_core::types::{Entry, TreeMeta};
@@ -179,6 +180,14 @@ pub struct AgentSession {
     ws: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
 }
 
+/// Result of a non-blocking WS read attempt.
+pub enum TryEvent {
+    Event(agent_core::types::ServerEvent),
+    WouldBlock,
+    Closed,
+    Err(String),
+}
+
 impl AgentSession {
     /// Connect to a tree's WebSocket session.
     pub fn connect(server: &str, tree_id: &str) -> Result<Self, String> {
@@ -188,6 +197,16 @@ impl AgentSession {
         Ok(Self { ws })
     }
 
+    /// Set the underlying TCP stream to blocking or non-blocking mode.
+    pub fn set_nonblocking(&mut self, nb: bool) -> Result<(), String> {
+        match self.ws.get_mut() {
+            MaybeTlsStream::Plain(tcp) => {
+                tcp.set_nonblocking(nb).map_err(|e| e.to_string())
+            }
+            _ => Err("Cannot set non-blocking on TLS stream".into()),
+        }
+    }
+
     /// Send a user message to the agent.
     pub fn send_message(&mut self, text: &str) -> Result<(), String> {
         let cmd = agent_core::rpc::WsCommand::Message {
@@ -195,6 +214,32 @@ impl AgentSession {
         };
         let s = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
         self.ws.send(tungstenite::Message::Text(s)).map_err(|e| e.to_string())
+    }
+
+    /// Send a stop command to the agent.
+    pub fn send_stop(&mut self) -> Result<(), String> {
+        let s = serde_json::to_string(&agent_core::rpc::WsCommand::Stop).map_err(|e| e.to_string())?;
+        self.ws.send(tungstenite::Message::Text(s)).map_err(|e| e.to_string())
+    }
+
+    /// Try to read the next event without blocking. Returns `WouldBlock` if no data is ready.
+    pub fn try_next_event(&mut self) -> TryEvent {
+        match self.ws.read() {
+            Ok(tungstenite::Message::Text(s)) => {
+                match serde_json::from_str(&s) {
+                    Ok(ev) => TryEvent::Event(ev),
+                    Err(e) => TryEvent::Err(format!("parse error: {}", e)),
+                }
+            }
+            Ok(tungstenite::Message::Ping(p)) => {
+                let _ = self.ws.send(tungstenite::Message::Pong(p));
+                TryEvent::WouldBlock
+            }
+            Ok(tungstenite::Message::Close(_)) => TryEvent::Closed,
+            Ok(_) => TryEvent::WouldBlock,
+            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => TryEvent::WouldBlock,
+            Err(_) => TryEvent::Closed,
+        }
     }
 
     /// Read the next event from the WebSocket. Returns None on close/error.
@@ -259,5 +304,11 @@ mod tests {
         let client = AgentClient::new("localhost:8080");
         let url = client.entries_url("abc123");
         assert_eq!(url, "/trees/abc123/entries");
+    }
+
+    #[test]
+    fn test_wscommand_stop_serializes() {
+        let s = serde_json::to_string(&agent_core::rpc::WsCommand::Stop).unwrap();
+        assert_eq!(s, r#"{"method":"stop"}"#);
     }
 }

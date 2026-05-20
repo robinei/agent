@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use unicode_normalization::UnicodeNormalization;
@@ -218,7 +219,7 @@ impl Tool for EditTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, _stop: &Arc<AtomicBool>) -> ToolResult {
         let file_path = params
             .get("file_path")
             .and_then(|v| v.as_str())
@@ -336,7 +337,7 @@ mod tests {
                 "file_path": "test.rs",
                 "old_text": "    println!(\"world\");",
                 "new_text": "    println!(\"hello world\");"
-            }))
+            }), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(!result.truncated);
         let content = fs::read_to_string(dir.path().join("test.rs")).unwrap();
@@ -357,7 +358,7 @@ mod tests {
                 "file_path": "test.rs",
                 "old_text": "println!(\"hello\");",
                 "new_text": "println!(\"world\");"
-            }))
+            }), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(!result.truncated);
         let content = fs::read_to_string(dir.path().join("test.rs")).unwrap();
@@ -378,7 +379,7 @@ mod tests {
                 "file_path": "test.rs",
                 "old_text": "fn hello() {\n    x = 1;\n}",
                 "new_text": "fn hello() {\n    x = 2;\n}"
-            }))
+            }), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(!result.truncated);
         let content = fs::read_to_string(dir.path().join("test.rs")).unwrap();
@@ -401,7 +402,7 @@ mod tests {
                     {"oldText": "line A", "newText": "line X"},
                     {"oldText": "line C", "newText": "line Z"}
                 ]
-            }))
+            }), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(!result.truncated);
         let content = fs::read_to_string(dir.path().join("test.rs")).unwrap();
@@ -420,7 +421,7 @@ mod tests {
                 "file_path": "test.rs",
                 "old_text": "zzzzzz",
                 "new_text": "yyyyyy"
-            }));
+            }), &Arc::new(AtomicBool::new(false)));
         assert!(result.is_err());
     }
 
@@ -433,7 +434,7 @@ mod tests {
                 "file_path": "../etc/passwd",
                 "old_text": "root",
                 "new_text": "nope"
-            }));
+            }), &Arc::new(AtomicBool::new(false)));
         assert!(result.is_err());
     }
 
@@ -454,7 +455,7 @@ mod tests {
                 "file_path": "nope.txt",
                 "old_text": "x",
                 "new_text": "y"
-            }));
+            }), &Arc::new(AtomicBool::new(false)));
         assert!(result.is_err());
     }
 }

@@ -193,7 +193,7 @@ fn build_system_prompt(context_section: &str) -> String {
 
 // ── Tool execution helpers ──
 
-fn execute_tool(tools: &[Box<dyn Tool>], name: &str, args: &serde_json::Value) -> ToolOutput {
+fn execute_tool(tools: &[Box<dyn Tool>], name: &str, args: &serde_json::Value, stop: &Arc<AtomicBool>) -> ToolOutput {
     let tool = match tools.iter().find(|t| t.definition().name == name) {
         Some(t) => t,
         None => {
@@ -206,7 +206,7 @@ fn execute_tool(tools: &[Box<dyn Tool>], name: &str, args: &serde_json::Value) -
         }
     };
 
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.execute(args))) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.execute(args, stop))) {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => ToolOutput {
             content: format!("Error: {}", e),
@@ -397,7 +397,9 @@ pub fn run_agent(
             Ok(AgentInput::Message { text }) => text,
             Ok(AgentInput::Stop) => {
                 info!("Agent received stop signal for tree {}", tree_id);
-                break;
+                // Worker stays alive; cancel applies only to in-flight work,
+                // which the atomic flag above already handled. Drain and wait.
+                continue;
             }
             Err(_) => {
                 info!("Input channel closed for tree {}, exiting", tree_id);
@@ -409,6 +411,10 @@ pub fn run_agent(
             info!("Stop flag set for tree {}, exiting", tree_id);
             break;
         }
+
+        // Reset stop flag so a cancel that arrived during idle wait
+        // doesn't instantly cancel the next turn.
+        stop.store(false, Ordering::Relaxed);
 
         info!("Processing message for tree {}: {}", tree_id, truncate_for_log(&text, 100));
 
@@ -546,6 +552,29 @@ pub fn run_agent(
             // Inner stream loop
             'stream: loop {
                 if stop.load(Ordering::Relaxed) {
+                    // User cancelled — emit Done and persist partial response
+                    let _ = event_tx.send(ServerEvent::Done {
+                        status: "cancelled".into(),
+                    });
+                    if !response_text.is_empty() {
+                        let msg_id = crate::util::generate_entry_id();
+                        let msg_parent = leaf_id.clone();
+                        let assistant_msg = Message {
+                            role: MessageRole::Assistant,
+                            content: MessageContent::Text(response_text.clone()),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            tool_name: None,
+                            usage: None,
+                            stop_reason: None,
+                            is_error: None,
+                        };
+                        write_message_entry(
+                            &store, tree_id, &event_tx,
+                            &msg_id, msg_parent.as_deref(),
+                            &assistant_msg, &mut leaf_id,
+                        );
+                    }
                     break 'turn;
                 }
 
@@ -695,7 +724,7 @@ pub fn run_agent(
                         });
 
                         // Execute
-                        let result = execute_tool(&tools, &call.name, &call.arguments);
+                        let result = execute_tool(&tools, &call.name, &call.arguments, &stop);
 
                         if result.exit_code.unwrap_or(0) != 0 {
                             consecutive_failures += 1;
@@ -810,6 +839,14 @@ pub fn run_agent(
             let _ = event_tx.send(ServerEvent::Error {
                 message: format!("Max tool call rounds ({}) reached", max_per_turn),
                 fatal: false,
+            });
+        }
+
+        // If the turn was cancelled (stop flag set during tool execution,
+        // not during streaming which already emits Done above), emit Done.
+        if stop.load(Ordering::Relaxed) {
+            let _ = event_tx.send(ServerEvent::Done {
+                status: "cancelled".into(),
             });
         }
     }

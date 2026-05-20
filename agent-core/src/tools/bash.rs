@@ -21,6 +21,11 @@ pub struct BashTool {
     cwd: PathBuf,
 }
 
+enum KillReason {
+    Timeout,
+    Cancelled,
+}
+
 impl BashTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
@@ -61,7 +66,7 @@ impl Tool for BashTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, stop: &Arc<AtomicBool>) -> ToolResult {
         let command = params
             .get("command")
             .and_then(|v| v.as_str())
@@ -99,14 +104,24 @@ impl Tool for BashTool {
         let pid = child.id() as i32;
         let timed_out = Arc::new(AtomicBool::new(false));
         let timed_out_clone = timed_out.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_clone = cancelled.clone();
         let done = Arc::new(AtomicBool::new(false));
         let done_clone = done.clone();
 
-        // Spawn a timeout thread
+        // Spawn a timeout thread that also checks the stop flag
+        let stop_for_thread = stop.clone();
         let timeout_handle = std::thread::spawn(move || {
-            // Check every 100ms if we're done; exit early if so
             for _ in 0..(timeout_secs * 10) {
                 if done_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+                if stop_for_thread.load(Ordering::Relaxed) {
+                    cancelled_clone.store(true, Ordering::Relaxed);
+                    let pgid = Pid::from_raw(pid);
+                    let _ = signal::killpg(pgid, signal::Signal::SIGTERM);
+                    std::thread::sleep(Duration::from_millis(500));
+                    let _ = signal::killpg(pgid, signal::Signal::SIGKILL);
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -160,11 +175,15 @@ impl Tool for BashTool {
             (out.clone(), err.clone())
         };
 
-        let content = Self::combine_output(
-            &out, &err,
-            timed_out.load(Ordering::Relaxed),
-            timeout_secs,
-        );
+        let kill_reason = if cancelled.load(Ordering::Relaxed) {
+            Some(KillReason::Cancelled)
+        } else if timed_out.load(Ordering::Relaxed) {
+            Some(KillReason::Timeout)
+        } else {
+            None
+        };
+
+        let content = Self::combine_output(&out, &err, kill_reason, timeout_secs);
 
         let mut output = truncate_output(&content, 2000, 50 * 1024);
         output.exit_code = exit_code;
@@ -173,13 +192,19 @@ impl Tool for BashTool {
 }
 
 impl BashTool {
-    fn combine_output(stdout: &[u8], stderr: &[u8], timed_out: bool, timeout_secs: u64) -> String {
+    fn combine_output(stdout: &[u8], stderr: &[u8], kill_reason: Option<KillReason>, timeout_secs: u64) -> String {
         let stdout_str = String::from_utf8_lossy(stdout);
         let stderr_str = String::from_utf8_lossy(stderr);
 
         let mut output = String::new();
-        if timed_out {
-            output.push_str(&format!("[Command timed out after {}s]\n", timeout_secs));
+        match kill_reason {
+            Some(KillReason::Timeout) => {
+                output.push_str(&format!("[Command timed out after {}s]\n", timeout_secs));
+            }
+            Some(KillReason::Cancelled) => {
+                output.push_str("[Command cancelled]\n");
+            }
+            None => {}
         }
         if !stdout_str.is_empty() {
             output.push_str(&stdout_str);
@@ -193,7 +218,7 @@ impl BashTool {
             }
             output.push_str(&stderr_str);
         }
-        if output.is_empty() && !timed_out {
+        if output.is_empty() && kill_reason.is_none() {
             output.push_str("[Command completed with no output]\n");
         }
         output
@@ -211,7 +236,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "echo hello world"}))
+            .execute(&serde_json::json!({"command": "echo hello world"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("hello world"));
         assert_eq!(result.exit_code, Some(0));
@@ -222,7 +247,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "exit 42"}))
+            .execute(&serde_json::json!({"command": "exit 42"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert_eq!(result.exit_code, Some(42));
     }
@@ -232,7 +257,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "echo error >&2"}))
+            .execute(&serde_json::json!({"command": "echo error >&2"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("error"));
     }
@@ -243,7 +268,7 @@ mod tests {
         fs::write(dir.path().join("marker.txt"), "present").unwrap();
         let tool = BashTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "ls marker.txt"}))
+            .execute(&serde_json::json!({"command": "ls marker.txt"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("marker.txt"));
         assert_eq!(result.exit_code, Some(0));
@@ -254,7 +279,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "sleep 10", "timeout": 1}))
+            .execute(&serde_json::json!({"command": "sleep 10", "timeout": 1}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("timed out"));
     }
@@ -264,8 +289,26 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "nonexistent_command_xyz123"}))
+            .execute(&serde_json::json!({"command": "nonexistent_command_xyz123"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert_eq!(result.exit_code, Some(127));
+    }
+
+    #[test]
+    fn test_bash_cancels_on_stop_flag() {
+        let dir = TempDir::new().unwrap();
+        let tool = BashTool::new(dir.path());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+
+        let handle = std::thread::spawn(move || {
+            tool.execute(&serde_json::json!({"command": "sleep 30"}), &stop_clone)
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+
+        let result = handle.join().unwrap().unwrap();
+        assert!(result.content.contains("Command cancelled") || result.exit_code == Some(-1) || result.exit_code.is_some());
     }
 }

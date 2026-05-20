@@ -7,6 +7,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use walkdir::WalkDir;
 
@@ -191,7 +193,7 @@ impl Tool for SearchMessagesTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, _stop: &Arc<AtomicBool>) -> ToolResult {
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
@@ -297,7 +299,7 @@ impl Tool for SearchFilesTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, _stop: &Arc<AtomicBool>) -> ToolResult {
         let pattern = params
             .get("pattern")
             .and_then(|v| v.as_str())
@@ -439,7 +441,7 @@ mod tests {
         with_temp_agent_dir("empty", |_path| {
             let tool = SearchMessagesTool::new(&PathBuf::from("/tmp"));
             let result = tool
-                .execute(&serde_json::json!({"query": "hello"}))
+                .execute(&serde_json::json!({"query": "hello"}), &Arc::new(AtomicBool::new(false)))
                 .unwrap();
             assert!(result.content.contains("No messages found"));
         });
@@ -472,7 +474,7 @@ mod tests {
 
             let tool = SearchMessagesTool::new(&PathBuf::from("/tmp"));
             let result = tool
-                .execute(&serde_json::json!({"query": "hello world"}))
+                .execute(&serde_json::json!({"query": "hello world"}), &Arc::new(AtomicBool::new(false)))
                 .unwrap();
             assert!(result.content.contains("hello world from search"));
             assert!(result.content.contains("user"));
@@ -511,7 +513,7 @@ mod tests {
                 .execute(&serde_json::json!({
                     "query": "secret",
                     "tree_id": "wrong-tree-id"
-                }))
+                }), &Arc::new(AtomicBool::new(false)))
                 .unwrap();
             assert!(result.content.contains("No messages found"));
         });

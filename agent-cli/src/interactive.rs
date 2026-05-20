@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use termion::{color, style};
 use termion::event::Key;
@@ -17,6 +18,8 @@ use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 
 use agent_core::types::{Entry, ServerEvent, TreeMeta};
+
+use crate::client::TryEvent;
 
 use crate::client::AgentClient;
 
@@ -166,6 +169,9 @@ fn render_done(out: &mut impl Write, status: &str) {
         // Worker crashed or was killed mid-turn.
         "aborted" => write!(out, "\r\n  {}✖{} Aborted\r\n",
                             color::Fg(color::Red), style::Reset),
+        // User pressed Esc during the turn.
+        "cancelled" => write!(out, "\r\n  {}✋{} Cancelled\r\n",
+                              color::Fg(color::Yellow), style::Reset),
         // Unknown status — show it so we notice in testing.
         other => write!(out, "\r\n  {}■{} Done ({}){}\r\n",
                         color::Fg(color::Yellow), style::Reset, other, style::Reset),
@@ -448,6 +454,18 @@ fn create_tree_interactive(
 
 // ── Message processing ──
 
+fn poll_key() -> Option<Key> {
+    // Use termion's async_stdin which returns a non-blocking reader.
+    // Create a fresh Keys iterator each time; if no byte is ready, it
+    // returns None immediately.
+    let stdin = termion::async_stdin();
+    let mut keys = stdin.keys();
+    match keys.next() {
+        Some(Ok(key)) => Some(key),
+        _ => None,
+    }
+}
+
 fn process_message(
     server: &str,
     tree_id: &str,
@@ -456,28 +474,51 @@ fn process_message(
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let mut session = crate::client::AgentSession::connect(server, tree_id)?;
+    session.set_nonblocking(true)?;
     session.send_message(text)?;
+
     let mut state = RenderState::default();
+    let mut cancel_signalled = false;
 
     loop {
+        // 1. Drain WS events
+        loop {
+            match session.try_next_event() {
+                TryEvent::Event(ev) => {
+                    let done = matches!(&ev, ServerEvent::Done { .. });
+                    render_event(out, &ev, &mut state);
+                    if done { return Ok(()); }
+                    continue;
+                }
+                TryEvent::Closed => return Ok(()),
+                TryEvent::Err(e) => {
+                    write!(out, "\r\nws error: {}\r\n", e).ok();
+                    return Ok(());
+                }
+                TryEvent::WouldBlock => break,
+            }
+        }
+
+        // 2. Check Ctrl-C from the outer signal handler
         if stop.load(Ordering::Relaxed) {
             write!(out, "\r\nInterrupted\r\n").ok();
             break;
         }
-        match session.next_event() {
-            Some(Ok(event)) => {
-                let is_done = matches!(&event, ServerEvent::Done { .. });
-                render_event(out, &event, &mut state);
-                if is_done { break; }
-            }
-            Some(Err(e)) => {
-                write!(out, "\r\nParse error: {}\r\n", e).ok();
-                break;
-            }
-            None => {
-                // Connection closed — check stop and loop back
+
+        // 3. Peek stdin for Esc or Ctrl-C
+        if !cancel_signalled {
+            if let Some(key) = poll_key() {
+                if matches!(key, Key::Esc | Key::Ctrl('c')) {
+                    write!(out, "\r\n  {}⏸ Cancelling…{}\r\n",
+                           color::Fg(color::Yellow), style::Reset).ok();
+                    out.flush().ok();
+                    let _ = session.send_stop();
+                    cancel_signalled = true;
+                }
             }
         }
+
+        std::thread::sleep(Duration::from_millis(20));
     }
     Ok(())
 }
@@ -662,6 +703,17 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains('✖'), "aborted should show ✖, got: {output}");
         assert!(output.contains("Aborted"), "aborted should show Aborted, got: {output}");
+    }
+
+    #[test]
+    fn test_render_done_cancelled() {
+        let mut buf = Vec::new();
+        render_done(&mut buf, "cancelled");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains('✋'), "cancelled should show ✋, got: {output}");
+        assert!(output.contains("Cancelled"), "cancelled should show Cancelled, got: {output}");
+        assert!(!output.contains("Done"), "cancelled should not show Done, got: {output}");
+        assert!(!output.contains("Aborted"), "cancelled should not show Aborted, got: {output}");
     }
 
     #[test]

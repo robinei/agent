@@ -5,6 +5,8 @@
 //! branch info) without having to parse human-oriented output.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::process::Command;
 
 use super::{Tool, ToolResult};
@@ -275,7 +277,7 @@ impl Tool for GitTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, _stop: &Arc<AtomicBool>) -> ToolResult {
         let cmd = params
             .get("command")
             .and_then(|v| v.as_str())
@@ -340,7 +342,7 @@ mod tests {
         fs::write(dir.path().join("new.txt"), "hello").unwrap();
         let tool = GitTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "status"}))
+            .execute(&serde_json::json!({"command": "status"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("new.txt"));
         assert_eq!(result.exit_code, Some(0));
@@ -363,7 +365,7 @@ mod tests {
             .unwrap();
         let tool = GitTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "log"}))
+            .execute(&serde_json::json!({"command": "log"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("initial commit"));
         assert_eq!(result.exit_code, Some(0));
@@ -387,7 +389,7 @@ mod tests {
         fs::write(dir.path().join("file.txt"), "modified").unwrap();
         let tool = GitTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "diff"}))
+            .execute(&serde_json::json!({"command": "diff"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("modified"));
         assert_eq!(result.exit_code, Some(0));
@@ -397,7 +399,7 @@ mod tests {
     fn test_git_unknown_command() {
         let dir = TempDir::new().unwrap();
         let tool = GitTool::new(dir.path());
-        let result = tool.execute(&serde_json::json!({"command": "blame"}));
+        let result = tool.execute(&serde_json::json!({"command": "blame"}), &Arc::new(AtomicBool::new(false)));
         assert!(result.is_err());
     }
 }

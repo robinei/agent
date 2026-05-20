@@ -7,6 +7,8 @@
 //! Tests create temp directories with fixture files.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 pub mod bash;
 pub mod edit;
@@ -31,7 +33,8 @@ pub trait Tool: Send {
     fn definition(&self) -> ToolDefinition;
 
     /// Execute the tool with the given JSON parameters.
-    fn execute(&self, params: &serde_json::Value) -> ToolResult;
+    /// `stop` is checked during long-running execution (bash only, currently).
+    fn execute(&self, params: &serde_json::Value, stop: &Arc<AtomicBool>) -> ToolResult;
 }
 
 /// Register all available tools.

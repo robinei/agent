@@ -1,6 +1,8 @@
 //! FindTool — file/directory search using walkdir.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use walkdir::WalkDir;
 
@@ -101,7 +103,7 @@ impl Tool for FindTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, _stop: &Arc<AtomicBool>) -> ToolResult {
         let pattern_str = params
             .get("pattern")
             .and_then(|v| v.as_str())
@@ -214,7 +216,7 @@ mod tests {
         fs::write(dir.path().join("readme.md"), "").unwrap();
         let tool = FindTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"pattern": "*.rs"}))
+            .execute(&serde_json::json!({"pattern": "*.rs"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("main.rs"));
         assert!(result.content.contains("lib.rs"));
@@ -229,7 +231,7 @@ mod tests {
         fs::write(dir.path().join("readme.md"), "").unwrap();
         let tool = FindTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"pattern": "test"}))
+            .execute(&serde_json::json!({"pattern": "test"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("test_main.rs"));
         assert!(result.content.contains("main_test.rs"));
@@ -244,7 +246,7 @@ mod tests {
         fs::write(dir.path().join("file.txt"), "").unwrap();
         let tool = FindTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"pattern": "*", "type": "dir"}))
+            .execute(&serde_json::json!({"pattern": "*", "type": "dir"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("src"));
         assert!(result.content.contains("tests"));
@@ -256,7 +258,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = FindTool::new(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"pattern": "zzzzz"}))
+            .execute(&serde_json::json!({"pattern": "zzzzz"}), &Arc::new(AtomicBool::new(false)))
             .unwrap();
         assert!(result.content.contains("No files found"));
     }
