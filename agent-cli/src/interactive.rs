@@ -8,10 +8,12 @@
 //! The main input loop and tree-selection prompts all use character-by-character raw input.
 
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::unix::io::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use termion::{color, style};
 use termion::event::Key;
 use termion::input::TermRead;
@@ -455,13 +457,21 @@ fn create_tree_interactive(
 // ── Message processing ──
 
 fn poll_key() -> Option<Key> {
-    // Use termion's async_stdin which returns a non-blocking reader.
-    // Create a fresh Keys iterator each time; if no byte is ready, it
-    // returns None immediately.
-    let stdin = termion::async_stdin();
-    let mut keys = stdin.keys();
-    match keys.next() {
-        Some(Ok(key)) => Some(key),
+    let stdin = io::stdin();
+    let mut poll_fd = PollFd::new(stdin.as_fd(), PollFlags::POLLIN);
+
+    match poll(std::slice::from_mut(&mut poll_fd), PollTimeout::from(0u16)) {
+        Ok(n) if n > 0 => {
+            let mut buf = [0u8; 1];
+            match io::stdin().read(&mut buf) {
+                Ok(1) => match buf[0] {
+                    0x1b => Some(Key::Esc),
+                    0x03 => Some(Key::Ctrl('c')),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
