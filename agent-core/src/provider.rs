@@ -1,11 +1,11 @@
 use log::info;
 use serde_json::json;
-use std::io::Read;
-use std::sync::atomic::AtomicU64;
-use std::sync::mpsc;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-use crate::rpc::{LlmRequest, LlmResponse, PipeOut};
+use crate::rpc::{LlmRequest, LlmResponse, PipeIn, PipeOut, WsCommand};
 use crate::types::{ChatStream, Message, MessageContent, MessageRole, ToolDefinition, ToolCall};
 
 #[derive(Error, Debug)]
@@ -368,19 +368,29 @@ pub fn generate_continuation_brief(
     Ok((final_brief, status))
 }
 
-// ── ChannelReader ──
-// Feeds LlmResponse::Chunk bytes into ChatStream.
-// LlmResponse::Done / channel-closed => EOF (Ok(0)).
-// LlmResponse::Error => io::Error::other(message).
+// ── Shared handle types for single-threaded direct-IO ──
+// These use Arc<Mutex<>> so the compiler accepts shared borrows between the
+// SyncPipeProvider struct and the closures passed to run_agent. The mutex is
+// never actually contended because everything runs on one thread.
 
-struct ChannelReader {
-    rx: mpsc::Receiver<LlmResponse>,
+type StdinHandle = Arc<Mutex<BufReader<std::io::Stdin>>>;
+type StdoutHandle = Arc<Mutex<std::io::Stdout>>;
+
+// ── SyncStdinChunkReader ──
+// Reads PipeIn lines from stdin until it sees an LlmResponse::Chunk, then
+// serves its bytes.  Returns EOF on LlmResponse::Done and an IO error on
+// LlmResponse::Error.  WsCommand::Stop sets the stop flag.
+
+struct SyncStdinChunkReader {
+    stdin: StdinHandle,
+    stop: Arc<AtomicBool>,
     buf: Vec<u8>,
     pos: usize,
 }
 
-impl Read for ChannelReader {
+impl Read for SyncStdinChunkReader {
     fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+        // Return any buffered bytes from the previous Chunk first.
         if self.pos < self.buf.len() {
             let n = std::cmp::min(dst.len(), self.buf.len() - self.pos);
             dst[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
@@ -391,87 +401,110 @@ impl Read for ChannelReader {
             }
             return Ok(n);
         }
-        match self.rx.recv() {
-            Ok(LlmResponse::Chunk { data, .. }) => {
-                self.buf = data.into_bytes();
-                self.pos = 0;
-                let n = std::cmp::min(dst.len(), self.buf.len());
-                dst[..n].copy_from_slice(&self.buf[..n]);
-                self.pos = n;
-                if self.pos >= self.buf.len() {
-                    self.buf.clear();
+        // Read lines until we get an LlmResponse.
+        loop {
+            let mut line = String::new();
+            let n = self.stdin.lock().unwrap().read_line(&mut line)?;
+            if n == 0 {
+                return Ok(0); // stdin closed → EOF
+            }
+            match serde_json::from_str(line.trim_end()) {
+                Ok(PipeIn::Llm(LlmResponse::Chunk { data, .. })) => {
+                    self.buf = data.into_bytes();
                     self.pos = 0;
+                    let n = std::cmp::min(dst.len(), self.buf.len());
+                    dst[..n].copy_from_slice(&self.buf[..n]);
+                    self.pos = n;
+                    if self.pos >= self.buf.len() {
+                        self.buf.clear();
+                        self.pos = 0;
+                    }
+                    return Ok(n);
                 }
-                Ok(n)
+                Ok(PipeIn::Llm(LlmResponse::Done { .. })) => return Ok(0),
+                Ok(PipeIn::Llm(LlmResponse::Error { message, .. })) => {
+                    return Err(std::io::Error::other(message));
+                }
+                Ok(PipeIn::Cmd(WsCommand::Stop)) => {
+                    self.stop.store(true, Ordering::Relaxed);
+                }
+                // Config and unknown Cmd messages are silently skipped.
+                _ => {}
             }
-            Ok(LlmResponse::Done { .. }) => Ok(0),
-            Ok(LlmResponse::Error { message, .. }) => {
-                Err(std::io::Error::other(message))
-            }
-            Err(_) => Ok(0),
         }
     }
 }
 
-// ── PipeProvider ──
-// Worker-side LLM provider that sends LlmRequest over the pipe and reads
-// LlmResponse chunks back. The server proxies the actual HTTP call.
-
-pub struct PipeProvider {
-    out_tx: mpsc::Sender<String>,
-    llm_register_tx: mpsc::Sender<mpsc::Sender<LlmResponse>>,
-    next_id: AtomicU64,
+impl Drop for SyncStdinChunkReader {
+    fn drop(&mut self) {
+        // The agent may break out of the stream loop early (e.g. on "data: [DONE]")
+        // before SyncStdinChunkReader has consumed the trailing PipeIn::Llm(Done)
+        // that the server always sends after the HTTP stream closes.  Without this
+        // drain, the Done leaks into stdin and the *next* stream_chat() call reads
+        // it as an immediate EOF, producing an empty response and a spurious "stop".
+        if self.pos < self.buf.len() {
+            // If there are still bytes buffered from the last Chunk, we already
+            // got past Done — nothing to drain.
+            return;
+        }
+        loop {
+            let mut line = String::new();
+            match self.stdin.lock().unwrap().read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => match serde_json::from_str(line.trim_end()) {
+                    Ok(PipeIn::Llm(LlmResponse::Done { .. })) => break,
+                    Ok(PipeIn::Llm(LlmResponse::Error { .. })) => break,
+                    _ => {}
+                },
+            }
+        }
+    }
 }
 
-impl PipeProvider {
+// ── SyncPipeProvider ──
+// Worker-side LLM provider that writes LlmRequest to stdout and reads
+// LlmResponse chunks back from stdin.  Single-threaded — no channels.
+
+pub struct SyncPipeProvider {
+    stdin: StdinHandle,
+    stdout: StdoutHandle,
+    stop: Arc<AtomicBool>,
+}
+
+impl SyncPipeProvider {
     pub fn new(
-        out_tx: mpsc::Sender<String>,
-        llm_register_tx: mpsc::Sender<mpsc::Sender<LlmResponse>>,
+        stdin: StdinHandle,
+        stdout: StdoutHandle,
+        stop: Arc<AtomicBool>,
     ) -> Self {
-        Self {
-            out_tx,
-            llm_register_tx,
-            next_id: AtomicU64::new(0),
-        }
+        Self { stdin, stdout, stop }
     }
 }
 
-impl LlmProvider for PipeProvider {
+impl LlmProvider for SyncPipeProvider {
     fn stream_chat(
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<ChatStream> {
-        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        let (chunk_tx, chunk_rx) = mpsc::channel::<LlmResponse>();
-
-        // Register the sender BEFORE sending the request so the stdin-reader
-        // thread installs it before the first Chunk arrives.
-        // INVARIANT: the agent loop is single-threaded — only one LlmRequest
-        // is in flight at a time, so there is never more than one registered
-        // sender.
-        self.llm_register_tx
-            .send(chunk_tx)
-            .map_err(|e| ProviderError::Io(std::io::Error::other(e)))?;
-
         let req = PipeOut::Llm(LlmRequest {
-            id,
+            id: 0,
             messages: messages.to_vec(),
             tools: tools.to_vec(),
         });
-        let json = serde_json::to_string(&req)
-            .map_err(ProviderError::Json)?;
-        self.out_tx
-            .send(json)
-            .map_err(|e| ProviderError::Io(std::io::Error::other(e)))?;
-
-        let reader = ChannelReader {
-            rx: chunk_rx,
+        let json = serde_json::to_string(&req).map_err(ProviderError::Json)?;
+        {
+            let mut w = self.stdout.lock().unwrap();
+            writeln!(w, "{}", json).map_err(ProviderError::Io)?;
+            w.flush().map_err(ProviderError::Io)?;
+        }
+        let reader = SyncStdinChunkReader {
+            stdin: self.stdin.clone(),
+            stop: self.stop.clone(),
             buf: Vec::new(),
             pos: 0,
         };
-        Ok(ChatStream::from_reader(Box::new(std::io::BufReader::new(reader))))
+        Ok(ChatStream::from_reader(Box::new(BufReader::new(reader))))
     }
 }
 
@@ -554,55 +587,6 @@ mod tests {
         assert_eq!(body["model"], "test-model");
         assert!(body["stream"].as_bool().unwrap_or(false));
         assert!(body["stream_options"]["include_usage"].as_bool().unwrap_or(false));
-    }
-
-    #[test]
-    fn test_channel_reader_chunk() {
-        let (tx, rx) = mpsc::channel::<LlmResponse>();
-        let data = "data: hello\n".to_string();
-        tx.send(LlmResponse::Chunk { id: 0, data }).unwrap();
-        tx.send(LlmResponse::Done { id: 0 }).unwrap();
-        let mut reader = ChannelReader { rx, buf: vec![], pos: 0 };
-        let mut buf = [0u8; 32];
-        let n = reader.read(&mut buf).unwrap();
-        let got = std::str::from_utf8(&buf[..n]).unwrap();
-        assert_eq!(got, "data: hello\n");
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 0); // EOF
-    }
-
-    #[test]
-    fn test_channel_reader_error() {
-        let (tx, rx) = mpsc::channel::<LlmResponse>();
-        tx.send(LlmResponse::Error {
-            id: 0,
-            message: "oops".into(),
-        })
-        .unwrap();
-        let mut reader = ChannelReader { rx, buf: vec![], pos: 0 };
-        let mut buf = [0u8; 32];
-        let err = reader.read(&mut buf).unwrap_err();
-        assert_eq!(err.to_string(), "oops");
-    }
-
-    #[test]
-    fn test_channel_reader_eof_on_done() {
-        let (tx, rx) = mpsc::channel::<LlmResponse>();
-        tx.send(LlmResponse::Done { id: 0 }).unwrap();
-        let mut reader = ChannelReader { rx, buf: vec![], pos: 0 };
-        let mut buf = [0u8; 32];
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn test_channel_reader_eof_on_closed_channel() {
-        let (tx, rx) = mpsc::channel::<LlmResponse>();
-        drop(tx);
-        let mut reader = ChannelReader { rx, buf: vec![], pos: 0 };
-        let mut buf = [0u8; 32];
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 0);
     }
 
     #[test]

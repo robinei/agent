@@ -251,10 +251,15 @@ pub fn build_bwrap_argv(
 
 pub fn worker_send_command(tree_id: &str, json_line: &str) -> Result<(), String> {
     let entry = worker_get(tree_id).ok_or_else(|| format!("No active worker for tree {}", tree_id))?;
+    let cmd: agent_core::rpc::WsCommand = serde_json::from_str(json_line)
+        .map_err(|e| format!("Invalid command JSON: {}", e))?;
+    let pipe_in = agent_core::rpc::PipeIn::Cmd(cmd);
+    let json = serde_json::to_string(&pipe_in)
+        .map_err(|e| format!("Serialize PipeIn: {}", e))?;
     let guard = entry.lock().unwrap();
     guard
         .stdin_tx
-        .send(json_line.to_string())
+        .send(json)
         .map_err(|e| format!("Failed to send command to worker: {}", e))
 }
 
@@ -352,10 +357,11 @@ fn spawn_stdout_proxy(
                     }
                 }
                 PipeOut::Llm(req) => {
-                    // The worker is blocked on ChannelReader::read waiting for the
-                    // response, so we process this synchronously (no other events
-                    // arrive until the call completes).
-                    handle_llm_request(req, &entry, &cfg);
+                    let entry_for_llm = entry.clone();
+                    let cfg_for_llm = cfg.clone();
+                    std::thread::spawn(move || {
+                        handle_llm_request(req, &entry_for_llm, &cfg_for_llm);
+                    });
                 }
             }
         }

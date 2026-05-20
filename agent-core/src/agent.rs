@@ -12,7 +12,6 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
 
 use log::{error, info, warn};
@@ -319,7 +318,7 @@ pub fn auto_title(
 fn write_session_end(
     store: &Store,
     tree_id: &str,
-    event_tx: &mpsc::Sender<ServerEvent>,
+    emit: &mut impl FnMut(ServerEvent),
     status: SessionStatus,
     continuation_brief: Option<String>,
 ) {
@@ -334,7 +333,7 @@ fn write_session_end(
     if let Err(e) = store.append_entry(tree_id, &entry) {
         error!("Failed to write session_end for tree {}: {}", tree_id, e);
     }
-    let _ = event_tx.send(ServerEvent::Entry(entry));
+    emit(ServerEvent::Entry(entry));
 }
 
 fn truncate_for_log(s: &str, max_len: usize) -> String {
@@ -349,7 +348,7 @@ fn truncate_for_log(s: &str, max_len: usize) -> String {
 fn write_message_entry(
     store: &Store,
     tree_id: &str,
-    event_tx: &mpsc::Sender<ServerEvent>,
+    emit: &mut impl FnMut(ServerEvent),
     entry_id: &str,
     parent_id: Option<&str>,
     message: &Message,
@@ -364,7 +363,7 @@ fn write_message_entry(
     if let Err(e) = store.append_entry(tree_id, &entry) {
         error!("Failed to append message entry for tree {}: {}", tree_id, e);
     }
-    let _ = event_tx.send(ServerEvent::Entry(entry));
+    emit(ServerEvent::Entry(entry));
     *leaf_id = Some(entry_id.to_string());
 }
 
@@ -425,17 +424,21 @@ fn split_thinking_chunks(text: &str, in_thinking: &mut bool) -> Vec<ThinkingSegm
 /// Run the agent loop for a single tree.
 ///
 /// This function is spawned in a dedicated thread by the server's lifecycle module.
-/// It reads from `input_rx` for user messages, builds context, calls the LLM,
-/// dispatches tools, and emits events over `event_tx`.
-pub fn run_agent<P: LlmProvider>(
+/// It calls `next_input` for user messages, builds context, calls the LLM,
+/// dispatches tools, and emits events via `emit`.
+pub fn run_agent<P, I, E>(
     tree_id: &str,
     store: Store,
     provider: P,
     session_config: SessionConfig,
-    input_rx: mpsc::Receiver<AgentInput>,
-    event_tx: mpsc::Sender<ServerEvent>,
+    mut next_input: I,
+    mut emit: E,
     stop: Arc<AtomicBool>,
-) {
+) where
+    P: LlmProvider,
+    I: FnMut() -> Option<AgentInput>,
+    E: FnMut(ServerEvent),
+{
     crate::logging::AGENT_TREE_ID.set(Some(tree_id.to_string()));
     info!("Agent loop started for tree {}", tree_id);
 
@@ -445,15 +448,15 @@ pub fn run_agent<P: LlmProvider>(
 
     'main: loop {
         // 1. Wait for user message
-        let text = match input_rx.recv() {
-            Ok(AgentInput::Message { text }) => text,
-            Ok(AgentInput::Stop) => {
+        let text = match next_input() {
+            Some(AgentInput::Message { text }) => text,
+            Some(AgentInput::Stop) => {
                 info!("Agent received stop signal for tree {}", tree_id);
                 // Worker stays alive; cancel applies only to in-flight work,
                 // which the atomic flag above already handled. Drain and wait.
                 continue;
             }
-            Err(_) => {
+            None => {
                 info!("Input channel closed for tree {}, exiting", tree_id);
                 break;
             }
@@ -475,7 +478,7 @@ pub fn run_agent<P: LlmProvider>(
             Ok(e) => e,
             Err(e) => {
                 error!("Failed to read entries for tree {}: {}", tree_id, e);
-                let _ = event_tx.send(ServerEvent::Error {
+                emit(ServerEvent::Error {
                     message: format!("Failed to read entries: {}", e),
                     fatal: true,
                 });
@@ -516,7 +519,7 @@ pub fn run_agent<P: LlmProvider>(
         };
 
         write_message_entry(
-            &store, tree_id, &event_tx,
+            &store, tree_id, &mut emit,
             &user_msg_id, user_msg_parent.as_deref(),
             &user_msg, &mut leaf_id,
         );
@@ -540,7 +543,7 @@ pub fn run_agent<P: LlmProvider>(
         // 6. Run before-LLM hooks
         if let Err(e) = hooks::run_before_llm_hooks(&mut messages) {
             warn!("Before-LLM hook blocked: {}", e);
-            let _ = event_tx.send(ServerEvent::Error {
+            emit(ServerEvent::Error {
                 message: format!("Hook blocked message: {}", e),
                 fatal: false,
             });
@@ -557,18 +560,18 @@ pub fn run_agent<P: LlmProvider>(
 
         if estimated >= soft_cap {
             let pct = (estimated * 100 / context_window) as u8;
-            let _ = event_tx.send(ServerEvent::CapWarning {
+            emit(ServerEvent::CapWarning {
                 level: if estimated >= hard_cap { "hard".into() } else { "soft".into() },
                 pct,
             });
 
             if estimated >= hard_cap {
                 warn!("Hard cap reached for tree {} (est. {} tokens)", tree_id, estimated);
-                let _ = event_tx.send(ServerEvent::Error {
+                emit(ServerEvent::Error {
                     message: "Hard context cap reached. Ending session.".into(),
                     fatal: false,
                 });
-                write_session_end(&store, tree_id, &event_tx, SessionStatus::Continuing, None);
+                write_session_end(&store, tree_id, &mut emit, SessionStatus::Continuing, None);
                 break;
             }
         }
@@ -589,7 +592,7 @@ pub fn run_agent<P: LlmProvider>(
                 Ok(s) => s,
                 Err(e) => {
                     error!("LLM call failed for tree {}: {}", tree_id, e);
-                    let _ = event_tx.send(ServerEvent::Error {
+                    emit(ServerEvent::Error {
                         message: format!("LLM call failed: {}", e),
                         fatal: true,
                     });
@@ -606,7 +609,7 @@ pub fn run_agent<P: LlmProvider>(
             'stream: loop {
                 if stop.load(Ordering::Relaxed) {
                     // User cancelled — emit Done and persist partial response
-                    let _ = event_tx.send(ServerEvent::Done {
+                    emit(ServerEvent::Done {
                         status: "cancelled".into(),
                     });
                     if !response_text.is_empty() {
@@ -623,7 +626,7 @@ pub fn run_agent<P: LlmProvider>(
                             is_error: None,
                         };
                         write_message_entry(
-                            &store, tree_id, &event_tx,
+                            &store, tree_id, &mut emit,
                             &msg_id, msg_parent.as_deref(),
                             &assistant_msg, &mut leaf_id,
                         );
@@ -679,7 +682,7 @@ pub fn run_agent<P: LlmProvider>(
                 // Explicit reasoning field (some providers like DeepSeek / Qwen)
                 if let Some(rc) = &choice.delta.reasoning {
                     if !rc.is_empty() {
-                        let _ = event_tx.send(ServerEvent::ThinkingChunk { content: rc.clone() });
+                        emit(ServerEvent::ThinkingChunk { content: rc.clone() });
                     }
                 }
 
@@ -689,11 +692,11 @@ pub fn run_agent<P: LlmProvider>(
                         for segment in split_thinking_chunks(delta, &mut in_thinking) {
                             match segment {
                                 ThinkingSegment::Thinking(t) => {
-                                    let _ = event_tx.send(ServerEvent::ThinkingChunk { content: t });
+                                    emit(ServerEvent::ThinkingChunk { content: t });
                                 }
                                 ThinkingSegment::Text(t) if !t.is_empty() => {
                                     response_text.push_str(&t);
-                                    let _ = event_tx.send(ServerEvent::TextChunk {
+                                    emit(ServerEvent::TextChunk {
                                         content: t,
                                     });
                                 }
@@ -760,7 +763,7 @@ pub fn run_agent<P: LlmProvider>(
                     };
 
                     write_message_entry(
-                        &store, tree_id, &event_tx,
+                        &store, tree_id, &mut emit,
                         &msg_id, msg_parent.as_deref(),
                         &assistant_msg, &mut leaf_id,
                     );
@@ -781,7 +784,7 @@ pub fn run_agent<P: LlmProvider>(
 
                         // Run hooks
                         if let Err(e) = hooks::run_tool_call_hooks(&call.name, &call.arguments) {
-                            let _ = event_tx.send(ServerEvent::Error {
+                            emit(ServerEvent::Error {
                                 message: format!("Hook blocked tool call: {}", e),
                                 fatal: false,
                             });
@@ -790,7 +793,7 @@ pub fn run_agent<P: LlmProvider>(
                         }
 
                         // Emit ToolStart
-                        let _ = event_tx.send(ServerEvent::ToolStart {
+                        emit(ServerEvent::ToolStart {
                             tool: call.name.clone(),
                             input: call.arguments.clone(),
                         });
@@ -802,7 +805,7 @@ pub fn run_agent<P: LlmProvider>(
                             consecutive_failures += 1;
                             if consecutive_failures >= 3 {
                                 warn!("3 consecutive tool failures for tree {}", tree_id);
-                                let _ = event_tx.send(ServerEvent::Error {
+                                emit(ServerEvent::Error {
                                     message: "3 consecutive tool failures, aborting turn".into(),
                                     fatal: false,
                                 });
@@ -813,7 +816,7 @@ pub fn run_agent<P: LlmProvider>(
                         }
 
                         // Emit ToolResult
-                        let _ = event_tx.send(ServerEvent::ToolResult {
+                        emit(ServerEvent::ToolResult {
                             tool: call.name.clone(),
                             exit: result.exit_code.unwrap_or(0),
                             output: preview_tool_output(&result),
@@ -838,7 +841,7 @@ pub fn run_agent<P: LlmProvider>(
                             if let Err(e) = store.append_entry(tree_id, &bash_entry) {
                                 error!("Failed to append bash_exec: {}", e);
                             }
-                            let _ = event_tx.send(ServerEvent::Entry(bash_entry));
+                            emit(ServerEvent::Entry(bash_entry));
                         }
 
                         // Add tool result to message context
@@ -860,7 +863,7 @@ pub fn run_agent<P: LlmProvider>(
                     continue 'turn;
                 }
                 "stop" | "length" => {
-                    let _ = event_tx.send(ServerEvent::Done {
+                    emit(ServerEvent::Done {
                         status: reason.to_string(),
                     });
 
@@ -880,7 +883,7 @@ pub fn run_agent<P: LlmProvider>(
                         };
 
                         write_message_entry(
-                            &store, tree_id, &event_tx,
+                            &store, tree_id, &mut emit,
                             &msg_id, msg_parent.as_deref(),
                             &assistant_msg, &mut leaf_id,
                         );
@@ -898,7 +901,7 @@ pub fn run_agent<P: LlmProvider>(
                 _ => {
                     // Unknown finish reason, try to handle gracefully
                     warn!("Unknown finish reason '{}' for tree {}", reason, tree_id);
-                    let _ = event_tx.send(ServerEvent::Done {
+                    emit(ServerEvent::Done {
                         status: reason.to_string(),
                     });
                     break 'turn;
@@ -908,7 +911,7 @@ pub fn run_agent<P: LlmProvider>(
 
         if tool_call_round >= max_per_turn {
             warn!("Max tool call rounds ({}) reached for tree {}", max_per_turn, tree_id);
-            let _ = event_tx.send(ServerEvent::Error {
+            emit(ServerEvent::Error {
                 message: format!("Max tool call rounds ({}) reached", max_per_turn),
                 fatal: false,
             });
@@ -917,7 +920,7 @@ pub fn run_agent<P: LlmProvider>(
         // If the turn was cancelled (stop flag set during tool execution,
         // not during streaming which already emits Done above), emit Done.
         if stop.load(Ordering::Relaxed) {
-            let _ = event_tx.send(ServerEvent::Done {
+            emit(ServerEvent::Done {
                 status: "cancelled".into(),
             });
         }
@@ -1003,13 +1006,6 @@ mod tests {
         let messages = build_context(&entries, "msg1");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, MessageRole::User);
-    }
-
-    fn message_text(msg: &Message) -> &str {
-        match &msg.content {
-            MessageContent::Text(t) => t,
-            _ => "",
-        }
     }
 
     #[test]
