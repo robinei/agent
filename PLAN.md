@@ -972,3 +972,256 @@ fn print_error(out: &mut impl Write, text: &str) {
 - Modified: `agent-server/src/lifecycle.rs` — added `StderrBuf` type alias, created ring buffer in `spawn_worker`, passed to both `spawn_stdout_proxy` and `spawn_stderr_demux`; `spawn_stderr_demux` fills buffer (cap 20); `spawn_stdout_proxy` reads buffer on crash to include stderr in error message.
 - Modified: `agent-cli/src/interactive.rs` — `print_error` now calls `normalize_for_raw` so multi-line error messages render correctly in raw mode.
 - Verified: `cargo test --workspace` → all pass, `cargo clippy --workspace` → no new warnings.
+
+---
+
+## Step 6 — Thinking stream visibility
+
+- [ ] Add `ThinkingChunk` to `ServerEvent`
+- [ ] Add `reasoning_content` to `Delta`
+- [ ] Split `<think>` / `</think>` tags out of content deltas in the agent loop
+- [ ] Emit `ThinkingChunk` events; keep thinking out of persisted `response_text`
+- [ ] Render thinking in dim dark-gray, streaming in real time
+- [ ] Reset color cleanly when the first regular `TextChunk` follows
+
+**Goal:** When the active model emits a reasoning / thinking trace (either via a
+`reasoning_content` delta field or embedded `<think>…</think>` tags), stream it
+to the terminal in visibly dimmer text so the user can watch the model think in
+real time. Thinking content is never stored — it is ephemeral display only.
+
+### Background
+
+Two conventions exist in OpenAI-compatible providers for surfacing model
+reasoning:
+
+1. **Explicit field:** `delta.reasoning_content` (e.g. some DeepSeek / Qwen
+   API variants). Non-null when the model has a separate reasoning budget.
+2. **Inline tags:** `<think>…</think>` embedded in `delta.content` (DeepSeek
+   R1 open-weight, Qwen3 thinking mode). The tags may straddle chunk
+   boundaries, so they must be parsed stateously.
+
+Both paths produce `ServerEvent::ThinkingChunk` events; the CLI renders them
+identically.
+
+### Spec details
+
+#### 1. New event variant — `agent-core/src/types.rs`
+
+Add to `ServerEvent`:
+
+```rust
+/// Reasoning/thinking token from models that expose extended thinking.
+/// Never stored. Rendered in dimmed color during streaming.
+#[serde(rename = "thinking_chunk")]
+ThinkingChunk { content: String },
+```
+
+Add `reasoning_content` to `Delta` (same file):
+
+```rust
+pub struct Delta {
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<DeltaToolCall>,
+    // Explicit reasoning field (some providers). Absent → None.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+}
+```
+
+#### 2. Tag splitter — `agent-core/src/agent.rs`
+
+Add before the agent loop:
+
+```rust
+enum ThinkingSegment {
+    Thinking(String),
+    Text(String),
+}
+
+/// Split a content delta into alternating thinking/text segments.
+///
+/// `in_thinking` tracks whether the parser is currently inside a `<think>` block
+/// across chunk boundaries. Both `<think>` and `</think>` may land in the middle
+/// of a chunk or straddle two chunks; the caller preserves `in_thinking` between
+/// calls to handle the cross-boundary case.
+fn split_thinking_chunks(text: &str, in_thinking: &mut bool) -> Vec<ThinkingSegment> {
+    let mut result = Vec::new();
+    let mut rest = text;
+    loop {
+        if *in_thinking {
+            match rest.find("</think>") {
+                Some(pos) => {
+                    if pos > 0 {
+                        result.push(ThinkingSegment::Thinking(rest[..pos].to_string()));
+                    }
+                    *in_thinking = false;
+                    rest = &rest[pos + "</think>".len()..];
+                }
+                None => {
+                    if !rest.is_empty() {
+                        result.push(ThinkingSegment::Thinking(rest.to_string()));
+                    }
+                    break;
+                }
+            }
+        } else {
+            match rest.find("<think>") {
+                Some(pos) => {
+                    if pos > 0 {
+                        result.push(ThinkingSegment::Text(rest[..pos].to_string()));
+                    }
+                    *in_thinking = true;
+                    rest = &rest[pos + "<think>".len()..];
+                }
+                None => {
+                    if !rest.is_empty() {
+                        result.push(ThinkingSegment::Text(rest.to_string()));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    result
+}
+```
+
+#### 3. Agent stream loop — `agent-core/src/agent.rs`
+
+In the `'turn` loop, add `let mut in_thinking = false;` next to the existing
+`let mut response_text = String::new();`.
+
+Replace the existing content-delta block:
+
+```rust
+// Was: if let Some(delta) = &choice.delta.content { … }
+// Now: handle reasoning_content first, then split content via tag parser.
+
+// Explicit reasoning field (some providers)
+if let Some(rc) = &choice.delta.reasoning_content {
+    if !rc.is_empty() {
+        let _ = event_tx.send(ServerEvent::ThinkingChunk { content: rc.clone() });
+    }
+}
+
+// Content delta — split on <think> / </think> tags
+if let Some(delta) = &choice.delta.content {
+    if !delta.is_empty() {
+        for segment in split_thinking_chunks(delta, &mut in_thinking) {
+            match segment {
+                ThinkingSegment::Thinking(t) => {
+                    let _ = event_tx.send(ServerEvent::ThinkingChunk { content: t });
+                }
+                ThinkingSegment::Text(t) if !t.is_empty() => {
+                    response_text.push_str(&t);
+                    let _ = event_tx.send(ServerEvent::TextChunk { content: t });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+```
+
+`in_thinking` resets to `false` at the top of each `'turn` iteration (declaration
+is inside the loop). Thinking content is excluded from `response_text`, so it is
+never persisted.
+
+#### 4. CLI render state — `agent-cli/src/interactive.rs`
+
+Add field to `RenderState`:
+
+```rust
+#[derive(Default)]
+struct RenderState {
+    _rendered: HashSet<String>,
+    assistant_header_shown: bool,
+    last_tool_args: Option<(String, serde_json::Value)>,
+    in_thinking: bool,   // true while a thinking block is streaming
+}
+```
+
+#### 5. Thinking render arm — `agent-cli/src/interactive.rs`
+
+Add to `render_event` (before or after `TextChunk`):
+
+```rust
+ServerEvent::ThinkingChunk { content } => {
+    if !state.in_thinking {
+        state.in_thinking = true;
+        // \x1b[2m = SGR "faint" — noticeably dimmer than LightBlack alone.
+        write!(out, "\r\n{}\x1b[2m", color::Fg(color::LightBlack)).ok();
+    }
+    write!(out, "{}", normalize_for_raw(content)).ok();
+    out.flush().ok();
+}
+```
+
+Update the `TextChunk` arm to close the thinking block when it ends:
+
+```rust
+ServerEvent::TextChunk { content } => {
+    if state.in_thinking {
+        // Thinking ended — reset terminal color and add a blank separator line.
+        state.in_thinking = false;
+        write!(out, "{}\r\n", style::Reset).ok();
+    }
+    if !state.assistant_header_shown {
+        state.assistant_header_shown = true;
+        write!(out, "\r\n").ok();
+    }
+    write!(out, "{}", normalize_for_raw(content)).ok();
+    out.flush().ok();
+}
+```
+
+The separator line between the thinking block and the main response keeps them
+visually distinct without a hard divider.
+
+### Tests
+
+Add to `#[cfg(test)] mod tests` in `agent.rs`:
+
+- `test_split_no_tags` — `split_thinking_chunks("hello world", &mut false)` →
+  `[Text("hello world")]`, `in_thinking` still false.
+- `test_split_full_block` — input `"<think>reason</think>answer"` →
+  `[Thinking("reason"), Text("answer")]`, `in_thinking` false after.
+- `test_split_open_only` — `in_thinking=false`, input `"<think>partial"` →
+  `[Thinking("partial")]`, `in_thinking` true after.
+- `test_split_close_only` — `in_thinking=true`, input `"end</think>rest"` →
+  `[Thinking("end"), Text("rest")]`, `in_thinking` false after.
+- `test_split_empty_think_block` — `"<think></think>after"` → `[Text("after")]`.
+
+Add to `#[cfg(test)] mod tests` in `interactive.rs`:
+
+- `test_render_thinking_chunk_faint` — `render_event` with a `ThinkingChunk`;
+  output contains `\x1b[2m` (faint) and the chunk text.
+- `test_render_thinking_resets_on_text` — drive `render_event` with
+  `ThinkingChunk { "think" }` then `TextChunk { "answer" }`;
+  output contains `style::Reset` (as string) before "answer" and contains
+  both "think" and "answer".
+
+### Do not modify
+
+- The `<think>` / `</think>` tag text is stripped from the event content before
+  sending — never written to the terminal or stored.
+- `response_text` (and thus persisted messages) contains only non-thinking text.
+- Existing `TextChunk` rendering path is unchanged except for the `in_thinking`
+  reset guard added at its top.
+- Wire protocol for existing events, store format, cancellation logic.
+
+### Verify
+
+- `cargo test --workspace` — all existing tests pass, seven new tests pass.
+- `cargo clippy --workspace` — no new warnings.
+- Manual (model with thinking, e.g. Qwen3 thinking mode or DeepSeek R1):
+  1. Send a message that triggers reasoning.
+  2. Observe the thinking trace streaming in dim dark-gray before the main
+     response.
+  3. Observe the color resets cleanly when the main response begins.
+  4. Confirm the thinking text does NOT appear in `/entries` history.
+- Manual (model without thinking, e.g. plain Qwen2.5):
+  - No regression: output identical to before.
+
+**Notes:** _(filled on completion)_

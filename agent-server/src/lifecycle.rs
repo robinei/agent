@@ -49,7 +49,21 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
     }
     drop(workers);
 
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    // Use argv[0] rather than current_exe(): on Linux, current_exe() reads
+    // /proc/self/exe and appends " (deleted)" when the binary has been replaced
+    // since the process started (e.g. by `cargo build`). argv[0] is the original
+    // launch path and is always usable as a filesystem reference.
+    let exe = std::env::args()
+        .next()
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "argv[0] missing".to_string())?;
+    let exe = if exe.is_absolute() {
+        exe
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("current_dir: {e}"))?
+            .join(exe)
+    };
     let config_path = agent_core::config::agent_dir().join("config.toml");
 
     let meta = store
