@@ -559,6 +559,7 @@ struct InputLine {
     history: Vec<String>,
     history_idx: Option<usize>,
     draft: String,
+    last_visual_line: usize,
 }
 
 impl InputLine {
@@ -569,6 +570,7 @@ impl InputLine {
             history: Vec::new(),
             history_idx: None,
             draft: String::new(),
+            last_visual_line: 0,
         }
     }
 
@@ -576,6 +578,38 @@ impl InputLine {
         self.buf.clear();
         self.cursor = 0;
         self.history_idx = None;
+        self.last_visual_line = 0;
+    }
+
+    fn current_line_indent(&self) -> String {
+        "  ".into()
+    }
+
+    /// Returns line_start + 2 (end of margin) if cursor is at or inside the
+    /// 2-space margin on a continuation line. The margin is the 2 spaces that
+    /// follow every \n — they act as a protected left-edge gutter.
+    fn margin_end(&self) -> Option<usize> {
+        let line_start = self.buf[..self.cursor]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(0);
+        if line_start > 0 && self.cursor <= line_start + 2 {
+            Some(line_start + 2)
+        } else {
+            None
+        }
+    }
+
+    /// Snap cursor back to valid positions after any operation that could
+    /// land it inside a margin.
+    fn snap_cursor(&mut self) {
+        if let Some(marker) = self.margin_end() {
+            // Margin extends from (marker - 2) to (marker - 1).
+            // Jump past it: cursor = marker (but capped to buf len).
+            self.cursor = marker.min(self.buf.len());
+        }
+        self.cursor = self.cursor.min(self.buf.len());
     }
 
     fn handle_key(
@@ -599,15 +633,28 @@ impl InputLine {
                 LineEvent::Submit(line)
             }
             Key::Alt('\n') => {
+                let indent = self.current_line_indent();
                 self.buf.insert(self.cursor, '\n');
                 self.cursor += 1;
+                for c in indent.chars() {
+                    self.buf.insert(self.cursor, c);
+                    self.cursor += 1;
+                }
                 self.redraw(out, prompt, prev_lines);
                 LineEvent::Continue
             }
             Key::Backspace => {
                 if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.buf.remove(self.cursor);
+                    if let Some(marker) = self.margin_end() {
+                        // At/inside margin: remove \n + 2 spaces, join to prev line
+                        self.buf.remove(marker - 1);
+                        self.buf.remove(marker - 2);
+                        self.buf.remove(marker - 3);
+                        self.cursor = marker - 3;
+                    } else {
+                        self.cursor -= 1;
+                        self.buf.remove(self.cursor);
+                    }
                     self.redraw(out, prompt, prev_lines);
                 }
                 LineEvent::Continue
@@ -620,17 +667,45 @@ impl InputLine {
                 LineEvent::Continue
             }
             Key::Left | Key::Ctrl('b') => {
-                self.cursor = self.cursor.saturating_sub(1);
+                if let Some(marker) = self.margin_end() {
+                    self.cursor = marker.saturating_sub(3);
+                } else if self.cursor > 0 {
+                    self.cursor -= 1;
+                }
                 self.redraw(out, prompt, prev_lines);
                 LineEvent::Continue
             }
-            Key::Right | Key::Ctrl('f') => {
+            Key::Right => {
+                if self.cursor == self.buf.len() {
+                    let indent = self.current_line_indent();
+                    for c in "\n".chars().chain(indent.chars()) {
+                        self.buf.insert(self.cursor, c);
+                        self.cursor += 1;
+                    }
+                } else {
+                    self.cursor = self.buf.len().min(self.cursor + 1);
+                    self.snap_cursor();
+                }
+                self.redraw(out, prompt, prev_lines);
+                LineEvent::Continue
+            }
+            Key::Ctrl('f') => {
                 self.cursor = self.buf.len().min(self.cursor + 1);
+                self.snap_cursor();
                 self.redraw(out, prompt, prev_lines);
                 LineEvent::Continue
             }
             Key::Home | Key::Ctrl('a') => {
-                self.cursor = 0;
+                let line_start = self.buf[..self.cursor]
+                    .iter()
+                    .rposition(|&c| c == '\n')
+                    .map(|pos| pos + 1)
+                    .unwrap_or(0);
+                self.cursor = if line_start > 0 {
+                    (line_start + 2).min(self.buf.len())
+                } else {
+                    0
+                };
                 self.redraw(out, prompt, prev_lines);
                 LineEvent::Continue
             }
@@ -650,8 +725,18 @@ impl InputLine {
                 LineEvent::Continue
             }
             Key::Ctrl('u') => {
-                self.buf.drain(..self.cursor);
-                self.cursor = 0;
+                let line_start = self.buf[..self.cursor]
+                    .iter()
+                    .rposition(|&c| c == '\n')
+                    .map(|pos| pos + 1)
+                    .unwrap_or(0);
+                let kill_start = if line_start > 0 {
+                    (line_start + 2).min(self.cursor)
+                } else {
+                    0
+                };
+                self.buf.drain(kill_start..self.cursor);
+                self.cursor = kill_start;
                 self.redraw(out, prompt, prev_lines);
                 LineEvent::Continue
             }
@@ -724,9 +809,13 @@ impl InputLine {
         }
     }
 
-    fn redraw(&self, out: &mut impl Write, prompt: &str, prev_lines: &mut usize) {
-        if *prev_lines > 1 {
-            write!(out, "{}", termion::cursor::Up((*prev_lines - 1) as u16)).ok();
+    fn redraw(&mut self, out: &mut impl Write, prompt: &str, prev_lines: &mut usize) {
+        self.snap_cursor();
+
+        let old_prev_lines = *prev_lines;
+
+        if self.last_visual_line > 0 {
+            write!(out, "{}", termion::cursor::Up(self.last_visual_line as u16)).ok();
         }
         write!(out, "\r{}", clear::AfterCursor).ok();
 
@@ -736,17 +825,43 @@ impl InputLine {
 
         *prev_lines = 1 + self.buf.iter().filter(|&&c| c == '\n').count();
 
-        let chars_after = self.buf.len() - self.cursor;
-        if chars_after > 0 {
-            let suffix = &self.buf[self.cursor..];
-            let newlines_in_suffix = suffix.iter().filter(|&&c| c == '\n').count();
-            let cols_back = chars_after - newlines_in_suffix;
-            if newlines_in_suffix > 0 {
-                write!(out, "{}", termion::cursor::Up(newlines_in_suffix as u16)).ok();
-            }
-            if cols_back > 0 {
-                write!(out, "{}", termion::cursor::Left(cols_back as u16)).ok();
-            }
+        write!(out, "\r").ok();
+        for _ in *prev_lines..old_prev_lines {
+            write!(out, "\r\n{}", clear::AfterCursor).ok();
+        }
+
+        let cursor_row = if old_prev_lines > *prev_lines {
+            old_prev_lines - 1
+        } else {
+            *prev_lines - 1
+        };
+
+        let newlines_before = self.buf[..self.cursor]
+            .iter()
+            .filter(|&&c| c == '\n')
+            .count();
+        let line_start = self.buf[..self.cursor]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(0);
+        let col_in_line = self.cursor - line_start;
+        let cursor_line = newlines_before;
+        self.last_visual_line = cursor_line;
+
+        let rows_to_move = cursor_row - cursor_line;
+        if rows_to_move > 0 {
+            write!(out, "{}", termion::cursor::Up(rows_to_move as u16)).ok();
+        }
+
+        let prompt_width = if cursor_line == 0 { prompt.len() } else { 0 };
+        if prompt_width + col_in_line > 0 {
+            write!(
+                out,
+                "{}",
+                termion::cursor::Right((prompt_width + col_in_line) as u16)
+            )
+            .ok();
         }
 
         out.flush().ok();
@@ -1428,7 +1543,87 @@ mod tests {
             il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
         }
         let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
-        assert!(matches!(result, LineEvent::Submit(s) if s == "hello\nworld"));
+assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
+    }
+
+    #[test]
+    fn test_inputline_right_arrow_at_end_inserts_newline() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        let mut prev = 1;
+        for c in "hello".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        il.handle_key(Key::Right, &mut buf, "> ", &mut prev);
+        for c in "world".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
+assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
+    }
+
+    #[test]
+    fn test_inputline_alt_enter_auto_indent() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        let mut prev = 1;
+        for c in "  hello".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ", &mut prev);
+        for c in "world".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
+        assert!(matches!(result, LineEvent::Submit(s) if s == "  hello\n  world"));
+    }
+
+    #[test]
+    fn test_inputline_right_arrow_at_end_auto_indent() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        let mut prev = 1;
+        for c in "  hello".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        il.handle_key(Key::Right, &mut buf, "> ", &mut prev);
+        for c in "world".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
+        assert!(matches!(result, LineEvent::Submit(s) if s == "  hello\n  world"));
+    }
+
+    #[test]
+    fn test_inputline_right_arrow_mid_line_moves_cursor() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        let mut prev = 1;
+        for c in "ab".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
+        // cursor at 1, right arrow should move to 2 (not insert newline)
+        il.handle_key(Key::Right, &mut buf, "> ", &mut prev);
+        assert_eq!(il.cursor, 2);
+        assert_eq!(il.buf.iter().collect::<String>(), "ab");
+    }
+
+    #[test]
+    fn test_inputline_backspace_joins_lines_at_newline() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        let mut prev = 1;
+        for c in "abc".chars() {
+            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+        }
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ", &mut prev);
+        // buf is now "abc\n  ", cursor at end.
+        // One backspace removes the \n + 2-space margin, joining to "abc".
+        il.handle_key(Key::Backspace, &mut buf, "> ", &mut prev);
+        let s: String = il.buf.iter().collect();
+        assert_eq!(s, "abc");
+        assert_eq!(il.cursor, 3);
     }
 
     #[test]
