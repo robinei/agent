@@ -178,6 +178,10 @@ pub fn build_bwrap_argv(
     for u in &meta.sandbox.unhide {
         hide_set.remove(u);
     }
+    // bwrap requires the right opcode per path type: --tmpfs only works on
+    // directories, --bind /dev/null is the equivalent for files. Picking the
+    // wrong one ("Can't mkdir ...: Not a directory") will abort the worker
+    // before it ever starts. Skip paths that don't exist on the host.
     for p in &hide_set {
         let expanded = agent_core::types::expand_tilde(p);
         let meta = match std::fs::symlink_metadata(&expanded) {

@@ -135,5 +135,5 @@ See `DEBUG.md` for env-var configuration and troubleshooting.
 
 ## Plan
 
-Implementation history and pending work are in `SANDBOX.md` — checked-off
-steps with `**Notes:**` blocks below each. Append notes inline on completion.
+Pending and in-flight work is in `PLAN.md` — checked-off steps with
+`**Notes:**` blocks below each. Append notes inline on completion.

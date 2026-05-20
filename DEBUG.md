@@ -35,7 +35,7 @@ export RUST_LOG=info
 | Tree data | `~/.agent/trees/{uuid}/data.jsonl` (header + entries, append-only) |
 | Tree metadata | `~/.agent/trees/{uuid}/meta.json` (server-only writer) |
 | Server log | `/tmp/agent-server.log` + stderr (set via `[logging]`) |
-| Plan | `SANDBOX.md` (steps + notes) |
+| Plan | `PLAN.md` (steps + notes) |
 
 ## Architecture cheat sheet
 
@@ -68,7 +68,7 @@ This is the message the CLI shows when the worker subprocess died. **First place
 [worker abcd...] bwrap: Can't mkdir /home/user/.bash_history: Not a directory
 ```
 
-The hide list contained a file. Fix per Step 12 in `SANDBOX.md`: emit `--bind /dev/null <path>` for files, `--tmpfs <path>` for directories.
+The hide list contained a file. `lifecycle.rs::build_bwrap_argv` emits `--bind /dev/null <path>` for files and `--tmpfs <path>` for directories; if you see this error in new code, the path classification is wrong.
 
 ```
 [worker abcd...] bwrap: setting up uid map: Permission denied
@@ -133,7 +133,7 @@ If the WS connection drops immediately, the worker spawn failed — check the se
 
 If the server is killed with SIGKILL (no graceful shutdown), `--die-with-parent` on bwrap kills the workers, and on next startup `scan_unterminated` writes synthetic `SessionEnd`s for any tree whose last entry isn't one.
 
-## Integration test (Step 10)
+## End-to-end integration test
 
 The end-to-end test spawns a real `agent worker` subprocess with `AGENT_TEST_STUB=1` set, which makes `provider.stream_chat()` return canned SSE data instead of hitting a real API. Useful for validating the full RPC roundtrip:
 
