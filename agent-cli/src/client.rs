@@ -136,7 +136,11 @@ impl AgentClient {
 
     /// Get all entries for a tree.
     pub fn get_entries(&self, tree_id: &str) -> Result<Vec<Entry>, String> {
-        self.get_json(&format!("/trees/{}", tree_id))
+        self.get_json(&self.entries_url(tree_id))
+    }
+
+    fn entries_url(&self, tree_id: &str) -> String {
+        format!("/trees/{}/entries", tree_id)
     }
 
     /// Ask the server to auto-generate a title for a tree.
@@ -248,5 +252,12 @@ mod tests {
         let (host, port) = parse_host_port("localhost:8080").unwrap();
         let url = format!("ws://{}:{}/trees/abc123/ws", host, port);
         assert_eq!(url, "ws://localhost:8080/trees/abc123/ws");
+    }
+
+    #[test]
+    fn test_get_entries_url() {
+        let client = AgentClient::new("localhost:8080");
+        let url = client.entries_url("abc123");
+        assert_eq!(url, "/trees/abc123/entries");
     }
 }

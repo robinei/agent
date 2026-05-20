@@ -36,9 +36,8 @@ pub fn run(args: Vec<String>) {
     // Scan for unterminated sessions from a previous unclean shutdown
     let unterm = store.scan_unterminated();
     for id in &unterm {
-        log::info!("[lifecycle] appending synthetic session_end for unterminated tree {}", id);
-        lifecycle::append_synthetic_session_end(&store, id);
-        store.reset_header_tokens(id).ok();
+        log::info!("[lifecycle] recovering unterminated session for tree {}", id);
+        lifecycle::recover_tree(&store, id);
     }
     if !unterm.is_empty() {
         log::info!("[lifecycle] cleaned up {} unterminated session(s)", unterm.len());

@@ -350,20 +350,48 @@ fn spawn_stderr_demux(tree_id: String, stderr: ChildStderr) {
 
 // ── Graceful shutdown ──
 
-/// Append a synthetic `SessionEnd` (Aborted) entry to a tree's data file.
-/// Used when a worker crashes or the server shuts down uncleanly.
-pub fn append_synthetic_session_end(store: &Store, tree_id: &str) {
+/// Recover a tree after an unclean shutdown or worker crash.
+/// Reads `meta.leaf_id`, appends a linked `SessionEnd` (Aborted), updates
+/// `meta.leaf_id`, and resets header tokens.
+pub fn recover_tree(store: &Store, tree_id: &str) {
+    let meta = match store.get_tree(tree_id) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            log::warn!("[lifecycle] recover_tree: tree {} not found, skipping", tree_id);
+            return;
+        }
+        Err(e) => {
+            log::error!("[lifecycle] recover_tree: failed to read meta for {}: {}", tree_id, e);
+            return;
+        }
+    };
+
+    let parent_id = meta.leaf_id.clone();
+    if parent_id.is_none() {
+        log::info!("[lifecycle] recover_tree: tree {} has no leaf_id, nothing to recover", tree_id);
+        return;
+    }
+
+    let new_id = agent_core::util::generate_entry_id();
     let entry = Entry::SessionEnd {
-        id: agent_core::util::generate_entry_id(),
-        parent_id: None,
+        id: new_id.clone(),
+        parent_id,
         timestamp: chrono::Utc::now().to_rfc3339(),
         summary: Some("session aborted (worker exit or server shutdown)".into()),
         status: agent_core::types::SessionStatus::Aborted,
         continuation_brief: None,
     };
     if let Err(e) = store.append_entry(tree_id, &entry) {
-        log::error!("[lifecycle] append synthetic session_end for {}: {}", tree_id, e);
+        log::error!("[lifecycle] recover_tree: append session_end for {}: {}", tree_id, e);
+        return;
     }
+
+    let mut meta = meta;
+    meta.leaf_id = Some(new_id);
+    if let Err(e) = store.save_tree_meta(&meta) {
+        log::error!("[lifecycle] recover_tree: save meta for {}: {}", tree_id, e);
+    }
+    store.reset_header_tokens(tree_id).ok();
 }
 
 /// Signal all active workers to stop, wait up to 60s, then SIGKILL any survivors.
@@ -430,7 +458,7 @@ pub fn shutdown_all(store: &Store) {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            append_synthetic_session_end(store, id);
+            recover_tree(store, id);
         }
     }
 
@@ -499,14 +527,60 @@ mod tests {
     }
 
     #[test]
-    fn test_append_synthetic_session_end() {
+    fn test_recover_tree_links_chain() {
         use agent_core::store::Store;
         use agent_core::types::SessionStatus;
         use tempfile::TempDir;
 
         let dir = TempDir::with_prefix("agent-lifecycle-test-").unwrap();
         let store = Store::new(dir.path().to_path_buf());
-        let tree_id = "synthetic-test";
+        let tree_id = "recover-test";
+
+        store.create_tree_file(tree_id, "model").unwrap();
+        let start_id = "s1".to_string();
+        let meta = agent_core::types::TreeMeta {
+            id: tree_id.to_string(),
+            parent_id: None,
+            repo_path: None,
+            title: None,
+            created_at: 100,
+            updated_at: 100,
+            leaf_id: Some(start_id.clone()),
+            sandbox: agent_core::types::TreeSandbox::default(),
+        };
+        store.save_tree_meta(&meta).unwrap();
+
+        store.append_entry(tree_id, &Entry::SessionStart {
+            id: start_id.clone(), parent_id: None, timestamp: "t1".into(),
+        }).unwrap();
+
+        recover_tree(&store, tree_id);
+
+        let entries = store.read_all_entries(tree_id).unwrap();
+        let last = entries.last().unwrap();
+        match last {
+            Entry::SessionEnd { status, summary, parent_id, .. } => {
+                assert_eq!(*status, SessionStatus::Aborted);
+                assert!(summary.as_deref().unwrap_or("").contains("aborted"));
+                assert_eq!(*parent_id, Some(start_id.clone()), "parent_id must link to leaf_id");
+            }
+            other => panic!("expected SessionEnd, got {:?}", other),
+        }
+
+        // Verify meta.leaf_id was updated
+        let updated = store.get_tree(tree_id).unwrap().unwrap();
+        assert!(updated.leaf_id.is_some());
+        assert_ne!(updated.leaf_id, Some(start_id), "leaf_id must advance");
+    }
+
+    #[test]
+    fn test_recover_tree_empty_tree() {
+        use agent_core::store::Store;
+        use tempfile::TempDir;
+
+        let dir = TempDir::with_prefix("agent-lifecycle-test-").unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        let tree_id = "recover-empty";
 
         store.create_tree_file(tree_id, "model").unwrap();
         let meta = agent_core::types::TreeMeta {
@@ -521,22 +595,11 @@ mod tests {
         };
         store.save_tree_meta(&meta).unwrap();
 
-        // Append a start entry so the tree isn't empty
-        store.append_entry(tree_id, &Entry::SessionStart {
-            id: "s1".into(), parent_id: None, timestamp: "t1".into(),
-        }).unwrap();
-
-        append_synthetic_session_end(&store, tree_id);
+        // Should not panic and should not write any entries
+        recover_tree(&store, tree_id);
 
         let entries = store.read_all_entries(tree_id).unwrap();
-        let last = entries.last().unwrap();
-        match last {
-            Entry::SessionEnd { status, summary, .. } => {
-                assert_eq!(*status, SessionStatus::Aborted);
-                assert!(summary.as_deref().unwrap_or("").contains("aborted"));
-            }
-            other => panic!("expected SessionEnd, got {:?}", other),
-        }
+        assert!(entries.is_empty(), "empty tree should have no entries after recover");
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub fn dispatch(
         return handle_list_trees(store);
     }
     if method == "POST" && path == "/trees" {
-        return handle_create_tree(body, store);
+        return handle_create_tree(body, store, cfg);
     }
     if let Some(rest) = path.strip_prefix("/trees/") {
         let (id, suffix) = rest.split_once('/').unwrap_or((rest, ""));
@@ -66,7 +66,7 @@ fn handle_list_trees(store: &Store) -> (u16, Vec<u8>, &'static str) {
     }
 }
 
-fn handle_create_tree(body: &[u8], store: &Store) -> (u16, Vec<u8>, &'static str) {
+fn handle_create_tree(body: &[u8], store: &Store, cfg: &Config) -> (u16, Vec<u8>, &'static str) {
     let body: CreateTreeBody = match serde_json::from_slice(body) {
         Ok(b) => b,
         Err(_) => {
@@ -81,7 +81,7 @@ fn handle_create_tree(body: &[u8], store: &Store) -> (u16, Vec<u8>, &'static str
     let repo_path = match &body.repo_path {
         Some(p) => {
             let path = std::path::Path::new(p);
-            match agent_core::types::validate_repo_path(path, &[], &sandbox) {
+            match agent_core::types::validate_repo_path(path, &cfg.sandbox.defaults.hide, &sandbox) {
                 Ok(canon) => Some(canon),
                 Err(e) => return json(400, &serde_json::json!({"error": e})),
             }
@@ -322,5 +322,38 @@ mod tests {
         assert_eq!(status, 200);
         let entries: Vec<Entry> = serde_json::from_slice(&body).unwrap();
         assert!(entries.iter().any(|e| matches!(e, Entry::SessionStart { .. })));
+    }
+
+    #[test]
+    fn test_create_tree_rejects_repo_inside_default_hide() {
+        use agent_core::config::{SandboxConfig, SandboxDefaults};
+
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(Store::new(tmp.path().join(".agent")));
+
+        // Create a directory that will be in the default hide list
+        let hidden_dir = tmp.path().join(".ssh");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+
+        let cfg = Arc::new(Config {
+            sandbox: SandboxConfig {
+                enabled: false,
+                bwrap_path: None,
+                defaults: SandboxDefaults {
+                    hide: vec![hidden_dir.clone()],
+                },
+            },
+            ..Config::default()
+        });
+
+        let create_body = serde_json::json!({
+            "title": "test-tree",
+            "repo_path": hidden_dir.to_str().unwrap(),
+        });
+        let (status, body, _) = dispatch("POST", "/trees", &serde_json::to_vec(&create_body).unwrap(), &store, &cfg);
+        assert_eq!(status, 400);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err = v["error"].as_str().unwrap();
+        assert!(err.contains("hidden"), "error should mention 'hidden': {}", err);
     }
 }

@@ -1973,3 +1973,137 @@ Do not modify: anything else.
 - Deviation: Used `CARGO_MANIFEST_DIR` + `PROFILE` env var to locate the `agent` binary instead of `env!("CARGO_BIN_EXE_agent")` (which would require `agent` as a dev-dependency of `agent-worker`, creating a circular dependency since `agent` already depends on `agent-worker`)
 - Deviation: Used runtime env var check (`AGENT_TEST_STUB=1`) rather than `#[cfg(feature = "test-stub")]` feature gate; both approaches are called out as valid in the spec; the env var approach avoids feature flag propagation across crate boundaries
 - Verified: `cargo test --workspace` → 107 passed, 0 failed; `cargo clippy --workspace` → no new warnings
+
+---
+
+### Step 11 — Post-review bug fixes
+
+- [x] done
+
+**Goal:** Fix three real bugs surfaced by post-implementation review. Each
+is small and localized; tests must catch the regression for each.
+
+**Spec details:**
+
+#### Fix 1 — `validate_repo_path` ignores default `sandbox.defaults.hide`
+
+File: `agent-server/src/routes.rs`, function `handle_create_tree`.
+
+Current call (line ~84):
+```rust
+match agent_core::types::validate_repo_path(path, &[], &sandbox) {
+```
+
+The empty slice means the global `[sandbox.defaults] hide` list from
+`config.toml` is ignored — a user creating their first tree with no
+per-tree `sandbox.hide` gets zero protection from defaults. Creating
+`repo_path: "/home/user/.ssh"` would silently succeed.
+
+Change to:
+```rust
+match agent_core::types::validate_repo_path(
+    path,
+    &cfg.sandbox.defaults.hide,
+    &sandbox,
+) {
+```
+
+`handle_create_tree` currently takes `body: &[u8], store: &Store` — extend
+the signature to also accept `cfg: &Config` and plumb it through from
+`dispatch` (which already has `cfg: &Arc<Config>`).
+
+**Test to add (in `routes.rs`):**
+- `test_create_tree_rejects_repo_inside_default_hide` — construct a
+  `Config` whose `sandbox.defaults.hide` contains a real existing
+  directory (use `TempDir` as the "default hide" dir), then POST
+  `/trees` with `repo_path` pointing inside that dir, assert 400 with
+  an "overlaps a hidden directory" error message.
+
+#### Fix 2 — `scan_unterminated` writes an orphaned `SessionEnd`
+
+Files:
+- `agent-server/src/lifecycle.rs`, function `append_synthetic_session_end`
+- `agent-server/src/lib.rs`, the startup loop calling it
+
+Current behaviour: `append_synthetic_session_end` writes a `SessionEnd`
+with `parent_id: None`, and the startup loop never updates
+`meta.leaf_id`. The new entry is therefore disconnected from the tree's
+parent chain — `build_context` walks from `leaf_id` (still pointing at
+the pre-crash leaf) and never visits the synthetic boundary. The
+"force a session boundary on recovery" semantics don't take effect.
+
+Replace `append_synthetic_session_end` with a `recover_tree(store,
+tree_id)` helper that:
+1. Reads `meta.leaf_id` (may be `None` for an empty tree)
+2. Generates the synthetic `SessionEnd` with `parent_id: meta.leaf_id`
+3. Appends it to `data.jsonl`
+4. Updates `meta.leaf_id = Some(new_entry_id)` and saves meta
+5. Calls `store.reset_header_tokens(tree_id)` (the existing helper)
+
+The existing shutdown path in `shutdown_all` also calls
+`append_synthetic_session_end` for SIGKILL'd workers — switch those
+call sites to `recover_tree` too.
+
+**Tests to add/update (in `lifecycle.rs`):**
+- Rename `test_append_synthetic_session_end` to `test_recover_tree_links_chain`
+- After calling `recover_tree`, assert:
+  - last entry is `SessionEnd { status: Aborted, .. }`
+  - `last.parent_id == Some(prev_leaf_id)`
+  - reloaded `meta.leaf_id == Some(last.id)`
+- Add `test_recover_tree_empty_tree` — empty tree (only header, no
+  `session_start`), assert `recover_tree` is a no-op or writes a
+  `SessionEnd` with `parent_id: None` and updates `meta.leaf_id`
+  accordingly (pick whichever is cleaner — empty trees probably
+  shouldn't get a synthetic SessionEnd, just log and skip)
+
+#### Fix 3 — `AgentClient::get_entries` URL is missing `/entries`
+
+File: `agent-cli/src/client.rs`, function `get_entries` (around line 138).
+
+Current:
+```rust
+pub fn get_entries(&self, tree_id: &str) -> Result<Vec<Entry>, String> {
+    self.get_json(&format!("/trees/{}", tree_id))   // wrong URL
+}
+```
+
+Returns a `TreeMeta`-shaped JSON; deserializing as `Vec<Entry>` would
+panic at runtime. The function isn't called from any current code
+path, so the bug is dormant — but it's a landmine.
+
+Two options:
+- **(a)** Fix: change to `format!("/trees/{}/entries", tree_id)`
+- **(b)** Delete: confirm no callers (`cargo build --workspace` after
+  removal stays clean), then remove the method entirely
+
+Pick **(a)** for safety. A future PWA or CLI feature will want this
+endpoint and the existing method name suggests it should work.
+
+**Test to add (in `client.rs`):**
+- `test_get_entries_url` — assert the URL formation. Since the existing
+  tests don't hit a real server, a string-comparison test on the URL
+  builder is fine. If `AgentClient` doesn't expose URL building, add a
+  small `fn entries_url(&self, tree_id: &str) -> String` and assert it
+  returns `format!("{}/trees/{}/entries", self.base, tree_id)`.
+
+#### Do not modify
+
+- `agent.rs`, tools, hooks, provider, store layout, worker, ws.rs, http.rs
+
+#### Verify
+
+- `cargo test --workspace` — 110+ passed (three new tests at minimum)
+- `cargo clippy --workspace` — no new warnings
+- Manual smoke test: start server, create a tree with `repo_path:
+  ~/.ssh`, assert 400. Kill the server with SIGKILL during a session,
+  restart, send a new message to the same tree, assert the LLM context
+  reflects the session boundary (new turn starts fresh, prior turn's
+  state isn't re-replayed).
+
+**Notes:**
+- Modified: `agent-server/src/routes.rs` — Fix 1: `handle_create_tree` now accepts `cfg: &Config` (plumbed from `dispatch`); passes `cfg.sandbox.defaults.hide` to `validate_repo_path` instead of `&[]`; added `test_create_tree_rejects_repo_inside_default_hide` test
+- Modified: `agent-server/src/lifecycle.rs` — Fix 2: replaced `append_synthetic_session_end` with `recover_tree` that reads `meta.leaf_id`, creates a linked `SessionEnd` with `parent_id: meta.leaf_id`, updates `meta.leaf_id`, and calls `store.reset_header_tokens`; empty-tree case skipped (no `leaf_id`) with a log message; updated `shutdown_all` to call `recover_tree` instead; renamed `test_append_synthetic_session_end` to `test_recover_tree_links_chain` and added `test_recover_tree_empty_tree`
+- Modified: `agent-server/src/lib.rs` — Fix 2: startup loop calls `lifecycle::recover_tree` instead of `append_synthetic_session_end` + manual `reset_header_tokens`
+- Modified: `agent-cli/src/client.rs` — Fix 3: `get_entries` uses `self.entries_url(tree_id)` returning `/trees/{id}/entries` instead of `/trees/{id}`; added `entries_url()` helper and `test_get_entries_url` test
+- Deviation: Fix 2's `recover_tree` on an empty tree (no `leaf_id`) skips entirely rather than writing a `SessionEnd` with `parent_id: None` — cleaner and matches the spec's "just log and skip" suggestion
+- Verified: `cargo test --workspace` → 110 passed, 0 failed; `cargo clippy --workspace` → no new warnings_
