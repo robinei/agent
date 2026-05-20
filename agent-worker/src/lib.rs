@@ -7,6 +7,14 @@ use agent_core::rpc::{PipeIn, WsCommand};
 use agent_core::types::{AgentInput, ServerEvent};
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Ensure panics are written to stderr and flushed before the process dies,
+    // so the server's stderr capture can report the cause.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }));
+
     let tree_id = parse_tree_id()?;
 
     let stdin = Arc::new(Mutex::new(BufReader::new(std::io::stdin())));

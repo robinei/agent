@@ -67,6 +67,7 @@ dependencies = [
  "chrono",
  "httparse",
  "log",
+ "mio",
  "serde",
  "serde_json",
  "signal-hook",

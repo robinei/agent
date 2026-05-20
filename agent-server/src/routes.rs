@@ -223,6 +223,8 @@ fn handle_auto_title(id: &str, store: &Store, config: &Config) -> (u16, Vec<u8>,
         config.summary.api_key.clone(),
         config.summary.model.clone(),
         false,
+        "medium".into(),
+        None,
     );
     match agent::auto_title(store, &provider, id) {
         Ok(title) => {

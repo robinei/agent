@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
-use std::os::unix::io::AsFd;
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -380,7 +380,7 @@ fn draw_spinner(out: &mut impl Write, state: &mut RenderState, frame: char) {
     } else {
         state.spinner_added_newline = false;
     }
-    write!(out, "{}", frame).ok();
+    write!(out, "{}{}", style::Reset, frame).ok();
     state.spinner_shown = true;
     out.flush().ok();
 }
@@ -400,6 +400,9 @@ fn erase_spinner(out: &mut impl Write, state: &mut RenderState) {
     } else {
         state.col = 0;
     }
+    if state.in_thinking {
+        write!(out, "{}\x1b[2m", color::Fg(color::LightBlack)).ok();
+    }
     state.spinner_shown = false;
     out.flush().ok();
 }
@@ -409,7 +412,7 @@ fn tick_spinner(out: &mut impl Write, state: &mut RenderState, frame: char) {
     if !state.spinner_shown {
         return;
     }
-    write!(out, "\r\x1b[2K{}", frame).ok();
+    write!(out, "\r\x1b[2K{}{}", style::Reset, frame).ok();
     out.flush().ok();
 }
 
@@ -488,7 +491,8 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
             write_blank_line(out, &mut state.trailing_newlines);
             write!(out, "  ⚙ {}{}{}", style::Bold, tool, style::Reset).ok();
             if !args_str.is_empty() {
-                write!(out, "  {}", args_str).ok();
+                let args_display = args_str.replace('\n', "\r\n");
+                write!(out, "  {}", args_display).ok();
             }
             let c = if *exit == 0 {
                 color::Fg(color::LightBlack).to_string()
@@ -606,6 +610,11 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
             print_warning(out, &format!("Context at {}% ({})", pct, level));
         }
         ServerEvent::Error { message, fatal } => {
+            if state.in_thinking {
+                state.in_thinking = false;
+                write!(out, "{}\r\n", style::Reset).ok();
+                state.col = 0;
+            }
             if *fatal {
                 print_error(out, &format!("Fatal: {}", message));
             } else {
@@ -1225,6 +1234,8 @@ fn process_message(
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let mut session = backend.connect_session(tree_id)?;
+    let ws_fd = session.as_raw_fd().ok_or("no fd on WS socket")?;
+    let stdin_fd = std::io::stdin().as_raw_fd();
     session.set_nonblocking(true)?;
     session.send_message(text)?;
 
@@ -1316,7 +1327,21 @@ fn process_message(
             last_spin = Instant::now();
         }
 
-        std::thread::sleep(Duration::from_millis(20));
+        // Block until WS data arrives or stdin is ready, waking at least once per
+        // spinner frame so the spinner stays smooth. This replaces the former 20ms
+        // sleep; the socket becoming readable is what actually wakes us up when a
+        // token arrives, so display latency drops from up to 20ms to near-zero.
+        // INTENTIONAL: do not remove this poll or replace it with a bare sleep.
+        let elapsed = last_spin.elapsed().as_millis() as u64;
+        let wait_ms = SPINNER_INTERVAL_MS.saturating_sub(elapsed);
+        let timeout = PollTimeout::try_from(wait_ms).unwrap_or(PollTimeout::ZERO);
+        let mut fds = unsafe {
+            [
+                PollFd::new(BorrowedFd::borrow_raw(ws_fd), PollFlags::POLLIN),
+                PollFd::new(BorrowedFd::borrow_raw(stdin_fd), PollFlags::POLLIN),
+            ]
+        };
+        let _ = poll(&mut fds, timeout);
     }
     Ok(())
 }

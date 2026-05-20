@@ -224,10 +224,10 @@ fn execute_tool(tools: &[Box<dyn Tool>], name: &str, args: &serde_json::Value, s
 
 fn format_tool_output(output: &ToolOutput) -> String {
     if output.truncated {
-        let len = output.content.len().min(2000);
+        let preview: String = output.content.chars().take(2000).collect();
         format!(
             "{}\n\n(Output truncated: was {} bytes)",
-            &output.content[..len], output.original_size
+            preview, output.original_size
         )
     } else {
         output.content.clone()
@@ -236,8 +236,8 @@ fn format_tool_output(output: &ToolOutput) -> String {
 
 fn preview_tool_output(output: &ToolOutput) -> String {
     if output.truncated {
-        let len = output.content.len().min(2000);
-        format!("{}... (truncated, was {} bytes)", &output.content[..len], output.original_size)
+        let preview: String = output.content.chars().take(2000).collect();
+        format!("{}... (truncated, was {} bytes)", preview, output.original_size)
     } else {
         output.content.clone()
     }
@@ -336,11 +336,13 @@ fn write_session_end(
     emit(ServerEvent::Entry(entry));
 }
 
-fn truncate_for_log(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
+fn truncate_for_log(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", truncated)
     } else {
-        format!("{}...", &s[..max_len])
+        truncated
     }
 }
 
@@ -642,7 +644,7 @@ pub fn run_agent<P, I, E>(
                 // Debug: log raw SSE lines from the LLM provider
                 let trimmed_line = line.trim();
                 if !trimmed_line.is_empty() && !trimmed_line.starts_with(':') {
-                    info!("SSE raw: {}", &trimmed_line[..trimmed_line.len().min(500)]);
+                    info!("SSE raw: {}", trimmed_line.chars().take(500).collect::<String>());
                 }
 
                 // Skip SSE event separators (blank lines) and comment lines

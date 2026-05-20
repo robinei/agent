@@ -230,6 +230,15 @@ impl AgentSession {
         }
     }
 
+    /// Expose the underlying raw file descriptor for polling.
+    pub fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        match self.ws.get_ref() {
+            MaybeTlsStream::Plain(tcp) => Some(tcp.as_raw_fd()),
+            _ => None,
+        }
+    }
+
     /// Send a user message to the agent.
     pub fn send_message(&mut self, text: &str) -> Result<(), String> {
         let cmd = agent_core::rpc::WsCommand::Message {

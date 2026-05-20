@@ -136,6 +136,8 @@ let mut meta = meta;
             self.config.summary.api_key.clone(),
             self.config.summary.model.clone(),
             false,
+            "medium".into(),
+            None,
         );
         agent_core::agent::auto_title(&self.store, &provider, tree_id)
     }

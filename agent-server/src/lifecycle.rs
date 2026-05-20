@@ -17,10 +17,15 @@ type StderrBuf = Arc<Mutex<VecDeque<String>>>;
 
 // ── Worker subprocess lifecycle ──
 
+pub struct Subscriber {
+    pub tx: mpsc::Sender<ServerEvent>,
+    pub waker: mio::Waker,
+}
+
 pub struct WorkerEntry {
     pub stdin_tx: mpsc::Sender<String>,
     pub event_buffer: VecDeque<ServerEvent>,
-    pub subscribers: Vec<mpsc::Sender<ServerEvent>>,
+    pub subscribers: Vec<Subscriber>,
     pub pid: u32,
     pub child: Option<Child>,
 }
@@ -40,7 +45,13 @@ pub fn broadcast_meta_update(tree_id: &str, title: Option<String>) {
     };
     let ev = ServerEvent::MetaUpdate { title };
     let mut guard = entry.lock().unwrap();
-    guard.subscribers.retain(|tx| tx.send(ev.clone()).is_ok());
+    guard.subscribers.retain(|s| {
+        let ok = s.tx.send(ev.clone()).is_ok();
+        if ok {
+            let _ = s.waker.wake();
+        }
+        ok
+    });
 }
 
 pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Result<(), String> {
@@ -71,46 +82,19 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
         .map_err(|e| format!("get_tree: {e}"))?
         .ok_or_else(|| format!("tree {} not found", tree_id))?;
 
-    // The worker receives its config via PipeIn::Config as the first message on
-    // stdin, so no filesystem config file with API keys is needed.
-
-    let mut child = if cfg.sandbox.enabled {
-        let bwrap_path = resolve_bwrap_path(&cfg.sandbox.bwrap_path)?;
-        let bwrap_args = build_bwrap_argv(&exe, tree_id, &meta, &cfg);
-        Command::new(&bwrap_path)
-            .args(&bwrap_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn bwrap worker: {e}"))?
-    } else {
-        Command::new(&exe)
-            .arg("worker")
-            .arg("--tree-id")
-            .arg(tree_id)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn worker: {e}"))?
-    };
-
-    let pid = child.id();
-    let stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
     let (stdin_tx, stdin_rx) = mpsc::channel::<String>();
 
     let entry = Arc::new(Mutex::new(WorkerEntry {
         stdin_tx: stdin_tx.clone(),
         event_buffer: VecDeque::with_capacity(BUFFER_CAPACITY),
         subscribers: Vec::new(),
-        pid,
-        child: Some(child),
+        pid: 0,
+        child: None,
     }));
 
-    // Send worker config as the first message on stdin
+    // Send worker config as the first message on stdin.
+    // The worker receives its config via PipeIn::Config as the first message on
+    // stdin, so no filesystem config file with API keys is needed.
     let worker_cfg = agent_core::rpc::WorkerConfig {
         session_soft_cap_pct: cfg.session.soft_cap_pct,
         session_hard_cap_pct: cfg.session.hard_cap_pct,
@@ -129,14 +113,109 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
 
     let stderr_buf: StderrBuf = Arc::new(Mutex::new(VecDeque::with_capacity(20)));
 
-    log::info!(
-        "[lifecycle] Spawned worker for tree {} (pid {}) model={} thinking={}",
-        tree_id, pid, cfg.provider.model, cfg.provider.enable_thinking
-    );
-    spawn_stdin_writer(stdin, stdin_rx);
-    spawn_stdout_proxy(tree_id.to_string(), stdout, entry.clone(), store, cfg, stderr_buf.clone());
-    spawn_stderr_demux(tree_id.to_string(), stderr, stderr_buf);
-    Ok(())
+    // Rendezvous: keeper thread sends Ok(()) once the subprocess is live (or an
+    // error) so spawn_worker can return a meaningful result to the caller.
+    let (spawn_tx, spawn_rx) = mpsc::sync_channel::<Result<(), String>>(0);
+
+    let tree_id_str = tree_id.to_string();
+    std::thread::spawn({
+        let entry = entry.clone();
+        let cfg = cfg.clone();
+        let store = store.clone();
+        let stderr_buf = stderr_buf.clone();
+        move || {
+            // IMPORTANT: bwrap calls prctl(PR_SET_PDEATHSIG, SIGKILL) on itself,
+            // so bwrap is killed when its parent *thread* exits. By spawning bwrap
+            // here and then running the stdout proxy inline (blocking until the
+            // worker exits), this thread outlives the worker — preventing the
+            // per-turn handle_connection thread (which exits after each turn) from
+            // being bwrap's parent and inadvertently killing the worker mid-stream.
+            let mut child = if cfg.sandbox.enabled {
+                let bwrap_path = match resolve_bwrap_path(&cfg.sandbox.bwrap_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        ACTIVE_WORKERS.lock().unwrap().remove(&tree_id_str);
+                        let _ = spawn_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let bwrap_args = build_bwrap_argv(&exe, &tree_id_str, &meta, &cfg);
+                match Command::new(&bwrap_path)
+                    .args(&bwrap_args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        ACTIVE_WORKERS.lock().unwrap().remove(&tree_id_str);
+                        let _ = spawn_tx.send(Err(format!("spawn bwrap worker: {e}")));
+                        return;
+                    }
+                }
+            } else {
+                match Command::new(&exe)
+                    .arg("worker")
+                    .arg("--tree-id")
+                    .arg(&tree_id_str)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        ACTIVE_WORKERS.lock().unwrap().remove(&tree_id_str);
+                        let _ = spawn_tx.send(Err(format!("spawn worker: {e}")));
+                        return;
+                    }
+                }
+            };
+
+            let pid = child.id();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+
+            {
+                let mut g = entry.lock().unwrap();
+                g.pid = pid;
+                g.child = Some(child);
+            }
+
+            log::info!(
+                "[lifecycle] Spawned worker for tree {} (pid {}) model={} thinking={}",
+                tree_id_str,
+                pid,
+                cfg.provider.model,
+                cfg.provider.enable_thinking
+            );
+
+            // Unblock spawn_worker now that the process is live.
+            let _ = spawn_tx.send(Ok(()));
+
+            spawn_stdin_writer(stdin, stdin_rx);
+            let stderr_join = spawn_stderr_demux(tree_id_str.clone(), stderr, stderr_buf.clone());
+
+            // Run the proxy inline — this keeps the current thread alive until the
+            // worker exits, which is what we need for bwrap's PDEATHSIG to work correctly.
+            run_stdout_proxy(
+                tree_id_str,
+                stdout,
+                entry,
+                store,
+                cfg,
+                stderr_buf,
+                stderr_join,
+            );
+        }
+    });
+
+    match spawn_rx.recv() {
+        Ok(result) => result,
+        Err(_) => Err("worker keeper thread exited without signaling".into()),
+    }
 }
 
 fn resolve_bwrap_path(hint: &Option<std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
@@ -172,12 +251,7 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
     })
 }
 
-pub fn build_bwrap_argv(
-    exe: &Path,
-    tree_id: &str,
-    meta: &TreeMeta,
-    cfg: &Config,
-) -> Vec<OsString> {
+pub fn build_bwrap_argv(exe: &Path, tree_id: &str, meta: &TreeMeta, cfg: &Config) -> Vec<OsString> {
     let store_dir = agent_core::config::agent_dir().join("trees").join(tree_id);
 
     let mut args: Vec<OsString> = Vec::new();
@@ -193,7 +267,11 @@ pub fn build_bwrap_argv(
     if let Some(repo) = &meta.repo_path {
         args.extend(["--bind".into(), repo.clone().into(), repo.clone().into()]);
     }
-    args.extend(["--ro-bind".into(), exe.to_path_buf().into(), exe.to_path_buf().into()]);
+    args.extend([
+        "--ro-bind".into(),
+        exe.to_path_buf().into(),
+        exe.to_path_buf().into(),
+    ]);
 
     // Per-tree extra writables
     for p in &meta.sandbox.writable {
@@ -250,12 +328,12 @@ pub fn build_bwrap_argv(
 }
 
 pub fn worker_send_command(tree_id: &str, json_line: &str) -> Result<(), String> {
-    let entry = worker_get(tree_id).ok_or_else(|| format!("No active worker for tree {}", tree_id))?;
-    let cmd: agent_core::rpc::WsCommand = serde_json::from_str(json_line)
-        .map_err(|e| format!("Invalid command JSON: {}", e))?;
+    let entry =
+        worker_get(tree_id).ok_or_else(|| format!("No active worker for tree {}", tree_id))?;
+    let cmd: agent_core::rpc::WsCommand =
+        serde_json::from_str(json_line).map_err(|e| format!("Invalid command JSON: {}", e))?;
     let pipe_in = agent_core::rpc::PipeIn::Cmd(cmd);
-    let json = serde_json::to_string(&pipe_in)
-        .map_err(|e| format!("Serialize PipeIn: {}", e))?;
+    let json = serde_json::to_string(&pipe_in).map_err(|e| format!("Serialize PipeIn: {}", e))?;
     let guard = entry.lock().unwrap();
     guard
         .stdin_tx
@@ -269,12 +347,13 @@ pub fn worker_stop(tree_id: &str) -> Result<(), String> {
 
 pub fn worker_subscribe(
     tree_id: &str,
+    waker: mio::Waker,
 ) -> Option<(Vec<ServerEvent>, mpsc::Receiver<ServerEvent>)> {
     let entry = worker_get(tree_id)?;
     let mut guard = entry.lock().unwrap();
     let snapshot: Vec<ServerEvent> = guard.event_buffer.iter().cloned().collect();
     let (tx, rx) = mpsc::channel();
-    guard.subscribers.push(tx);
+    guard.subscribers.push(Subscriber { tx, waker });
     Some((snapshot, rx))
 }
 
@@ -291,124 +370,166 @@ fn spawn_stdin_writer(mut stdin: ChildStdin, rx: mpsc::Receiver<String>) {
     });
 }
 
-fn spawn_stdout_proxy(
+fn run_stdout_proxy(
     tree_id: String,
     stdout: ChildStdout,
     entry: Arc<Mutex<WorkerEntry>>,
     store: Arc<Store>,
     cfg: Arc<Config>,
     stderr_buf: StderrBuf,
+    stderr_join: std::thread::JoinHandle<()>,
 ) {
-    std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            match reader.read_line(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let pipe_out: PipeOut = match serde_json::from_str(buf.trim_end()) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[proxy {}] bad PipeOut JSON: {}", tree_id, e);
+                continue;
             }
-            let pipe_out: PipeOut = match serde_json::from_str(buf.trim_end()) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::warn!("[proxy {}] bad PipeOut JSON: {}", tree_id, e);
-                    continue;
-                }
-            };
-            match pipe_out {
-                PipeOut::Event(event) => {
-                    let mut guard = entry.lock().unwrap();
-                    if matches!(event, ServerEvent::Entry(_)) {
-                        if guard.event_buffer.len() >= BUFFER_CAPACITY {
-                            guard.event_buffer.pop_front();
-                        }
-                        guard.event_buffer.push_back(event.clone());
+        };
+        match pipe_out {
+            PipeOut::Event(event) => {
+                let mut guard = entry.lock().unwrap();
+                if matches!(event, ServerEvent::Entry(_)) {
+                    if guard.event_buffer.len() >= BUFFER_CAPACITY {
+                        guard.event_buffer.pop_front();
                     }
-                    guard.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+                    guard.event_buffer.push_back(event.clone());
+                }
+                guard.subscribers.retain(|s| {
+                    let ok = s.tx.send(event.clone()).is_ok();
+                    if ok {
+                        let _ = s.waker.wake();
+                    }
+                    ok
+                });
 
-                    // Auto-title: if a Done event arrives on a tree without a title,
-                    // spawn a side thread to generate one.
-                    if matches!(event, ServerEvent::Done { .. }) {
-                        let store_for_title = store.clone();
-                        let cfg_for_title = cfg.clone();
-                        let entry_for_title = entry.clone();
-                        let tid = tree_id.clone();
-                        std::thread::spawn(move || {
-                            let needs = match store_for_title.get_tree(&tid) {
-                                Ok(Some(m)) => m.title.is_none(),
-                                _ => false,
-                            };
-                            if !needs { return; }
-                            let provider = Provider::new(
-                                cfg_for_title.summary.base_url.clone(),
-                                cfg_for_title.summary.api_key.clone(),
-                                cfg_for_title.summary.model.clone(),
-                                false,
-                            );
-                            match agent_core::agent::auto_title(&store_for_title, &provider, &tid) {
-                                Ok(title) => {
-                                    let ev = ServerEvent::MetaUpdate { title: Some(title) };
-                                    let mut g = entry_for_title.lock().unwrap();
-                                    g.subscribers.retain(|tx| tx.send(ev.clone()).is_ok());
-                                }
-                                Err(e) => log::warn!("[auto-title {}] {}", tid, e),
-                            }
-                        });
-                    }
-                }
-                PipeOut::Llm(req) => {
-                    let entry_for_llm = entry.clone();
-                    let cfg_for_llm = cfg.clone();
+                // Auto-title: if a Done event arrives on a tree without a title,
+                // spawn a side thread to generate one.
+                if matches!(event, ServerEvent::Done { .. }) {
+                    let store_for_title = store.clone();
+                    let cfg_for_title = cfg.clone();
+                    let entry_for_title = entry.clone();
+                    let tid = tree_id.clone();
                     std::thread::spawn(move || {
-                        handle_llm_request(req, &entry_for_llm, &cfg_for_llm);
+                        let needs = match store_for_title.get_tree(&tid) {
+                            Ok(Some(m)) => m.title.is_none(),
+                            _ => false,
+                        };
+                        if !needs {
+                            return;
+                        }
+                        let provider = Provider::new(
+                            cfg_for_title.summary.base_url.clone(),
+                            cfg_for_title.summary.api_key.clone(),
+                            cfg_for_title.summary.model.clone(),
+                            false,
+                            "medium".into(),
+                            None,
+                        );
+                        match agent_core::agent::auto_title(&store_for_title, &provider, &tid) {
+                            Ok(title) => {
+                                let ev = ServerEvent::MetaUpdate { title: Some(title) };
+                                let mut g = entry_for_title.lock().unwrap();
+                                g.subscribers.retain(|s| {
+                                    let ok = s.tx.send(ev.clone()).is_ok();
+                                    if ok {
+                                        let _ = s.waker.wake();
+                                    }
+                                    ok
+                                });
+                            }
+                            Err(e) => log::warn!("[auto-title {}] {}", tid, e),
+                        }
                     });
                 }
             }
+            PipeOut::Llm(req) => {
+                let entry_for_llm = entry.clone();
+                let cfg_for_llm = cfg.clone();
+                std::thread::spawn(move || {
+                    handle_llm_request(req, &entry_for_llm, &cfg_for_llm);
+                });
+            }
         }
-        log::info!("[proxy {}] worker stdout closed", tree_id);
+    }
+    log::info!("[proxy {}] worker stdout closed", tree_id);
 
-        // Crash detection: check child exit status
-        let exit_ok = {
-            let mut guard = entry.lock().unwrap();
-            if let Some(mut child) = guard.child.take() {
-                let status = child.wait().ok();
-                matches!(status, Some(s) if s.success())
+    // Crash detection: check child exit status
+    let (exit_ok, exit_desc) = {
+        let mut guard = entry.lock().unwrap();
+        if let Some(mut child) = guard.child.take() {
+            match child.wait() {
+                Ok(status) if status.success() => (true, String::new()),
+                Ok(status) => {
+                    use std::os::unix::process::ExitStatusExt;
+                    let desc = if let Some(code) = status.code() {
+                        format!(" (exit code {})", code)
+                    } else if let Some(sig) = status.signal() {
+                        format!(" (killed by signal {})", sig)
+                    } else {
+                        String::new()
+                    };
+                    (false, desc)
+                }
+                Err(e) => (false, format!(" (wait error: {})", e)),
+            }
+        } else {
+            (true, String::new())
+        }
+    };
+
+    // Join the stderr demux thread before reading its buffer — eliminates the
+    // race where child.wait() returns before the demux thread has drained the pipe.
+    let _ = stderr_join.join();
+
+    if !exit_ok {
+        log::warn!("[proxy {}] worker exited with error{}", tree_id, exit_desc);
+        let detail = {
+            let g = stderr_buf.lock().unwrap();
+            if g.is_empty() {
+                String::new()
             } else {
-                true
+                format!("\n{}", g.iter().cloned().collect::<Vec<_>>().join("\n"))
             }
         };
+        let err_event = ServerEvent::Error {
+            message: format!("worker exited unexpectedly{}{}", exit_desc, detail),
+            fatal: true,
+        };
+        let done_event = ServerEvent::Done {
+            status: "aborted".into(),
+        };
+        let mut guard = entry.lock().unwrap();
+        guard.subscribers.retain(|s| {
+            let ok = s.tx.send(err_event.clone()).is_ok();
+            if ok {
+                let _ = s.waker.wake();
+            }
+            ok
+        });
+        guard.subscribers.retain(|s| {
+            let ok = s.tx.send(done_event.clone()).is_ok();
+            if ok {
+                let _ = s.waker.wake();
+            }
+            ok
+        });
+    }
 
-        if !exit_ok {
-            log::warn!("[proxy {}] worker exited with error", tree_id);
-            let detail = {
-                let g = stderr_buf.lock().unwrap();
-                if g.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n{}", g.iter().cloned().collect::<Vec<_>>().join("\n"))
-                }
-            };
-            let err_event = ServerEvent::Error {
-                message: format!("worker exited unexpectedly{}", detail),
-                fatal: true,
-            };
-            let done_event = ServerEvent::Done { status: "aborted".into() };
-            let mut guard = entry.lock().unwrap();
-            guard.subscribers.retain(|tx| tx.send(err_event.clone()).is_ok());
-            guard.subscribers.retain(|tx| tx.send(done_event.clone()).is_ok());
-        }
-
-        ACTIVE_WORKERS.lock().unwrap().remove(&tree_id);
-    });
+    ACTIVE_WORKERS.lock().unwrap().remove(&tree_id);
 }
 
 /// Handle an LlmRequest from the worker by making the actual HTTP call and
 /// streaming LlmResponse::Chunk / Done / Error back to the worker's stdin.
-fn handle_llm_request(
-    req: LlmRequest,
-    entry: &Arc<Mutex<WorkerEntry>>,
-    cfg: &Config,
-) {
+fn handle_llm_request(req: LlmRequest, entry: &Arc<Mutex<WorkerEntry>>, cfg: &Config) {
     // AGENT_TEST_STUB: return canned SSE data without a real HTTP call.
     // INTENTIONAL: this env var is only set in the test harness so the same
     // binary handles both test and production. DO NOT remove this check —
@@ -441,6 +562,8 @@ fn handle_llm_request(
         cfg.provider.api_key.clone(),
         cfg.provider.model.clone(),
         cfg.provider.enable_thinking,
+        cfg.provider.reasoning_effort.clone(),
+        cfg.provider.max_tokens,
     );
     match provider.stream_chat(&req.messages, &req.tools) {
         Ok(mut stream) => {
@@ -470,7 +593,11 @@ fn handle_llm_request(
     }
 }
 
-fn spawn_stderr_demux(tree_id: String, stderr: ChildStderr, buf: StderrBuf) {
+fn spawn_stderr_demux(
+    tree_id: String,
+    stderr: ChildStderr,
+    buf: StderrBuf,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(stderr);
         let mut line = String::new();
@@ -490,7 +617,7 @@ fn spawn_stderr_demux(tree_id: String, stderr: ChildStderr, buf: StderrBuf) {
                 }
             }
         }
-    });
+    })
 }
 
 // ── Graceful shutdown ──
@@ -502,18 +629,28 @@ pub fn recover_tree(store: &Store, tree_id: &str) {
     let meta = match store.get_tree(tree_id) {
         Ok(Some(m)) => m,
         Ok(None) => {
-            log::warn!("[lifecycle] recover_tree: tree {} not found, skipping", tree_id);
+            log::warn!(
+                "[lifecycle] recover_tree: tree {} not found, skipping",
+                tree_id
+            );
             return;
         }
         Err(e) => {
-            log::error!("[lifecycle] recover_tree: failed to read meta for {}: {}", tree_id, e);
+            log::error!(
+                "[lifecycle] recover_tree: failed to read meta for {}: {}",
+                tree_id,
+                e
+            );
             return;
         }
     };
 
     let parent_id = meta.leaf_id.clone();
     if parent_id.is_none() {
-        log::info!("[lifecycle] recover_tree: tree {} has no leaf_id, nothing to recover", tree_id);
+        log::info!(
+            "[lifecycle] recover_tree: tree {} has no leaf_id, nothing to recover",
+            tree_id
+        );
         return;
     }
 
@@ -527,7 +664,11 @@ pub fn recover_tree(store: &Store, tree_id: &str) {
         continuation_brief: None,
     };
     if let Err(e) = store.append_entry(tree_id, &entry) {
-        log::error!("[lifecycle] recover_tree: append session_end for {}: {}", tree_id, e);
+        log::error!(
+            "[lifecycle] recover_tree: append session_end for {}: {}",
+            tree_id,
+            e
+        );
         return;
     }
 
@@ -648,7 +789,9 @@ mod tests {
             .insert(tree_id.to_string(), entry.clone());
 
         // Subscribe — gets snapshot + live rx
-        let (snapshot, rx) = worker_subscribe(tree_id).unwrap();
+        let poll = mio::Poll::new().unwrap();
+        let waker = mio::Waker::new(poll.registry(), mio::Token(1)).unwrap();
+        let (snapshot, rx) = worker_subscribe(tree_id, waker).unwrap();
         assert_eq!(snapshot.len(), 1);
 
         // Append event while subscriber is live
@@ -660,7 +803,7 @@ mod tests {
         {
             let mut g = entry.lock().unwrap();
             g.event_buffer.push_back(e2.clone());
-            g.subscribers.retain(|tx| tx.send(e2.clone()).is_ok());
+            g.subscribers.retain(|s| s.tx.send(e2.clone()).is_ok());
         }
 
         // Live subscriber should receive it
@@ -695,19 +838,35 @@ mod tests {
         };
         store.save_tree_meta(&meta).unwrap();
 
-        store.append_entry(tree_id, &Entry::SessionStart {
-            id: start_id.clone(), parent_id: None, timestamp: "t1".into(),
-        }).unwrap();
+        store
+            .append_entry(
+                tree_id,
+                &Entry::SessionStart {
+                    id: start_id.clone(),
+                    parent_id: None,
+                    timestamp: "t1".into(),
+                },
+            )
+            .unwrap();
 
         recover_tree(&store, tree_id);
 
         let entries = store.read_all_entries(tree_id).unwrap();
         let last = entries.last().unwrap();
         match last {
-            Entry::SessionEnd { status, summary, parent_id, .. } => {
+            Entry::SessionEnd {
+                status,
+                summary,
+                parent_id,
+                ..
+            } => {
                 assert_eq!(*status, SessionStatus::Aborted);
                 assert!(summary.as_deref().unwrap_or("").contains("aborted"));
-                assert_eq!(*parent_id, Some(start_id.clone()), "parent_id must link to leaf_id");
+                assert_eq!(
+                    *parent_id,
+                    Some(start_id.clone()),
+                    "parent_id must link to leaf_id"
+                );
             }
             other => panic!("expected SessionEnd, got {:?}", other),
         }
@@ -744,7 +903,10 @@ mod tests {
         recover_tree(&store, tree_id);
 
         let entries = store.read_all_entries(tree_id).unwrap();
-        assert!(entries.is_empty(), "empty tree should have no entries after recover");
+        assert!(
+            entries.is_empty(),
+            "empty tree should have no entries after recover"
+        );
     }
 
     #[test]
@@ -764,14 +926,18 @@ mod tests {
             .insert(tree_id.to_string(), entry.clone());
 
         // Subscribe to receive events
-        let (_snapshot, rx) = worker_subscribe(tree_id).unwrap();
+        let poll = mio::Poll::new().unwrap();
+        let waker = mio::Waker::new(poll.registry(), mio::Token(1)).unwrap();
+        let (_snapshot, rx) = worker_subscribe(tree_id, waker).unwrap();
 
         // Broadcast a meta update
         broadcast_meta_update(tree_id, Some("Generated Title".into()));
 
         // Verify the subscriber received it
         let received = rx.recv().unwrap();
-        assert!(matches!(&received, ServerEvent::MetaUpdate { title: Some(t) } if t == "Generated Title"));
+        assert!(
+            matches!(&received, ServerEvent::MetaUpdate { title: Some(t) } if t == "Generated Title")
+        );
 
         // Cleanup
         ACTIVE_WORKERS.lock().unwrap().remove(tree_id);
@@ -906,7 +1072,8 @@ mod tests {
         let aws_dir = PathBuf::from(&home).join(".aws");
 
         // Count --tmpfs that match the unhide'd path
-        let ssh_tmpfs_count = args.windows(2)
+        let ssh_tmpfs_count = args
+            .windows(2)
             .filter(|w| w[0] == OsString::from("--tmpfs"))
             .filter(|w| w[1] == OsString::from(ssh_dir.clone().into_os_string()))
             .count();
@@ -914,11 +1081,15 @@ mod tests {
 
         // If ~/.aws exists, it should have a --tmpfs
         if aws_dir.exists() {
-            let aws_tmpfs_count = args.windows(2)
+            let aws_tmpfs_count = args
+                .windows(2)
                 .filter(|w| w[0] == OsString::from("--tmpfs"))
                 .filter(|w| w[1] == OsString::from(aws_dir.clone().into_os_string()))
                 .count();
-            assert_eq!(aws_tmpfs_count, 1, "~/.aws should be tmpfs'd (still hidden)");
+            assert_eq!(
+                aws_tmpfs_count, 1,
+                "~/.aws should be tmpfs'd (still hidden)"
+            );
         }
     }
 
@@ -956,22 +1127,28 @@ mod tests {
         let args = build_bwrap_argv(exe, tree_id, &meta, &cfg);
 
         // The file should appear as --bind /dev/null <file_path>
-        let file_bind_count = args.windows(3)
+        let file_bind_count = args
+            .windows(3)
             .filter(|w| w[0] == OsString::from("--bind"))
             .filter(|w| w[1] == OsString::from("/dev/null"))
             .filter(|w| w[2] == OsString::from(file_path.clone().into_os_string()))
             .count();
-        assert_eq!(file_bind_count, 1, "file should be bound from /dev/null, not tmpfs'd");
+        assert_eq!(
+            file_bind_count, 1,
+            "file should be bound from /dev/null, not tmpfs'd"
+        );
 
         // The directory should appear as --tmpfs <dir_path>
-        let dir_tmpfs_count = args.windows(2)
+        let dir_tmpfs_count = args
+            .windows(2)
             .filter(|w| w[0] == OsString::from("--tmpfs"))
             .filter(|w| w[1] == OsString::from(dir_path.clone().into_os_string()))
             .count();
         assert_eq!(dir_tmpfs_count, 1, "directory should be tmpfs'd");
 
         // The file must NOT appear as --tmpfs
-        let file_tmpfs_count = args.windows(2)
+        let file_tmpfs_count = args
+            .windows(2)
             .filter(|w| w[0] == OsString::from("--tmpfs"))
             .filter(|w| w[1] == OsString::from(file_path.clone().into_os_string()))
             .count();

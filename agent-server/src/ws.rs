@@ -7,6 +7,9 @@ use agent_core::config::Config;
 use agent_core::store::Store;
 use tungstenite::Message;
 
+const STREAM_TOKEN: mio::Token = mio::Token(0);
+const WAKER_TOKEN: mio::Token = mio::Token(1);
+
 pub fn accept(
     mut stream: TcpStream,
     path: &str,
@@ -77,7 +80,16 @@ pub fn accept(
         }
     }
 
-    let Some((catch_up, rx)) = crate::lifecycle::worker_subscribe(&tree_id) else {
+    let poll = match mio::Poll::new() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let waker = match mio::Waker::new(poll.registry(), WAKER_TOKEN) {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+
+    let Some((catch_up, rx)) = crate::lifecycle::worker_subscribe(&tree_id, waker) else {
         return;
     };
     for ev in catch_up {
@@ -88,18 +100,40 @@ pub fn accept(
         }
     }
 
-    run_session(tree_id, ws, rx);
+    run_session(tree_id, ws, rx, poll);
 }
 
 fn run_session(
     tree_id: String,
     mut ws: tungstenite::WebSocket<TcpStream>,
     rx: std::sync::mpsc::Receiver<agent_core::types::ServerEvent>,
+    mut poll: mio::Poll,
 ) {
+    use std::os::unix::io::AsRawFd;
+
+    let raw_fd = ws.get_ref().as_raw_fd();
+    let mut source = mio::unix::SourceFd(&raw_fd);
+    if poll.registry()
+        .register(&mut source, STREAM_TOKEN, mio::Interest::READABLE)
+        .is_err()
+    {
+        return;
+    }
+
+    let mut events = mio::Events::with_capacity(8);
     let mut last_ping = Instant::now();
     let mut last_pong = Instant::now();
 
     loop {
+        // Block until: WS data ready, waker signalled, or next keepalive due.
+        let timeout = Duration::from_secs(30)
+            .checked_sub(last_ping.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if poll.poll(&mut events, Some(timeout)).is_err() {
+            break;
+        }
+
+        // Drain inbound WS messages.
         match ws.read() {
             Ok(Message::Text(s)) => {
                 let _ = crate::lifecycle::worker_send_command(&tree_id, &s);
@@ -114,6 +148,7 @@ fn run_session(
             Err(_) => break,
         }
 
+        // Drain outbound events.
         while let Ok(ev) = rx.try_recv() {
             if let Ok(s) = serde_json::to_string(&ev) {
                 if ws.send(Message::Text(s)).is_err() {
@@ -133,15 +168,10 @@ fn run_session(
             break;
         }
 
-        // INTENTIONAL: 10ms sets the latency floor for both inbound commands
-        // and outbound event delivery. For personal-use traffic (a handful of
-        // concurrent WS, LLM chunks arriving every 10–30ms anyway) this is
-        // invisible and costs ~negligible CPU. DO NOT replace with
-        // `Thread::yield_now()` (burns a core) or remove (burns harder) or
-        // shorten without measuring. The architecturally clean alternative is
-        // edge-triggered I/O via mio + an eventfd written by the proxy thread
-        // on broadcast — only worth it past ~100 concurrent sessions.
-        std::thread::sleep(Duration::from_millis(10));
+        // INTENTIONAL: no sleep here. mio::Poll above blocks until the WS
+        // socket is readable or waker.wake() is called by the broadcast path.
+        // The timeout drives the keepalive interval. This replaces the former
+        // 10ms sleep; removing the sleep is the whole point of this step.
     }
 }
 

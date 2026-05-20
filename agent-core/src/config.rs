@@ -34,10 +34,17 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
-    /// Send `thinking: {type: "enabled"}` and `reasoning_effort: "high"` in
-    /// the request body. Required for DeepSeek and some other providers to
-    /// emit reasoning content. Has no effect on models that don't support it.
+    /// Send `thinking: {type: "enabled"}` in the request body. Required for
+    /// DeepSeek and some other providers to emit reasoning content. Has no
+    /// effect on models that don't support it.
     pub enable_thinking: bool,
+    /// Value for the `reasoning_effort` field when `enable_thinking` is true.
+    /// Maps to DeepSeek's reasoning_effort; typical values: "low", "medium", "high".
+    /// Defaults to "medium".
+    pub reasoning_effort: String,
+    /// If set, sent as `max_tokens` in the request body. Leave unset to use
+    /// the provider's default.
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +80,8 @@ impl Default for Config {
                 api_key: String::new(),
                 model: "qwen2.5-coder-7b-instruct".into(),
                 enable_thinking: true,
+                reasoning_effort: "medium".into(),
+                max_tokens: None,
             },
             summary: SummaryConfig {
                 model: "qwen2.5-coder-1.5b-instruct".into(),
@@ -207,6 +216,12 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
         }
         if let Some(v) = section.get("enable_thinking").and_then(|v| v.as_bool()) {
             cfg.provider.enable_thinking = v;
+        }
+        if let Some(v) = section.get("reasoning_effort").and_then(|v| v.as_str()) {
+            cfg.provider.reasoning_effort = v.to_string();
+        }
+        if let Some(v) = section.get("max_tokens").and_then(|v| v.as_integer()) {
+            cfg.provider.max_tokens = Some(v as u32);
         }
     }
 

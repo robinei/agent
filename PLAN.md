@@ -6,29 +6,31 @@ Steps for ongoing work on the agent server. Architecture overview and
 
 ---
 
-## Step template
+## Future ideas
 
-```
-### <Name>
+Small things worth doing eventually; promote to a step when picked up.
 
-- [ ] todo / - [x] done
-
-**Goal:** one or two sentences.
-
-**Spec details:** file paths, signatures, tests, do-not-modify list.
-
-**Verify:** commands that prove it works.
-```
-
-On completion: delete this entry, then commit code + PLAN.md together with:
-
-```
-<crate/area>: <brief title>
-
-<what was built, 1-2 sentences>
-
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
-```
+- **File-change awareness.** Watch the repo directory with the `notify` crate.
+  Track files the agent reads each turn; before the next LLM call, inject a
+  system message listing any of those files that were modified externally.
+  Same event stream can later push `FileChanged` events to a PWA. The
+  `ServerEvent::FileChanged { path, kind }` variant already exists for this.
+- **Queued input while the agent is working.** Buffer user input typed during
+  streaming; flush on Enter as a pending message that sends once the current
+  turn ends. (Cancellation covers the immediate-stop case; this is the
+  friendlier "I have a follow-up" case.)
+- **5xx retry with exponential backoff** in the provider client. Currently any
+  provider error is fatal; three retries on transient 5xx would smooth over
+  flaky upstream.
+- **Turn timeout** (configurable, default ~300s) in the agent loop, alongside
+  the existing `max_tool_calls_per_turn` guard.
+- **Subtask spawning** — child trees linked via `parent_id`, so the agent can
+  fork a sub-investigation that returns a summary into the parent.
+- **Autonomous loop** — agent self-continues without user input on a cadence.
+- **PWA frontend** — browser client over WS, voice input via Web Speech API.
+- **Provider abstraction** beyond the current single-config struct (Anthropic,
+  OpenAI, local OpenAI-compatible all supported via base_url today, but a
+  trait would let us add response-shape adapters).
 
 ---
 
@@ -65,28 +67,30 @@ Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
 
 ---
 
-## Future ideas
+## Step template
 
-Small things worth doing eventually; promote to a step when picked up.
+```
+### <Name>
 
-- **File-change awareness.** Watch the repo directory with the `notify` crate.
-  Track files the agent reads each turn; before the next LLM call, inject a
-  system message listing any of those files that were modified externally.
-  Same event stream can later push `FileChanged` events to a PWA. The
-  `ServerEvent::FileChanged { path, kind }` variant already exists for this.
-- **Queued input while the agent is working.** Buffer user input typed during
-  streaming; flush on Enter as a pending message that sends once the current
-  turn ends. (Cancellation covers the immediate-stop case; this is the
-  friendlier "I have a follow-up" case.)
-- **5xx retry with exponential backoff** in the provider client. Currently any
-  provider error is fatal; three retries on transient 5xx would smooth over
-  flaky upstream.
-- **Turn timeout** (configurable, default ~300s) in the agent loop, alongside
-  the existing `max_tool_calls_per_turn` guard.
-- **Subtask spawning** — child trees linked via `parent_id`, so the agent can
-  fork a sub-investigation that returns a summary into the parent.
-- **Autonomous loop** — agent self-continues without user input on a cadence.
-- **PWA frontend** — browser client over WS, voice input via Web Speech API.
-- **Provider abstraction** beyond the current single-config struct (Anthropic,
-  OpenAI, local OpenAI-compatible all supported via base_url today, but a
-  trait would let us add response-shape adapters).
+- [ ] todo / - [x] done
+
+**Goal:** one or two sentences.
+
+**Spec details:** file paths, signatures, tests, do-not-modify list.
+
+**Verify:** commands that prove it works.
+```
+
+On completion: delete this entry, then commit code + PLAN.md together with:
+
+```
+<crate/area>: <brief title>
+
+<what was built, 1-2 sentences>
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+```
+
+---
+
+## Steps

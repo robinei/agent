@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use crate::rpc::{LlmRequest, LlmResponse, PipeIn, PipeOut, WsCommand};
-use crate::types::{ChatStream, Message, MessageContent, MessageRole, ToolDefinition, ToolCall};
+use crate::types::{ChatStream, Message, MessageContent, MessageRole, ToolCall, ToolDefinition};
 
 #[derive(Error, Debug)]
 pub enum ProviderError {
@@ -26,11 +26,7 @@ pub type Result<T> = std::result::Result<T, ProviderError>;
 /// works with both the real HTTP provider (server-side) and the pipe provider
 /// (worker-side).
 pub trait LlmProvider {
-    fn stream_chat(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-    ) -> Result<ChatStream>;
+    fn stream_chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatStream>;
 }
 
 /// LLM provider — communicates with an OpenAI-compatible chat completions API.
@@ -40,14 +36,12 @@ pub struct Provider {
     pub api_key: String,
     pub model: String,
     pub enable_thinking: bool,
+    pub reasoning_effort: String,
+    pub max_tokens: Option<u32>,
 }
 
 impl LlmProvider for Provider {
-    fn stream_chat(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-    ) -> Result<ChatStream> {
+    fn stream_chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatStream> {
         // INTENTIONAL: no AGENT_TEST_STUB check here — that logic moved to
         // lifecycle.rs::handle_llm_request so the worker never sees it.
         let body = self.build_body(messages, tools, true);
@@ -79,13 +73,15 @@ impl LlmProvider for Provider {
     }
 }
 
-    impl Provider {
-    pub fn new(base_url: String, api_key: String, model: String, enable_thinking: bool) -> Self {
+impl Provider {
+    pub fn new(base_url: String, api_key: String, model: String, enable_thinking: bool, reasoning_effort: String, max_tokens: Option<u32>) -> Self {
         Self {
             base_url,
             api_key,
             model,
             enable_thinking,
+            reasoning_effort,
+            max_tokens,
         }
     }
 
@@ -128,7 +124,11 @@ impl LlmProvider for Provider {
 
         if self.enable_thinking {
             body["thinking"] = json!({"type": "enabled"});
-            body["reasoning_effort"] = json!("high");
+            body["reasoning_effort"] = json!(self.reasoning_effort);
+        }
+
+        if let Some(max_tokens) = self.max_tokens {
+            body["max_tokens"] = json!(max_tokens);
         }
 
         body
@@ -158,7 +158,11 @@ impl LlmProvider for Provider {
                         crate::types::ContentBlock::Text { text } => {
                             json!({"type": "text", "text": text})
                         }
-                        crate::types::ContentBlock::ToolCall { id, name, arguments } => {
+                        crate::types::ContentBlock::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => {
                             json!({
                                 "type": "tool_use",
                                 "id": id,
@@ -243,7 +247,11 @@ impl LlmProvider for Provider {
     }
 
     /// Raw non-streaming call returning the full JSON value.
-    fn chat_raw(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<serde_json::Value> {
+    fn chat_raw(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> Result<serde_json::Value> {
         let body = self.build_body(messages, tools, false);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
@@ -386,6 +394,9 @@ struct SyncStdinChunkReader {
     stop: Arc<AtomicBool>,
     buf: Vec<u8>,
     pos: usize,
+    // Set when read() already consumed a Done or Error message so drop() knows
+    // not to drain stdin (there is nothing left to drain).
+    done: bool,
 }
 
 impl Read for SyncStdinChunkReader {
@@ -421,8 +432,12 @@ impl Read for SyncStdinChunkReader {
                     }
                     return Ok(n);
                 }
-                Ok(PipeIn::Llm(LlmResponse::Done { .. })) => return Ok(0),
+                Ok(PipeIn::Llm(LlmResponse::Done { .. })) => {
+                    self.done = true;
+                    return Ok(0);
+                }
                 Ok(PipeIn::Llm(LlmResponse::Error { message, .. })) => {
+                    self.done = true;
                     return Err(std::io::Error::other(message));
                 }
                 Ok(PipeIn::Cmd(WsCommand::Stop)) => {
@@ -442,9 +457,14 @@ impl Drop for SyncStdinChunkReader {
         // that the server always sends after the HTTP stream closes.  Without this
         // drain, the Done leaks into stdin and the *next* stream_chat() call reads
         // it as an immediate EOF, producing an empty response and a spurious "stop".
+        //
+        // Skip the drain if read() already consumed the terminal message: draining
+        // would block indefinitely waiting for a Done/Error that will never arrive.
+        if self.done {
+            return;
+        }
         if self.pos < self.buf.len() {
-            // If there are still bytes buffered from the last Chunk, we already
-            // got past Done — nothing to drain.
+            // Bytes still buffered from the last Chunk — Done was already consumed.
             return;
         }
         loop {
@@ -472,21 +492,17 @@ pub struct SyncPipeProvider {
 }
 
 impl SyncPipeProvider {
-    pub fn new(
-        stdin: StdinHandle,
-        stdout: StdoutHandle,
-        stop: Arc<AtomicBool>,
-    ) -> Self {
-        Self { stdin, stdout, stop }
+    pub fn new(stdin: StdinHandle, stdout: StdoutHandle, stop: Arc<AtomicBool>) -> Self {
+        Self {
+            stdin,
+            stdout,
+            stop,
+        }
     }
 }
 
 impl LlmProvider for SyncPipeProvider {
-    fn stream_chat(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-    ) -> Result<ChatStream> {
+    fn stream_chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatStream> {
         let req = PipeOut::Llm(LlmRequest {
             id: 0,
             messages: messages.to_vec(),
@@ -503,6 +519,7 @@ impl LlmProvider for SyncPipeProvider {
             stop: self.stop.clone(),
             buf: Vec::new(),
             pos: 0,
+            done: false,
         };
         Ok(ChatStream::from_reader(Box::new(BufReader::new(reader))))
     }
@@ -514,7 +531,14 @@ mod tests {
 
     #[test]
     fn test_serialize_message_user() {
-        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into(), false);
+        let p = Provider::new(
+            "http://localhost".into(),
+            "".into(),
+            "test-model".into(),
+            false,
+            "medium".into(),
+            None,
+        );
         let msg = Message {
             role: MessageRole::User,
             content: MessageContent::Text("hello".into()),
@@ -532,7 +556,14 @@ mod tests {
 
     #[test]
     fn test_serialize_message_assistant_with_tool_calls() {
-        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into(), false);
+        let p = Provider::new(
+            "http://localhost".into(),
+            "".into(),
+            "test-model".into(),
+            false,
+            "medium".into(),
+            None,
+        );
         let msg = Message {
             role: MessageRole::Assistant,
             content: MessageContent::Text("Let me check".into()),
@@ -554,7 +585,14 @@ mod tests {
 
     #[test]
     fn test_serialize_message_tool_result() {
-        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into(), false);
+        let p = Provider::new(
+            "http://localhost".into(),
+            "".into(),
+            "test-model".into(),
+            false,
+            "medium".into(),
+            None,
+        );
         let msg = Message {
             role: MessageRole::Tool,
             content: MessageContent::Text("file contents".into()),
@@ -572,7 +610,14 @@ mod tests {
 
     #[test]
     fn test_build_body_streaming() {
-        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into(), false);
+        let p = Provider::new(
+            "http://localhost".into(),
+            "".into(),
+            "test-model".into(),
+            false,
+            "medium".into(),
+            None,
+        );
         let msg = Message {
             role: MessageRole::User,
             content: MessageContent::Text("hi".into()),
@@ -586,12 +631,21 @@ mod tests {
         let body = p.build_body(&[msg], &[], true);
         assert_eq!(body["model"], "test-model");
         assert!(body["stream"].as_bool().unwrap_or(false));
-        assert!(body["stream_options"]["include_usage"].as_bool().unwrap_or(false));
+        assert!(body["stream_options"]["include_usage"]
+            .as_bool()
+            .unwrap_or(false));
     }
 
     #[test]
     fn test_build_body_with_tools() {
-        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into(), false);
+        let p = Provider::new(
+            "http://localhost".into(),
+            "".into(),
+            "test-model".into(),
+            false,
+            "medium".into(),
+            None,
+        );
         let msg = Message {
             role: MessageRole::User,
             content: MessageContent::Text("hi".into()),
