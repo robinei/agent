@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use termion::event::Key;
@@ -326,6 +326,13 @@ struct RenderState {
     /// Capped at 2. Used to avoid double blank lines when events each add
     /// a leading separator.
     trailing_newlines: u8,
+    /// Current column position (chars since the last \n in output).
+    /// Only TextChunk and ThinkingChunk update this; all other events end
+    /// with \r\n so col is reset to 0 by the caller after those events.
+    col: usize,
+    spinner_shown: bool,
+    spinner_added_newline: bool, // true when we injected \r\n before the spinner
+    spinner_saved_col: usize,    // col at the time the spinner was drawn
 }
 
 /// Count trailing \r\n pairs in a string (max 2).
@@ -348,6 +355,62 @@ fn write_blank_line(out: &mut impl Write, trailing: &mut u8) {
 /// Normalize bare `\n` to `\r\n` for raw-mode terminal output.
 fn normalize_for_raw(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+// ── Spinner ──
+
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPINNER_INTERVAL_MS: u64 = 80;
+
+/// Update col after writing `text` (original content, not yet normalized).
+fn update_col(col: &mut usize, text: &str) {
+    match text.rfind('\n') {
+        Some(pos) => *col = text[pos + 1..].chars().count(),
+        None => *col += text.chars().count(),
+    }
+}
+
+/// Draw the spinner on its own line.  If the cursor is mid-line (col > 0) we
+/// emit a \r\n first so the spinner never shares a line with content.
+fn draw_spinner(out: &mut impl Write, state: &mut RenderState, frame: char) {
+    state.spinner_saved_col = state.col;
+    if state.col > 0 {
+        write!(out, "\r\n").ok();
+        state.spinner_added_newline = true;
+    } else {
+        state.spinner_added_newline = false;
+    }
+    write!(out, "{}", frame).ok();
+    state.spinner_shown = true;
+    out.flush().ok();
+}
+
+/// Erase the spinner and reposition the cursor back to where content left off.
+fn erase_spinner(out: &mut impl Write, state: &mut RenderState) {
+    if !state.spinner_shown {
+        return;
+    }
+    write!(out, "\r\x1b[2K").ok(); // clear spinner line, cursor at col 0
+    if state.spinner_added_newline {
+        write!(out, "\x1b[1A").ok(); // up to content line
+        if state.spinner_saved_col > 0 {
+            write!(out, "\x1b[{}C", state.spinner_saved_col).ok(); // right to saved col
+        }
+        state.col = state.spinner_saved_col;
+    } else {
+        state.col = 0;
+    }
+    state.spinner_shown = false;
+    out.flush().ok();
+}
+
+/// Advance the spinner frame in place without touching the cursor row above.
+fn tick_spinner(out: &mut impl Write, state: &mut RenderState, frame: char) {
+    if !state.spinner_shown {
+        return;
+    }
+    write!(out, "\r\x1b[2K{}", frame).ok();
+    out.flush().ok();
 }
 
 fn format_tool_args(tool: &str, input: &serde_json::Value) -> String {
@@ -386,11 +449,13 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
                 // assistant_header \r\n below so we don't double-count.
                 write_blank_line(out, &mut state.trailing_newlines);
                 state.assistant_header_shown = true;
+                state.col = 0;
             }
             if !state.assistant_header_shown {
                 state.assistant_header_shown = true;
                 write!(out, "\r\n").ok();
                 state.trailing_newlines = 1;
+                state.col = 0;
             }
             // Raw mode: `\n` alone leaves the cursor at the same column.
             // Normalize existing `\r\n` first (so we don't write `\r\r\n`), then
@@ -398,6 +463,7 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
             let normalized = normalize_for_raw(content);
             write!(out, "{}", normalized).ok();
             out.flush().ok();
+            update_col(&mut state.col, content);
             let non_nl = !normalized.trim_end_matches("\r\n").is_empty();
             if non_nl {
                 state.trailing_newlines = count_trailing_crlf(&normalized);
@@ -571,10 +637,12 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
                 state.in_thinking = true;
                 write!(out, "\r\n{}\x1b[2m", color::Fg(color::LightBlack)).ok();
                 state.trailing_newlines = 0;
+                state.col = 0;
             }
             let normalized = normalize_for_raw(content);
             write!(out, "{}", normalized).ok();
             out.flush().ok();
+            update_col(&mut state.col, content);
             let non_nl = !normalized.trim_end_matches("\r\n").is_empty();
             if non_nl {
                 state.trailing_newlines = count_trailing_crlf(&normalized);
@@ -588,6 +656,8 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
 
 // ── Input line editor with history and multiline support ──
 
+const MARGIN_WIDTH: usize = 2;
+
 struct InputLine {
     buf: Vec<char>,
     cursor: usize,
@@ -595,6 +665,8 @@ struct InputLine {
     history_idx: Option<usize>,
     draft: String,
     last_visual_line: usize,
+    total_visual_lines: usize,
+    anchored_col: Option<usize>,
 }
 
 impl InputLine {
@@ -606,6 +678,8 @@ impl InputLine {
             history_idx: None,
             draft: String::new(),
             last_visual_line: 0,
+            total_visual_lines: 1,
+            anchored_col: None,
         }
     }
 
@@ -614,37 +688,40 @@ impl InputLine {
         self.cursor = 0;
         self.history_idx = None;
         self.last_visual_line = 0;
+        self.total_visual_lines = 1;
+        self.anchored_col = None;
     }
 
-    fn current_line_indent(&self) -> String {
-        "  ".into()
-    }
-
-    /// Returns line_start + 2 (end of margin) if cursor is at or inside the
-    /// 2-space margin on a continuation line. The margin is the 2 spaces that
-    /// follow every \n — they act as a protected left-edge gutter.
-    fn margin_end(&self) -> Option<usize> {
+    fn line_info(&self) -> (usize, usize, usize) {
         let line_start = self.buf[..self.cursor]
             .iter()
             .rposition(|&c| c == '\n')
             .map(|pos| pos + 1)
             .unwrap_or(0);
-        if line_start > 0 && self.cursor <= line_start + 2 {
-            Some(line_start + 2)
+        let line_end = self.buf[self.cursor..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map(|pos| self.cursor + pos)
+            .unwrap_or(self.buf.len());
+        let newlines_before = self.buf[..self.cursor]
+            .iter()
+            .filter(|&&c| c == '\n')
+            .count();
+        (line_start, line_end, newlines_before)
+    }
+
+    fn line_min(line_start: usize, buf_len: usize) -> usize {
+        if line_start == 0 {
+            0
         } else {
-            None
+            (line_start + MARGIN_WIDTH).min(buf_len)
         }
     }
 
-    /// Snap cursor back to valid positions after any operation that could
-    /// land it inside a margin.
     fn snap_cursor(&mut self) {
-        if let Some(marker) = self.margin_end() {
-            // Margin extends from (marker - 2) to (marker - 1).
-            // Jump past it: cursor = marker (but capped to buf len).
-            self.cursor = marker.min(self.buf.len());
-        }
-        self.cursor = self.cursor.min(self.buf.len());
+        let (line_start, line_end, _) = self.line_info();
+        let min = Self::line_min(line_start, self.buf.len());
+        self.cursor = self.cursor.max(min).min(line_end);
     }
 
     fn handle_key(
@@ -652,7 +729,6 @@ impl InputLine {
         key: Key,
         out: &mut impl Write,
         prompt: &str,
-        prev_lines: &mut usize,
     ) -> LineEvent {
         match key {
             Key::Char('\n') | Key::Char('\r') => {
@@ -663,121 +739,189 @@ impl InputLine {
                 self.buf.clear();
                 self.cursor = 0;
                 self.history_idx = None;
+                self.anchored_col = None;
                 write!(out, "\r\n").ok();
                 out.flush().ok();
                 LineEvent::Submit(line)
             }
             Key::Alt('\n') => {
-                let indent = self.current_line_indent();
                 self.buf.insert(self.cursor, '\n');
                 self.cursor += 1;
-                for c in indent.chars() {
-                    self.buf.insert(self.cursor, c);
+                for _ in 0..MARGIN_WIDTH {
+                    self.buf.insert(self.cursor, ' ');
                     self.cursor += 1;
                 }
-                self.redraw(out, prompt, prev_lines);
+                self.anchored_col = None;
+                self.redraw(out, prompt);
                 LineEvent::Continue
             }
             Key::Backspace => {
                 if self.cursor > 0 {
-                    if let Some(marker) = self.margin_end() {
-                        // At/inside margin: remove \n + 2 spaces, join to prev line
-                        self.buf.remove(marker - 1);
-                        self.buf.remove(marker - 2);
-                        self.buf.remove(marker - 3);
-                        self.cursor = marker - 3;
+                    let (line_start, _, _) = self.line_info();
+                    if line_start > 0 && self.cursor <= line_start + MARGIN_WIDTH {
+                        for _ in 0..=MARGIN_WIDTH {
+                            self.buf.remove(line_start - 1);
+                        }
+                        self.cursor = line_start - 1;
                     } else {
                         self.cursor -= 1;
                         self.buf.remove(self.cursor);
                     }
-                    self.redraw(out, prompt, prev_lines);
+                    self.anchored_col = None;
+                    self.redraw(out, prompt);
                 }
                 LineEvent::Continue
             }
             Key::Delete | Key::Ctrl('d') => {
                 if self.cursor < self.buf.len() {
                     self.buf.remove(self.cursor);
-                    self.redraw(out, prompt, prev_lines);
+                    self.anchored_col = None;
+                    self.redraw(out, prompt);
                 }
                 LineEvent::Continue
             }
             Key::Left | Key::Ctrl('b') => {
-                if let Some(marker) = self.margin_end() {
-                    self.cursor = marker.saturating_sub(3);
+                let (line_start, _, _) = self.line_info();
+                if line_start > 0 && self.cursor <= line_start + MARGIN_WIDTH {
+                    self.cursor = line_start.saturating_sub(1);
                 } else if self.cursor > 0 {
                     self.cursor -= 1;
                 }
-                self.redraw(out, prompt, prev_lines);
+                self.anchored_col = None;
+                self.redraw(out, prompt);
                 LineEvent::Continue
             }
             Key::Right => {
+                let (_, line_end, _) = self.line_info();
                 if self.cursor == self.buf.len() {
-                    let indent = self.current_line_indent();
-                    for c in "\n".chars().chain(indent.chars()) {
+                    for c in "\n".chars().chain(std::iter::repeat_n(' ', MARGIN_WIDTH)) {
                         self.buf.insert(self.cursor, c);
                         self.cursor += 1;
                     }
+                } else if self.cursor >= line_end && line_end < self.buf.len() {
+                    let next_line_start = line_end + 1;
+                    self.cursor = Self::line_min(next_line_start, self.buf.len());
                 } else {
                     self.cursor = self.buf.len().min(self.cursor + 1);
-                    self.snap_cursor();
                 }
-                self.redraw(out, prompt, prev_lines);
+                self.anchored_col = None;
+                self.redraw(out, prompt);
                 LineEvent::Continue
             }
             Key::Ctrl('f') => {
-                self.cursor = self.buf.len().min(self.cursor + 1);
-                self.snap_cursor();
-                self.redraw(out, prompt, prev_lines);
+                let (_, line_end, _) = self.line_info();
+                if self.cursor >= line_end && line_end < self.buf.len() {
+                    let next_line_start = line_end + 1;
+                    self.cursor = Self::line_min(next_line_start, self.buf.len());
+                } else {
+                    self.cursor = self.buf.len().min(self.cursor + 1);
+                }
+                self.anchored_col = None;
+                self.redraw(out, prompt);
                 LineEvent::Continue
             }
             Key::Home | Key::Ctrl('a') => {
-                let line_start = self.buf[..self.cursor]
-                    .iter()
-                    .rposition(|&c| c == '\n')
-                    .map(|pos| pos + 1)
-                    .unwrap_or(0);
-                self.cursor = if line_start > 0 {
-                    (line_start + 2).min(self.buf.len())
-                } else {
-                    0
-                };
-                self.redraw(out, prompt, prev_lines);
+                let (line_start, _, _) = self.line_info();
+                self.cursor = Self::line_min(line_start, self.buf.len());
+                self.anchored_col = None;
+                self.redraw(out, prompt);
                 LineEvent::Continue
             }
             Key::End | Key::Ctrl('e') => {
-                self.cursor = self.buf.len();
-                self.redraw(out, prompt, prev_lines);
+                let (_, line_end, _) = self.line_info();
+                self.cursor = line_end;
+                self.anchored_col = None;
+                self.redraw(out, prompt);
                 LineEvent::Continue
             }
-            Key::Up | Key::Ctrl('p') => {
+            Key::Up => {
+                let (line_start, _, newlines_before) = self.line_info();
+                let cur_col = self.cursor - line_start;
+                let visual_col = if line_start > 0 {
+                    cur_col.saturating_sub(MARGIN_WIDTH)
+                } else {
+                    cur_col
+                };
+                if self.anchored_col.is_none() {
+                    self.anchored_col = Some(visual_col);
+                }
+                let want_visual = self.anchored_col.unwrap();
+                if newlines_before == 0 {
+                    self.anchored_col = None;
+                    self.history_prev();
+                } else {
+                    let prev_line_end = line_start - 1;
+                    let prev_line_start = self.buf[..prev_line_end]
+                        .iter()
+                        .rposition(|&c| c == '\n')
+                        .map(|pos| pos + 1)
+                        .unwrap_or(0);
+                    let target = if prev_line_start > 0 {
+                        prev_line_start + MARGIN_WIDTH + want_visual
+                    } else {
+                        want_visual
+                    };
+                    let min = Self::line_min(prev_line_start, self.buf.len());
+                    self.cursor = target.min(prev_line_end).max(min);
+                }
+                self.redraw(out, prompt);
+                LineEvent::Continue
+            }
+            Key::Down => {
+                let (line_start, line_end, newlines_before) = self.line_info();
+                let cur_col = self.cursor - line_start;
+                let visual_col = if line_start > 0 {
+                    cur_col.saturating_sub(MARGIN_WIDTH)
+                } else {
+                    cur_col
+                };
+                if self.anchored_col.is_none() {
+                    self.anchored_col = Some(visual_col);
+                }
+                let want_visual = self.anchored_col.unwrap();
+                let total_nl = self.buf.iter().filter(|&&c| c == '\n').count();
+                if newlines_before >= total_nl {
+                    self.anchored_col = None;
+                    self.history_next();
+                } else {
+                    let next_line_start = line_end + 1;
+                    let next_line_end = self.buf[next_line_start..]
+                        .iter()
+                        .position(|&c| c == '\n')
+                        .map(|pos| next_line_start + pos)
+                        .unwrap_or(self.buf.len());
+                    let target = next_line_start + MARGIN_WIDTH + want_visual;
+                    let min = Self::line_min(next_line_start, self.buf.len());
+                    self.cursor = target.min(next_line_end).max(min);
+                }
+                self.redraw(out, prompt);
+                LineEvent::Continue
+            }
+            Key::Ctrl('p') => {
+                self.anchored_col = None;
                 self.history_prev();
-                self.redraw(out, prompt, prev_lines);
+                self.redraw(out, prompt);
                 LineEvent::Continue
             }
-            Key::Down | Key::Ctrl('n') => {
+            Key::Ctrl('n') => {
+                self.anchored_col = None;
                 self.history_next();
-                self.redraw(out, prompt, prev_lines);
+                self.redraw(out, prompt);
                 LineEvent::Continue
             }
             Key::Ctrl('u') => {
-                let line_start = self.buf[..self.cursor]
-                    .iter()
-                    .rposition(|&c| c == '\n')
-                    .map(|pos| pos + 1)
-                    .unwrap_or(0);
-                let kill_start = if line_start > 0 {
-                    (line_start + 2).min(self.cursor)
-                } else {
-                    0
-                };
+                let (line_start, _, _) = self.line_info();
+                let kill_start = Self::line_min(line_start, self.buf.len());
                 self.buf.drain(kill_start..self.cursor);
                 self.cursor = kill_start;
-                self.redraw(out, prompt, prev_lines);
+                self.anchored_col = None;
+                self.redraw(out, prompt);
                 LineEvent::Continue
             }
             Key::Ctrl('k') => {
                 self.buf.truncate(self.cursor);
-                self.redraw(out, prompt, prev_lines);
+                self.anchored_col = None;
+                self.redraw(out, prompt);
                 LineEvent::Continue
             }
             Key::Ctrl('w') => {
@@ -794,7 +938,8 @@ impl InputLine {
                         self.buf.remove(end);
                     }
                     self.cursor = end;
-                    self.redraw(out, prompt, prev_lines);
+                    self.anchored_col = None;
+                    self.redraw(out, prompt);
                 }
                 LineEvent::Continue
             }
@@ -802,7 +947,8 @@ impl InputLine {
             Key::Char(c) => {
                 self.buf.insert(self.cursor, c);
                 self.cursor += 1;
-                self.redraw(out, prompt, prev_lines);
+                self.anchored_col = None;
+                self.redraw(out, prompt);
                 LineEvent::Continue
             }
             _ => LineEvent::Continue,
@@ -844,10 +990,10 @@ impl InputLine {
         }
     }
 
-    fn redraw(&mut self, out: &mut impl Write, prompt: &str, prev_lines: &mut usize) {
+    fn redraw(&mut self, out: &mut impl Write, prompt: &str) {
         self.snap_cursor();
 
-        let old_prev_lines = *prev_lines;
+        let old_total = self.total_visual_lines;
 
         if self.last_visual_line > 0 {
             write!(out, "{}", termion::cursor::Up(self.last_visual_line as u16)).ok();
@@ -858,17 +1004,17 @@ impl InputLine {
         let content: String = self.buf.iter().collect();
         write!(out, "{}", content.replace('\n', "\r\n")).ok();
 
-        *prev_lines = 1 + self.buf.iter().filter(|&&c| c == '\n').count();
+        self.total_visual_lines = 1 + self.buf.iter().filter(|&&c| c == '\n').count();
 
         write!(out, "\r").ok();
-        for _ in *prev_lines..old_prev_lines {
+        for _ in self.total_visual_lines..old_total {
             write!(out, "\r\n{}", clear::AfterCursor).ok();
         }
 
-        let cursor_row = if old_prev_lines > *prev_lines {
-            old_prev_lines - 1
+        let cursor_row = if old_total > self.total_visual_lines {
+            old_total - 1
         } else {
-            *prev_lines - 1
+            self.total_visual_lines - 1
         };
 
         let newlines_before = self.buf[..self.cursor]
@@ -930,10 +1076,9 @@ fn select_or_create_tree(
             out.flush().ok();
 
             input_line.clear();
-            let mut prev_lines = 1;
             let result = loop {
                 match keys.next() {
-                    Some(Ok(k)) => match input_line.handle_key(k, out, "", &mut prev_lines) {
+                    Some(Ok(k)) => match input_line.handle_key(k, out, "") {
                         LineEvent::Continue => {}
                         ev => break ev,
                     },
@@ -989,10 +1134,9 @@ fn create_tree_interactive(
         write!(out, "{}", prompt).ok();
         out.flush().ok();
         input_line.clear();
-        let mut prev_lines = 1;
         let result = loop {
             match keys.next() {
-                Some(Ok(k)) => match input_line.handle_key(k, out, "", &mut prev_lines) {
+                Some(Ok(k)) => match input_line.handle_key(k, out, "") {
                     LineEvent::Continue => {}
                     ev => break ev,
                 },
@@ -1088,6 +1232,10 @@ fn process_message(
 
     let mut state = RenderState::default();
     let mut cancel_signalled = false;
+    let mut spin_frame = 0usize;
+    let mut last_spin = Instant::now();
+
+    draw_spinner(out, &mut state, SPINNER_FRAMES[spin_frame]);
 
     loop {
         // 1. Drain WS events
@@ -1097,15 +1245,31 @@ fn process_message(
                     if matches!(&ev, ServerEvent::Entry(_)) {
                         continue;
                     }
+                    erase_spinner(out, &mut state);
                     let done = matches!(&ev, ServerEvent::Done { .. });
                     render_event(out, &ev, &mut state);
+                    // All events except streaming chunks always end with \r\n.
+                    // ToolStart writes nothing so col is unchanged.
+                    if !matches!(
+                        &ev,
+                        ServerEvent::TextChunk { .. }
+                            | ServerEvent::ThinkingChunk { .. }
+                            | ServerEvent::ToolStart { .. }
+                    ) {
+                        state.col = 0;
+                    }
                     if done {
                         return Ok(());
                     }
+                    draw_spinner(out, &mut state, SPINNER_FRAMES[spin_frame]);
                     continue;
                 }
-                TryEvent::Closed => return Ok(()),
+                TryEvent::Closed => {
+                    erase_spinner(out, &mut state);
+                    return Ok(());
+                }
                 TryEvent::Err(e) => {
+                    erase_spinner(out, &mut state);
                     write!(out, "\r\nws error: {}\r\n", e).ok();
                     return Ok(());
                 }
@@ -1115,6 +1279,7 @@ fn process_message(
 
         // 2. Check Ctrl-C from the outer signal handler
         if stop.load(Ordering::Relaxed) {
+            erase_spinner(out, &mut state);
             write!(out, "\r\nInterrupted\r\n").ok();
             break;
         }
@@ -1123,6 +1288,7 @@ fn process_message(
         if !cancel_signalled {
             if let Some(key) = poll_key() {
                 if matches!(key, Key::Esc | Key::Ctrl('c')) {
+                    erase_spinner(out, &mut state);
                     write!(
                         out,
                         "\r\n  {}⏸ Cancelling…{}\r\n",
@@ -1133,8 +1299,17 @@ fn process_message(
                     out.flush().ok();
                     let _ = session.send_stop();
                     cancel_signalled = true;
+                    state.col = 0;
+                    draw_spinner(out, &mut state, SPINNER_FRAMES[spin_frame]);
                 }
             }
+        }
+
+        // 4. Animate spinner
+        if last_spin.elapsed() >= Duration::from_millis(SPINNER_INTERVAL_MS) {
+            spin_frame = (spin_frame + 1) % SPINNER_FRAMES.len();
+            tick_spinner(out, &mut state, SPINNER_FRAMES[spin_frame]);
+            last_spin = Instant::now();
         }
 
         std::thread::sleep(Duration::from_millis(20));
@@ -1227,10 +1402,9 @@ pub fn run_interactive(
         out.flush().ok();
 
         input_line.clear();
-        let mut prev_lines = 1;
         let result = loop {
             match keys.next() {
-                Some(Ok(k)) => match input_line.handle_key(k, &mut out, "> ", &mut prev_lines) {
+                Some(Ok(k)) => match input_line.handle_key(k, &mut out, "> ") {
                     LineEvent::Continue => {}
                     ev => break ev,
                 },
@@ -1381,6 +1555,8 @@ pub fn run_interactive(
                 }
             }
             CliCommand::Message(text) => {
+                write!(out, "\x1b[?25l").ok();
+                out.flush().ok();
                 process_message(server, &current_tree_id, &text, &mut out, stop)?;
             }
         }
@@ -1467,8 +1643,7 @@ mod tests {
     fn test_inputline_backspace_at_start_is_noop() {
         let mut il = InputLine::new();
         let mut buf = Vec::new();
-        let mut prev = 1;
-        il.handle_key(Key::Backspace, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Backspace, &mut buf, "> ");
         assert!(il.buf.is_empty());
     }
 
@@ -1476,13 +1651,12 @@ mod tests {
     fn test_inputline_cursor_movement() {
         let mut il = InputLine::new();
         let mut buf = Vec::new();
-        let mut prev = 1;
         for c in "hello".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
-        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
-        il.handle_key(Key::Char('X'), &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Left, &mut buf, "> ");
+        il.handle_key(Key::Left, &mut buf, "> ");
+        il.handle_key(Key::Char('X'), &mut buf, "> ");
         let result: String = il.buf.iter().collect();
         assert_eq!(result, "helXlo");
     }
@@ -1491,30 +1665,29 @@ mod tests {
     fn test_inputline_history_cycle() {
         let mut il = InputLine::new();
         let mut buf = Vec::new();
-        let mut prev = 1;
 
         for c in "first".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ");
         assert!(matches!(result, LineEvent::Submit(s) if s == "first"));
 
         for c in "second".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ");
         assert!(matches!(result, LineEvent::Submit(s) if s == "second"));
 
-        il.handle_key(Key::Up, &mut buf, "> ", &mut prev);
-        il.handle_key(Key::Up, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Up, &mut buf, "> ");
+        il.handle_key(Key::Up, &mut buf, "> ");
         let s: String = il.buf.iter().collect();
         assert_eq!(s, "first");
 
-        il.handle_key(Key::Down, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Down, &mut buf, "> ");
         let s: String = il.buf.iter().collect();
         assert_eq!(s, "second");
 
-        il.handle_key(Key::Down, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Down, &mut buf, "> ");
         let s: String = il.buf.iter().collect();
         assert_eq!(s, "");
     }
@@ -1523,47 +1696,44 @@ mod tests {
     fn test_inputline_alt_enter_inserts_newline() {
         let mut il = InputLine::new();
         let mut buf = Vec::new();
-        let mut prev = 1;
         for c in "hello".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        il.handle_key(Key::Alt('\n'), &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ");
         for c in "world".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
-assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ");
+        assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
     }
 
     #[test]
     fn test_inputline_right_arrow_at_end_inserts_newline() {
         let mut il = InputLine::new();
         let mut buf = Vec::new();
-        let mut prev = 1;
         for c in "hello".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        il.handle_key(Key::Right, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Right, &mut buf, "> ");
         for c in "world".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
-assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ");
+        assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
     }
 
     #[test]
     fn test_inputline_alt_enter_auto_indent() {
         let mut il = InputLine::new();
         let mut buf = Vec::new();
-        let mut prev = 1;
         for c in "  hello".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        il.handle_key(Key::Alt('\n'), &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ");
         for c in "world".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ");
         assert!(matches!(result, LineEvent::Submit(s) if s == "  hello\n  world"));
     }
 
@@ -1571,15 +1741,14 @@ assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
     fn test_inputline_right_arrow_at_end_auto_indent() {
         let mut il = InputLine::new();
         let mut buf = Vec::new();
-        let mut prev = 1;
         for c in "  hello".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        il.handle_key(Key::Right, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Right, &mut buf, "> ");
         for c in "world".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ", &mut prev);
+        let result = il.handle_key(Key::Char('\n'), &mut buf, "> ");
         assert!(matches!(result, LineEvent::Submit(s) if s == "  hello\n  world"));
     }
 
@@ -1587,13 +1756,12 @@ assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
     fn test_inputline_right_arrow_mid_line_moves_cursor() {
         let mut il = InputLine::new();
         let mut buf = Vec::new();
-        let mut prev = 1;
         for c in "ab".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Left, &mut buf, "> ");
         // cursor at 1, right arrow should move to 2 (not insert newline)
-        il.handle_key(Key::Right, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Right, &mut buf, "> ");
         assert_eq!(il.cursor, 2);
         assert_eq!(il.buf.iter().collect::<String>(), "ab");
     }
@@ -1602,14 +1770,13 @@ assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
     fn test_inputline_backspace_joins_lines_at_newline() {
         let mut il = InputLine::new();
         let mut buf = Vec::new();
-        let mut prev = 1;
         for c in "abc".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        il.handle_key(Key::Alt('\n'), &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ");
         // buf is now "abc\n  ", cursor at end.
         // One backspace removes the \n + 2-space margin, joining to "abc".
-        il.handle_key(Key::Backspace, &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Backspace, &mut buf, "> ");
         let s: String = il.buf.iter().collect();
         assert_eq!(s, "abc");
         assert_eq!(il.cursor, 3);
@@ -1619,13 +1786,12 @@ assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
     fn test_inputline_ctrl_u_kills_to_start() {
         let mut il = InputLine::new();
         let mut buf = Vec::new();
-        let mut prev = 1;
         for c in "hello".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
-        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
-        il.handle_key(Key::Ctrl('u'), &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Left, &mut buf, "> ");
+        il.handle_key(Key::Left, &mut buf, "> ");
+        il.handle_key(Key::Ctrl('u'), &mut buf, "> ");
         let s: String = il.buf.iter().collect();
         assert_eq!(s, "lo");
         assert_eq!(il.cursor, 0);
@@ -1635,15 +1801,146 @@ assert!(matches!(result, LineEvent::Submit(s) if s == "hello\n  world"));
     fn test_inputline_ctrl_k_kills_to_end() {
         let mut il = InputLine::new();
         let mut buf = Vec::new();
-        let mut prev = 1;
         for c in "hello".chars() {
-            il.handle_key(Key::Char(c), &mut buf, "> ", &mut prev);
+            il.handle_key(Key::Char(c), &mut buf, "> ");
         }
-        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
-        il.handle_key(Key::Left, &mut buf, "> ", &mut prev);
-        il.handle_key(Key::Ctrl('k'), &mut buf, "> ", &mut prev);
+        il.handle_key(Key::Left, &mut buf, "> ");
+        il.handle_key(Key::Left, &mut buf, "> ");
+        il.handle_key(Key::Ctrl('k'), &mut buf, "> ");
         let s: String = il.buf.iter().collect();
         assert_eq!(s, "hel");
+    }
+
+    // ── New tests for Step 7 ──
+
+    #[test]
+    fn test_up_down_2d_basic() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        // Build "abc\n  def" — len 9
+        for c in "abc".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ");
+        for c in "def".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        // cursor at end of buffer (position 9)
+        assert_eq!(il.cursor, 9);
+        // Up → prev_line_end (the '\n' at position 3), cursor clips to 3
+        il.handle_key(Key::Up, &mut buf, "> ");
+        assert_eq!(il.cursor, 3);
+        // Down → back to end of buffer
+        il.handle_key(Key::Down, &mut buf, "> ");
+        assert_eq!(il.cursor, 9);
+    }
+
+    #[test]
+    fn test_up_down_anchored_col() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        // Build "hello\n  hi" — first line has 5 chars, second has 2 chars
+        for c in "hello".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ");
+        for c in "hi".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        // cursor at end of buffer (position 10), visual col = (10-6)-2 = 2
+        assert_eq!(il.cursor, 10);
+        // Up → visual col 2 on first line = position 2
+        il.handle_key(Key::Up, &mut buf, "> ");
+        assert_eq!(il.cursor, 2);
+        // Down → back to end of buffer (visual col 2 on second line = 6+2+2 = 10)
+        il.handle_key(Key::Down, &mut buf, "> ");
+        assert_eq!(il.cursor, 10);
+        // Up again → restores visual col 2 on first line = position 2
+        il.handle_key(Key::Up, &mut buf, "> ");
+        assert_eq!(il.cursor, 2);
+    }
+
+    #[test]
+    fn test_up_at_first_row_goes_to_history() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        // Submit "bar" to history
+        for c in "bar".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        il.handle_key(Key::Char('\n'), &mut buf, "> ");
+        // Single-line buffer "foo"
+        for c in "foo".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        // Up on first row → history_prev → loads "bar"
+        il.handle_key(Key::Up, &mut buf, "> ");
+        let s: String = il.buf.iter().collect();
+        assert_eq!(s, "bar");
+    }
+
+    #[test]
+    fn test_down_at_last_row_goes_to_history() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        // Submit "first" to history
+        for c in "first".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        il.handle_key(Key::Char('\n'), &mut buf, "> ");
+        // Build multiline: "a\n  b"
+        il.handle_key(Key::Char('a'), &mut buf, "> ");
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ");
+        il.handle_key(Key::Char('b'), &mut buf, "> ");
+        // Up twice: first 2D to first row, then history → "first"
+        il.handle_key(Key::Up, &mut buf, "> ");
+        il.handle_key(Key::Up, &mut buf, "> ");
+        let s: String = il.buf.iter().collect();
+        assert_eq!(s, "first");
+        // Down returns to draft "a\n  b"
+        il.handle_key(Key::Down, &mut buf, "> ");
+        let s: String = il.buf.iter().collect();
+        assert_eq!(s, "a\n  b");
+        // Down again on last row does nothing (already on live draft)
+        il.handle_key(Key::Down, &mut buf, "> ");
+        let s: String = il.buf.iter().collect();
+        assert_eq!(s, "a\n  b");
+    }
+
+    #[test]
+    fn test_ctrl_pn_always_history() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        // Submit "prev" to history
+        for c in "prev".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        il.handle_key(Key::Char('\n'), &mut buf, "> ");
+        // Multiline buffer: "a\n  b"
+        il.handle_key(Key::Char('a'), &mut buf, "> ");
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ");
+        il.handle_key(Key::Char('b'), &mut buf, "> ");
+        // Ctrl('p') always history — even on middle row
+        il.handle_key(Key::Ctrl('p'), &mut buf, "> ");
+        let s: String = il.buf.iter().collect();
+        assert_eq!(s, "prev");
+    }
+
+    #[test]
+    fn test_end_stops_before_newline() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        // Build "ab\n  cd" — \n at position 2
+        for c in "ab".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ");
+        for c in "cd".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        // Set cursor to line start (position 0), then End → stops at line_end (the \n at pos 2)
+        il.cursor = 0;
+        il.handle_key(Key::End, &mut buf, "> ");
+        assert_eq!(il.cursor, 2, "End should stop before newline, not at buf.len()");
+    }
+
+    #[test]
+    fn test_anchor_resets_on_left() {
+        let mut il = InputLine::new();
+        let mut buf = Vec::new();
+        // Build "hello\n  world"
+        for c in "hello".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        il.handle_key(Key::Alt('\n'), &mut buf, "> ");
+        for c in "world".chars() { il.handle_key(Key::Char(c), &mut buf, "> "); }
+        // cursor at end (pos 13), visual col = (13-6)-2 = 5, Up lands at pos 5 ('\n')
+        il.handle_key(Key::Up, &mut buf, "> ");
+        assert_eq!(il.cursor, 5);
+        // Left resets anchor, moves to pos 4
+        il.handle_key(Key::Left, &mut buf, "> ");
+        assert_eq!(il.cursor, 4);
+        // Down from new visual col 4 on first line → visual col 4 on second line: 6+2+4=12
+        il.handle_key(Key::Down, &mut buf, "> ");
+        assert_eq!(il.cursor, 12);
     }
 
     #[test]

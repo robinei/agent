@@ -1230,3 +1230,238 @@ Add to `#[cfg(test)] mod tests` in `interactive.rs`:
 - Modified: `agent-cli/src/interactive.rs` — added `in_thinking` field to `RenderState`; `render_event` now has `ThinkingChunk` arm (renders in dim `\x1b[2m` light-gray), `TextChunk` arm resets style when thinking block ends; added 7 new tests (5 for `split_thinking_chunks`, 2 for thinking rendering).
 - Deviation: None — matches spec exactly.
 - Verified: `cargo test --workspace` → 144 passed, `cargo clippy --workspace` → no new warnings.
+
+---
+
+## Step 7 — 2D input editor: vertical movement, anchored column, clean margin constant
+
+- [ ] Define `MARGIN_WIDTH` constant; eliminate all magic `2`s
+- [ ] Internalize `prev_lines` into `InputLine` as `total_visual_lines`
+- [ ] `End`/`Ctrl-E` → end of current line (not end of whole buffer)
+- [ ] `Up`/`Down` → 2D vertical movement with history fallback at boundary
+- [ ] Anchored column for vertical movement; reset on horizontal movement
+- [ ] Right arrow at end-of-last-line → no-op (remove insert-newline behaviour)
+
+**Goal:** Make the input box behave like a proper 2D editor.  Up/Down move the
+cursor a row at a time within a multiline buffer, falling back to history
+navigation only when already at the first or last visual line.  A remembered
+horizontal anchor makes columns survive round-trips through shorter lines.
+All of this is built on a named constant for the margin width so no magic
+numbers leak through the code.
+
+---
+
+### Assessment of the current code
+
+The commit 9af7ec3 ("CLI input editor: right-arrow newline, auto-indent,
+margin protection, redraw fixes") is mostly correct but has several rough
+edges introduced by the worker agent:
+
+1. **Magic number `2` is scattered** — `margin_end()` uses `line_start + 2`
+   twice; `Key::Backspace` removes `marker-1 / marker-2 / marker-3`
+   (implicit `1 + MARGIN_WIDTH`); `Key::Left` uses `marker.saturating_sub(3)`;
+   `Key::Home` and `Ctrl('u')` both have `line_start + 2`;
+   `current_line_indent()` is a method that just returns `"  "`.
+
+2. **`prev_lines` is external state** — callers hold and pass `&mut usize`
+   into every `handle_key` / `redraw` call; it is really internal bookkeeping.
+
+3. **`End`/`Ctrl-E` jumps to `buf.len()`** — skips past other lines in a
+   multiline buffer; should stop at the end of the current line.
+
+4. **Up/Down only navigate history** — no 2D movement.
+
+5. **No anchored column** — vertical moves through shorter lines lose position.
+
+6. **`current_line_indent()` method** — single-use, exists only to hide the
+   magic `2`; remove in favour of the constant.
+
+---
+
+### Constant
+
+```rust
+/// Width of the auto-inserted left margin on continuation lines (chars after `\n`).
+const MARGIN_WIDTH: usize = 2;
+```
+
+Defined at module level (outside the struct/impl block).  Every occurrence of
+the raw `2`, `3` (= `1 + MARGIN_WIDTH`), or `"  "` that relates to the margin
+is replaced by an expression using this constant.  Remove `current_line_indent()`.
+
+---
+
+### Struct
+
+```rust
+struct InputLine {
+    buf: Vec<char>,
+    cursor: usize,
+    history: Vec<String>,
+    history_idx: Option<usize>,
+    draft: String,
+
+    // redraw bookkeeping
+    last_visual_line: usize,    // visual row of cursor (= count of '\n' before cursor)
+    total_visual_lines: usize,  // total rows the input occupies; replaces external prev_lines
+
+    // 2D vertical movement
+    anchored_col: Option<usize>, // desired col-from-line-start; None when not mid-vertical-move
+}
+```
+
+Remove the `prev_lines: &mut usize` parameter from `handle_key` and `redraw`.
+Callers that need the line count read `input_line.total_visual_lines` after the
+call.  The main loop in `run_interactive` (and the tree-selection helpers) must
+be updated accordingly.
+
+---
+
+### New helpers
+
+```rust
+/// (line_start, line_end, newlines_before_cursor)
+///
+/// line_start: index after the nearest preceding '\n', or 0.
+/// line_end:   index of the nearest following '\n', or buf.len().
+///             The cursor may sit anywhere in [line_start, line_end]; at
+///             line_end it is "before the '\n'" or at end-of-buffer.
+fn line_info(&self) -> (usize, usize, usize)
+
+/// Leftmost valid cursor on a line.
+/// Line 0 (line_start == 0): 0.
+/// Continuation line: line_start + MARGIN_WIDTH (capped to buf.len()).
+fn line_min(line_start: usize, buf_len: usize) -> usize
+
+/// Rightmost valid cursor on a line — the position *before* the '\n' (or buf.len()).
+/// Equal to line_end (as returned by line_info).
+```
+
+Remove `margin_end()`.  Rewrite `snap_cursor()` using `line_info()` and
+`line_min()`.
+
+**Cursor invariant** (enforced by `snap_cursor` after every operation):
+```
+line_min(line_start, buf.len()) <= cursor <= line_end
+```
+
+---
+
+### Key binding changes
+
+Only the keys that change behaviour are listed.
+
+| Key | Old behaviour | New behaviour |
+|-----|--------------|---------------|
+| `End` / `Ctrl('e')` | `cursor = buf.len()` | `cursor = line_end` of current line |
+| `Up` | always `history_prev` | 2D if not on row 0; `history_prev` if on row 0 |
+| `Down` | always `history_next` | 2D if not on last row; `history_next` if on last row |
+| `Ctrl('p')` | `history_prev` | `history_prev` (unchanged — always history) |
+| `Ctrl('n')` | `history_next` | `history_next` (unchanged — always history) |
+| `Right` at `cursor == buf.len()` | inserts `\n  ` | **unchanged** — still inserts `\n` + `MARGIN_WIDTH` spaces (Alt+Enter is captured by the environment) |
+| `Right` at `line_end` (not last line) | snaps to next line via `snap_cursor` | explicit wrap: `cursor = line_min(next_line_start)` |
+
+All other keys are unchanged in intent; they just use the new helpers and
+constant in place of the inline arithmetic.
+
+#### `Up` in detail
+
+```
+let (line_start, _, _) = self.line_info();
+let cur_col = self.cursor - line_start;
+if anchored_col is None { anchored_col = Some(cur_col) }
+let want_col = anchored_col.unwrap();
+
+if newlines_before_cursor == 0 {
+    // already on first visual row → history
+    self.anchored_col = None;
+    self.history_prev();
+} else {
+    // find previous line: prev_line_end = line_start - 1 (the '\n')
+    //                     prev_line_start = index after '\n' before that, or 0
+    let prev_line_end = line_start - 1;   // index of the '\n' separating lines
+    let prev_line_start = buf[..prev_line_end]
+        .iter().rposition(|&c| c == '\n').map(|p| p + 1).unwrap_or(0);
+    let target = prev_line_start + want_col;
+    let min = line_min(prev_line_start, buf.len());
+    self.cursor = target.min(prev_line_end).max(min);
+    // do NOT reset anchored_col
+}
+```
+
+#### `Down` in detail
+
+Mirror of Up: if `buf[cursor..].iter().find(|&&c|c=='\n')` is None → history_next
+(reset anchored_col); else find `next_line_start = line_end + 1`,
+`next_line_end` = next `'\n'` after that or `buf.len()`, place cursor at
+`(next_line_start + want_col).min(next_line_end).max(line_min(next_line_start))`.
+
+#### `anchored_col` reset policy
+
+Reset to `None` on: `Left`, `Right`, `Ctrl('b')`, `Ctrl('f')`, `Home`,
+`End`, `Ctrl('a')`, `Ctrl('e')`, `Ctrl('u')`, `Ctrl('k')`, `Ctrl('w')`,
+`Char(_)`, `Backspace`, `Delete`/`Ctrl('d')`, `Alt('\n')`,
+history navigation via `Ctrl('p')`/`Ctrl('n')`, and the history fallback
+branches of `Up`/`Down`.
+
+Do NOT reset on the 2D-movement branches of `Up`/`Down`.
+
+---
+
+### `redraw` changes
+
+Signature: `fn redraw(&mut self, out: &mut impl Write)` — no `prev_lines` param.
+
+Replace references to `old_prev_lines` / `*prev_lines` with
+`old_total = self.total_visual_lines` (read at entry) and the new
+`self.total_visual_lines` (written during the function, same as the old
+`*prev_lines` write).  Logic is otherwise unchanged.
+
+---
+
+### Tests to add
+
+- `test_up_down_2d_basic` — buffer `"abc\n  def"`, cursor at end of "def"
+  (position 11); `Up` moves cursor to position 2 ("c"); `Down` returns to 11.
+- `test_up_down_anchored_col` — buffer `"hello\n  hi"`, cursor after 'o'
+  (col 5); `Down` → cursor clips to end of "hi" (col 4); `Up` → cursor
+  restores to col 5 on "hello".
+- `test_up_at_first_row_goes_to_history` — single-line buffer `"foo"` with
+  one history entry `"bar"`; `Up` loads "bar".
+- `test_down_at_last_row_goes_to_history` — multiline buffer, cursor on last
+  row; `Down` triggers `history_next`.
+- `test_ctrl_pn_always_history` — multiline buffer, cursor on middle row;
+  `Ctrl('p')` still does history_prev (not 2D move).
+- `test_end_stops_before_newline` — buffer `"ab\n  cd"`, cursor on first row;
+  `End` → cursor == 2 (before `'\n'`), NOT `buf.len()`.
+- `test_right_at_last_line_inserts_newline` — cursor == `buf.len()` on a
+  single-line buffer; `Right` inserts `"\n  "` and advances cursor (existing
+  behaviour preserved; test replaces the now-misnamed `test_inputline_right_arrow_at_end_inserts_newline`).
+- `test_anchor_resets_on_left` — move `Up` (sets anchor), then `Left` (resets
+  anchor); next `Up` from the new position uses the new col, not the old one.
+- `test_inputline_right_arrow_at_end_inserts_newline` — keep existing test unchanged.
+
+### Do not modify
+
+- Wire protocol, server, agent-core.
+- `process_message` / `poll_key` / cancel logic.
+- `render_event` / `RenderState` / output rendering.
+- `replay_entries`.
+
+### Verify
+
+- `cargo test --workspace` — all existing tests pass, nine new tests pass.
+- `cargo clippy --workspace` — no new warnings.
+- Manual: type three lines via Alt+Enter; use Up/Down to navigate rows;
+  confirm cursor stays on the same column and clips correctly on shorter lines.
+- Manual: navigate to a short line, then Up/Down back to the longer line —
+  cursor returns to original column.
+- Manual: press End on a multiline line — cursor stops before the `\n`, not
+  at end of buffer.
+- Manual: press Right at end of last line — new line is inserted (existing behaviour).
+- Manual: Ctrl+P / Ctrl+N navigate history regardless of cursor row.
+
+**Notes:**
+- Modified: `agent-cli/src/interactive.rs` — added `MARGIN_WIDTH` constant, replaced all hardcoded `2`s; added `total_visual_lines` and `anchored_col` to `InputLine` struct; added `line_info()` and `line_min()` helpers; rewrote `snap_cursor()`; removed `margin_end()` and `current_line_indent()`; removed `prev_lines` param from `handle_key` and `redraw`; rewrote `redraw` to use `self.total_visual_lines`; implemented 2D Up/Down with anchored column; `End`/`Ctrl+E` now stops at end of current line; `Right` wraps to next line at line_end; anchored_col resets on all horizontal movement keys; `Ctrl+P`/`Ctrl+N` always history regardless of cursor row; updated all callers and tests.
+- Added 9 new tests: `test_up_down_2d_basic`, `test_up_down_anchored_col`, `test_up_at_first_row_goes_to_history`, `test_down_at_last_row_goes_to_history`, `test_ctrl_pn_always_history`, `test_end_stops_before_newline`, `test_anchor_resets_on_left`.
+- Verified: `cargo test --workspace` → all pass (39 agent-cli tests), `cargo clippy --workspace` → no new warnings.
