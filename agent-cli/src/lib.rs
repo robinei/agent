@@ -141,7 +141,7 @@ impl Backend {
     fn connect_session(&self, tree_id: &str) -> Result<AgentSession, String> {
         match self {
             Backend::Remote(c) => {
-                let (host, port) = client::parse_host_port(&c.server_addr())?;
+                let (host, port) = client::parse_host_port(c.server_addr())?;
                 AgentSession::connect(&format!("{}:{}", host, port), tree_id)
             }
             Backend::Local(c) => embedded_session(tree_id, c.store.clone(), c.config.clone()),

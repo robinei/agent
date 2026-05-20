@@ -7,7 +7,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use agent_core::config::Config;
-use agent_core::provider::Provider;
+use agent_core::provider::{LlmProvider, Provider};
+use agent_core::rpc::{LlmRequest, LlmResponse, PipeIn, PipeOut};
 use agent_core::store::Store;
 use agent_core::types::{Entry, ServerEvent, TreeId, TreeMeta};
 
@@ -64,12 +65,14 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
             .map_err(|e| format!("current_dir: {e}"))?
             .join(exe)
     };
-    let config_path = agent_core::config::agent_dir().join("config.toml");
 
     let meta = store
         .get_tree(tree_id)
         .map_err(|e| format!("get_tree: {e}"))?
         .ok_or_else(|| format!("tree {} not found", tree_id))?;
+
+    // The worker receives its config via PipeIn::Config as the first message on
+    // stdin, so no filesystem config file with API keys is needed.
 
     let mut child = if cfg.sandbox.enabled {
         let bwrap_path = resolve_bwrap_path(&cfg.sandbox.bwrap_path)?;
@@ -86,8 +89,6 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
             .arg("worker")
             .arg("--tree-id")
             .arg(tree_id)
-            .arg("--config")
-            .arg(&config_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -102,12 +103,24 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
     let (stdin_tx, stdin_rx) = mpsc::channel::<String>();
 
     let entry = Arc::new(Mutex::new(WorkerEntry {
-        stdin_tx,
+        stdin_tx: stdin_tx.clone(),
         event_buffer: VecDeque::with_capacity(BUFFER_CAPACITY),
         subscribers: Vec::new(),
         pid,
         child: Some(child),
     }));
+
+    // Send worker config as the first message on stdin
+    let worker_cfg = agent_core::rpc::WorkerConfig {
+        session_soft_cap_pct: cfg.session.soft_cap_pct,
+        session_hard_cap_pct: cfg.session.hard_cap_pct,
+        max_tool_calls_per_turn: cfg.session.max_tool_calls_per_turn,
+        logging_level: cfg.logging.level.clone(),
+        logging_to_file: cfg.logging.to_file.clone(),
+        logging_to_stderr: cfg.logging.to_stderr,
+    };
+    let config_msg = serde_json::to_string(&agent_core::rpc::PipeIn::Config(worker_cfg)).unwrap();
+    let _ = stdin_tx.send(config_msg);
 
     ACTIVE_WORKERS
         .lock()
@@ -166,7 +179,6 @@ pub fn build_bwrap_argv(
     cfg: &Config,
 ) -> Vec<OsString> {
     let store_dir = agent_core::config::agent_dir().join("trees").join(tree_id);
-    let config_path = agent_core::config::agent_dir().join("config.toml");
 
     let mut args: Vec<OsString> = Vec::new();
 
@@ -176,12 +188,11 @@ pub fn build_bwrap_argv(
     args.extend(["--proc", "/proc"].iter().map(OsString::from));
     args.extend(["--tmpfs", "/tmp"].iter().map(OsString::from));
 
-    // The tree's own data dir + repo + config
+    // The tree's own data dir + repo + binary (config is sent via pipe)
     args.extend(["--bind".into(), store_dir.clone().into(), store_dir.into()]);
     if let Some(repo) = &meta.repo_path {
         args.extend(["--bind".into(), repo.clone().into(), repo.clone().into()]);
     }
-    args.extend(["--ro-bind".into(), config_path.clone().into(), config_path.into()]);
     args.extend(["--ro-bind".into(), exe.to_path_buf().into(), exe.to_path_buf().into()]);
 
     // Per-tree extra writables
@@ -234,8 +245,6 @@ pub fn build_bwrap_argv(
     args.push("worker".into());
     args.push("--tree-id".into());
     args.push(tree_id.into());
-    args.push("--config".into());
-    args.push(agent_core::config::agent_dir().join("config.toml").into());
 
     args
 }
@@ -294,50 +303,60 @@ fn spawn_stdout_proxy(
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
-            let event: ServerEvent = match serde_json::from_str(buf.trim_end()) {
-                Ok(e) => e,
+            let pipe_out: PipeOut = match serde_json::from_str(buf.trim_end()) {
+                Ok(p) => p,
                 Err(e) => {
-                    log::warn!("[proxy {}] bad event JSON: {}", tree_id, e);
+                    log::warn!("[proxy {}] bad PipeOut JSON: {}", tree_id, e);
                     continue;
                 }
             };
-            let mut guard = entry.lock().unwrap();
-            if matches!(event, ServerEvent::Entry(_)) {
-                if guard.event_buffer.len() >= BUFFER_CAPACITY {
-                    guard.event_buffer.pop_front();
-                }
-                guard.event_buffer.push_back(event.clone());
-            }
-            guard.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
-
-            // Auto-title: if a Done event arrives on a tree without a title,
-            // spawn a side thread to generate one.
-            if matches!(event, ServerEvent::Done { .. }) {
-                let store_for_title = store.clone();
-                let cfg_for_title = cfg.clone();
-                let entry_for_title = entry.clone();
-                let tid = tree_id.clone();
-                std::thread::spawn(move || {
-                    let needs = match store_for_title.get_tree(&tid) {
-                        Ok(Some(m)) => m.title.is_none(),
-                        _ => false,
-                    };
-                    if !needs { return; }
-                    let provider = Provider::new(
-                        cfg_for_title.summary.base_url.clone(),
-                        cfg_for_title.summary.api_key.clone(),
-                        cfg_for_title.summary.model.clone(),
-                        false,
-                    );
-                    match agent_core::agent::auto_title(&store_for_title, &provider, &tid) {
-                        Ok(title) => {
-                            let ev = ServerEvent::MetaUpdate { title: Some(title) };
-                            let mut g = entry_for_title.lock().unwrap();
-                            g.subscribers.retain(|tx| tx.send(ev.clone()).is_ok());
+            match pipe_out {
+                PipeOut::Event(event) => {
+                    let mut guard = entry.lock().unwrap();
+                    if matches!(event, ServerEvent::Entry(_)) {
+                        if guard.event_buffer.len() >= BUFFER_CAPACITY {
+                            guard.event_buffer.pop_front();
                         }
-                        Err(e) => log::warn!("[auto-title {}] {}", tid, e),
+                        guard.event_buffer.push_back(event.clone());
                     }
-                });
+                    guard.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+
+                    // Auto-title: if a Done event arrives on a tree without a title,
+                    // spawn a side thread to generate one.
+                    if matches!(event, ServerEvent::Done { .. }) {
+                        let store_for_title = store.clone();
+                        let cfg_for_title = cfg.clone();
+                        let entry_for_title = entry.clone();
+                        let tid = tree_id.clone();
+                        std::thread::spawn(move || {
+                            let needs = match store_for_title.get_tree(&tid) {
+                                Ok(Some(m)) => m.title.is_none(),
+                                _ => false,
+                            };
+                            if !needs { return; }
+                            let provider = Provider::new(
+                                cfg_for_title.summary.base_url.clone(),
+                                cfg_for_title.summary.api_key.clone(),
+                                cfg_for_title.summary.model.clone(),
+                                false,
+                            );
+                            match agent_core::agent::auto_title(&store_for_title, &provider, &tid) {
+                                Ok(title) => {
+                                    let ev = ServerEvent::MetaUpdate { title: Some(title) };
+                                    let mut g = entry_for_title.lock().unwrap();
+                                    g.subscribers.retain(|tx| tx.send(ev.clone()).is_ok());
+                                }
+                                Err(e) => log::warn!("[auto-title {}] {}", tid, e),
+                            }
+                        });
+                    }
+                }
+                PipeOut::Llm(req) => {
+                    // The worker is blocked on ChannelReader::read waiting for the
+                    // response, so we process this synchronously (no other events
+                    // arrive until the call completes).
+                    handle_llm_request(req, &entry, &cfg);
+                }
             }
         }
         log::info!("[proxy {}] worker stdout closed", tree_id);
@@ -375,6 +394,74 @@ fn spawn_stdout_proxy(
 
         ACTIVE_WORKERS.lock().unwrap().remove(&tree_id);
     });
+}
+
+/// Handle an LlmRequest from the worker by making the actual HTTP call and
+/// streaming LlmResponse::Chunk / Done / Error back to the worker's stdin.
+fn handle_llm_request(
+    req: LlmRequest,
+    entry: &Arc<Mutex<WorkerEntry>>,
+    cfg: &Config,
+) {
+    // AGENT_TEST_STUB: return canned SSE data without a real HTTP call.
+    // INTENTIONAL: this env var is only set in the test harness so the same
+    // binary handles both test and production. DO NOT remove this check —
+    // the worker integration test depends on it.
+    if std::env::var("AGENT_TEST_STUB").as_deref() == Ok("1") {
+        let canned = [
+            r#"data: {"choices":[{"delta":{"content":"Hello! I am an AI assistant."},"index":0,"finish_reason":null}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "",
+        ];
+        for line in &canned {
+            let msg = PipeIn::Llm(LlmResponse::Chunk {
+                id: req.id,
+                data: format!("{}\n", line),
+            });
+            let json = serde_json::to_string(&msg).unwrap();
+            let guard = entry.lock().unwrap();
+            let _ = guard.stdin_tx.send(json);
+        }
+        let done = PipeIn::Llm(LlmResponse::Done { id: req.id });
+        let json = serde_json::to_string(&done).unwrap();
+        let guard = entry.lock().unwrap();
+        let _ = guard.stdin_tx.send(json);
+        return;
+    }
+
+    let provider = Provider::new(
+        cfg.provider.base_url.clone(),
+        cfg.provider.api_key.clone(),
+        cfg.provider.model.clone(),
+        cfg.provider.enable_thinking,
+    );
+    match provider.stream_chat(&req.messages, &req.tools) {
+        Ok(mut stream) => {
+            while let Some(line) = stream.next_line() {
+                let msg = PipeIn::Llm(LlmResponse::Chunk {
+                    id: req.id,
+                    data: line,
+                });
+                let json = serde_json::to_string(&msg).unwrap();
+                let guard = entry.lock().unwrap();
+                let _ = guard.stdin_tx.send(json);
+            }
+            let done = PipeIn::Llm(LlmResponse::Done { id: req.id });
+            let json = serde_json::to_string(&done).unwrap();
+            let guard = entry.lock().unwrap();
+            let _ = guard.stdin_tx.send(json);
+        }
+        Err(e) => {
+            let err = PipeIn::Llm(LlmResponse::Error {
+                id: req.id,
+                message: e.to_string(),
+            });
+            let json = serde_json::to_string(&err).unwrap();
+            let guard = entry.lock().unwrap();
+            let _ = guard.stdin_tx.send(json);
+        }
+    }
 }
 
 fn spawn_stderr_demux(tree_id: String, stderr: ChildStderr, buf: StderrBuf) {

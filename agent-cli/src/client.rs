@@ -86,7 +86,7 @@ impl AgentClient {
     fn post_empty(&self, path: &str) -> Result<(), String> {
         let url = format!("{}{}", self.base, path);
         let resp = ureq::post(&url)
-            .send_json(&serde_json::json!({}))
+            .send_json(serde_json::json!({}))
             .map_err(|e| format!("request failed: {}", e))?;
         if resp.status().as_u16() >= 400 {
             return Err(extract_error(resp));
@@ -155,7 +155,7 @@ impl AgentClient {
     pub fn auto_title(&self, tree_id: &str) -> Result<String, String> {
         let url = format!("{}/trees/{}/auto-title", self.base, tree_id);
         let resp = ureq::post(&url)
-            .send_json(&serde_json::json!({}))
+            .send_json(serde_json::json!({}))
             .map_err(|e| format!("request failed: {}", e))?;
         if resp.status().as_u16() >= 400 {
             return Err(extract_error(resp));

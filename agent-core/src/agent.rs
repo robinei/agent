@@ -20,7 +20,7 @@ use log::{error, info, warn};
 use crate::config::SessionConfig;
 use crate::context_files;
 use crate::hooks;
-use crate::provider::Provider;
+use crate::provider::{LlmProvider, Provider};
 use crate::store::Store;
 use crate::tools::{self, Tool};
 use crate::types::*;
@@ -427,10 +427,10 @@ fn split_thinking_chunks(text: &str, in_thinking: &mut bool) -> Vec<ThinkingSegm
 /// This function is spawned in a dedicated thread by the server's lifecycle module.
 /// It reads from `input_rx` for user messages, builds context, calls the LLM,
 /// dispatches tools, and emits events over `event_tx`.
-pub fn run_agent(
+pub fn run_agent<P: LlmProvider>(
     tree_id: &str,
     store: Store,
-    provider: Provider,
+    provider: P,
     session_config: SessionConfig,
     input_rx: mpsc::Receiver<AgentInput>,
     event_tx: mpsc::Sender<ServerEvent>,

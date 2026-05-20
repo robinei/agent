@@ -134,7 +134,7 @@ impl Store {
     pub fn list_trees(&self) -> Result<Vec<TreeMeta>> {
         let cache = INDEX_CACHE.lock().unwrap();
         let mut trees: Vec<TreeMeta> = cache.values().cloned().collect();
-        trees.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        trees.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         Ok(trees)
     }
 
@@ -174,7 +174,7 @@ impl Store {
                 }
             }
         }
-        trees.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        trees.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         // Write index.json as cache (best-effort)
         let index_path = self.base_dir.join("index.json");
         let _ = std::fs::write(&index_path, serde_json::to_string(&trees).unwrap_or_default());

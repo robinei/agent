@@ -420,6 +420,11 @@ impl ChatStream {
         }
     }
 
+    /// Construct a ChatStream from an arbitrary BufRead source.
+    pub fn from_reader(reader: Box<dyn BufRead + Send>) -> Self {
+        Self { reader }
+    }
+
     /// Read the next SSE line. Returns `None` on EOF or error.
     pub fn next_line(&mut self) -> Option<String> {
         let mut line = String::new();
@@ -479,7 +484,7 @@ pub enum ServerEvent {
 // ── Tool system types ──
 
 /// Definition of a tool, sent to the LLM as a JSON Schema function definition.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,

@@ -173,7 +173,8 @@ impl Tool for GrepTool {
                         block.push_str(&format!("{}:\n", relative.display()));
                     }
 
-                    for ctx_lineno in ctx_start..ctx_end {
+                    for (idx, line) in lines[ctx_start..ctx_end].iter().enumerate() {
+                        let ctx_lineno = ctx_start + idx;
                         let prefix = if ctx_lineno == lineno {
                             ">"
                         } else {
@@ -183,7 +184,7 @@ impl Tool for GrepTool {
                             "{} {:>6}: {}\n",
                             prefix,
                             ctx_lineno + 1,
-                            lines[ctx_lineno]
+                            line
                         ));
                     }
 
