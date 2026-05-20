@@ -153,11 +153,22 @@ fn replay_entries(out: &mut impl Write, entries: &[Entry]) {
 }
 
 fn render_done(out: &mut impl Write, status: &str) {
-    let _ = write!(out, "\r\n");
     let _ = match status {
-        "complete" => write!(out, "  {}✓{} Done\r\n", color::Fg(color::Green), style::Reset),
-        "stop" => write!(out, "  {}■{} Stopped\r\n", color::Fg(color::Yellow), style::Reset),
-        _ => write!(out, "{}\r\n", style::Bold),
+        // Provider's "stop" finish_reason = model decided it was done.
+        // "complete" is reserved for synthetic completion paths.
+        // Both are happy-path turn endings.
+        "stop" | "complete" => {
+            write!(out, "\r\n  {}✓{} Done\r\n", color::Fg(color::Green), style::Reset)
+        }
+        // Model hit the provider's max_tokens or our hard cap.
+        "length" => write!(out, "\r\n  {}⚠{} Stopped at length limit\r\n",
+                           color::Fg(color::Yellow), style::Reset),
+        // Worker crashed or was killed mid-turn.
+        "aborted" => write!(out, "\r\n  {}✖{} Aborted\r\n",
+                            color::Fg(color::Red), style::Reset),
+        // Unknown status — show it so we notice in testing.
+        other => write!(out, "\r\n  {}■{} Done ({}){}\r\n",
+                        color::Fg(color::Yellow), style::Reset, other, style::Reset),
     };
 }
 
@@ -201,6 +212,11 @@ struct RenderState {
     assistant_header_shown: bool,
 }
 
+/// Normalize bare `\n` to `\r\n` for raw-mode terminal output.
+fn normalize_for_raw(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
 fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderState) {
     match event {
         ServerEvent::TextChunk { content } => {
@@ -209,7 +225,10 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
                 write!(out, "\r\n").ok();
                 write!(out, "{}  Assistant:{}\r\n", color::Fg(color::Cyan), style::Reset).ok();
             }
-            write!(out, "{}", content).ok();
+            // Raw mode: `\n` alone leaves the cursor at the same column.
+            // Normalize existing `\r\n` first (so we don't write `\r\r\n`), then
+            // translate bare `\n` to `\r\n`.
+            write!(out, "{}", normalize_for_raw(content)).ok();
             out.flush().ok();
         }
         ServerEvent::ToolStart { tool, input } => {
@@ -610,4 +629,75 @@ pub fn run_interactive(server: &str, initial_repo_path: Option<String>, stop: &A
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_render_done_stop_is_happy_path() {
+        let mut buf = Vec::new();
+        render_done(&mut buf, "stop");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains('✓'), "stop should show ✓, got: {output}");
+        assert!(output.contains("Done"), "stop should show Done, got: {output}");
+        assert!(!output.contains("Stopped"), "stop should not show Stopped, got: {output}");
+        assert!(!output.contains("Aborted"), "stop should not show Aborted, got: {output}");
+    }
+
+    #[test]
+    fn test_render_done_complete_is_happy_path() {
+        let mut buf = Vec::new();
+        render_done(&mut buf, "complete");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains('✓'), "complete should show ✓, got: {output}");
+        assert!(output.contains("Done"), "complete should show Done, got: {output}");
+    }
+
+    #[test]
+    fn test_render_done_aborted_is_red() {
+        let mut buf = Vec::new();
+        render_done(&mut buf, "aborted");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains('✖'), "aborted should show ✖, got: {output}");
+        assert!(output.contains("Aborted"), "aborted should show Aborted, got: {output}");
+    }
+
+    #[test]
+    fn test_render_done_length() {
+        let mut buf = Vec::new();
+        render_done(&mut buf, "length");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains('⚠'), "length should show ⚠, got: {output}");
+        assert!(output.contains("Stopped at length limit"), "length should show warning, got: {output}");
+    }
+
+    #[test]
+    fn test_normalize_for_raw_replaces_bare_newlines() {
+        let input = "hello\nworld\n";
+        let result = normalize_for_raw(input);
+        assert_eq!(result, "hello\r\nworld\r\n");
+    }
+
+    #[test]
+    fn test_normalize_for_raw_no_double_carriage_return() {
+        let input = "hello\r\nworld\r\n";
+        let result = normalize_for_raw(input);
+        assert_eq!(result, "hello\r\nworld\r\n");
+    }
+
+    #[test]
+    fn test_normalize_for_raw_no_newlines() {
+        let input = "hello world";
+        let result = normalize_for_raw(input);
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_normalize_for_raw_mixed() {
+        let input = "a\r\nb\nc\r\nd\n";
+        let result = normalize_for_raw(input);
+        assert_eq!(result, "a\r\nb\r\nc\r\nd\r\n");
+    }
 }

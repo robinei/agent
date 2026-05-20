@@ -2217,3 +2217,133 @@ it only checks that paths are **absent** from `--tmpfs` after `unhide`
 - Modified: `agent-server/src/lifecycle.rs` — `build_bwrap_argv` hide loop now uses `symlink_metadata` to distinguish files from directories; directories get `--tmpfs`, files get `--bind /dev/null <path>` so shell histories, `.netrc`, etc. are correctly hidden without causing bwrap to abort with "Not a directory"
 - Test added: `test_build_bwrap_argv_file_hide` — creates a temp dir with one file and one directory, asserts the file gets `--bind /dev/null` and the directory gets `--tmpfs`, and the file does not appear with `--tmpfs`
 - Verified: `cargo test --workspace` → 111 passed, 0 failed
+
+---
+
+### Step 13 — CLI rendering: raw-mode newlines + Done label
+
+- [x] done
+
+**Goal:** Fix two display issues observed in the interactive TUI after Step 12.
+
+**Symptoms observed:**
+
+1. Streaming assistant text shows a staircase pattern — each newline
+   advances the cursor down but keeps the column from the previous
+   line, producing output like:
+   ```
+   Hello there.
+                I see you're working on Rust...
+                                                Want me to help?
+   ```
+2. Every normal turn ends with `■ Stopped` instead of `✓ Done`, even
+   though the model finished generating cleanly.
+
+**Root causes:**
+
+1. **Raw-mode + `\n`-only newlines.** `agent-cli/src/interactive.rs:212`
+   writes `TextChunk.content` verbatim:
+   ```rust
+   write!(out, "{}", content).ok();
+   ```
+   The CLI calls `io::stdout().into_raw_mode()` at start of
+   `run_interactive`, so terminal output is in raw mode and `\n` alone
+   only moves the cursor down — `\r\n` is required to also return to
+   column 0. The LLM streams `\n`-only newlines (standard for text
+   content), so every newline produces the staircase.
+
+2. **`"stop"` label mismatch.** `agent-core/src/agent.rs` forwards the
+   provider's `finish_reason` directly into `ServerEvent::Done {
+   status }`. For OpenAI-compatible APIs the normal end-of-stream
+   finish reason is `"stop"` (model decided it was done). The CLI's
+   `render_done` at `interactive.rs:159` maps `"stop"` → `■ Stopped`,
+   which reads as "interrupted by user". The genuine `"aborted"` case
+   (worker crash, emitted by `lifecycle::spawn_stdout_proxy`) currently
+   falls through to the `_ =>` arm and prints essentially nothing.
+
+**Spec details:**
+
+#### Fix 1 — translate `\n` → `\r\n` in `TextChunk` rendering
+
+File: `agent-cli/src/interactive.rs`, `render_event`'s `TextChunk` arm.
+
+Replace:
+```rust
+write!(out, "{}", content).ok();
+```
+With:
+```rust
+// Raw mode: `\n` alone leaves the cursor at the same column.
+// Normalize existing `\r\n` first (so we don't write `\r\r\n`), then
+// translate bare `\n` to `\r\n`.
+let normalized = content.replace("\r\n", "\n").replace('\n', "\r\n");
+write!(out, "{}", normalized).ok();
+```
+
+Chunk-boundary edge case: if a `\r\n` is split across two streaming
+chunks (one ends with `\r`, next starts with `\n`), the simple replace
+won't see the pair. In practice this doesn't happen with OpenAI-style
+chunks. Worst case is one stray blank line. Don't add buffering for it
+unless we see it.
+
+#### Fix 2 — `render_done` labels
+
+File: `agent-cli/src/interactive.rs:155–162`.
+
+Replace the whole function with:
+```rust
+fn render_done(out: &mut impl Write, status: &str) {
+    let _ = match status {
+        // Provider's "stop" finish_reason = model decided it was done.
+        // "complete" is reserved for synthetic completion paths.
+        // Both are happy-path turn endings.
+        "stop" | "complete" => {
+            write!(out, "  {}✓{} Done\r\n", color::Fg(color::Green), style::Reset)
+        }
+        // Model hit the provider's max_tokens or our hard cap.
+        "length" => write!(out, "  {}⚠{} Stopped at length limit\r\n",
+                           color::Fg(color::Yellow), style::Reset),
+        // Worker crashed or was killed mid-turn.
+        "aborted" => write!(out, "  {}✖{} Aborted\r\n",
+                            color::Fg(color::Red), style::Reset),
+        // Unknown status — show it so we notice in testing.
+        other => write!(out, "  {}■{} Done ({}){}\r\n",
+                        color::Fg(color::Yellow), style::Reset, other, style::Reset),
+    };
+}
+```
+
+**Tests to add (in `interactive.rs`):**
+
+Both behaviours test cleanly against a `Vec<u8>` as the `impl Write`
+target — no terminal needed.
+
+- `test_render_done_stop_is_happy_path` — `render_done(&mut buf,
+  "stop")` produces output containing `✓` and `Done`, not `Stopped`
+  or `Aborted`.
+- `test_render_done_aborted_is_red` — `"aborted"` produces `✖` and
+  `Aborted`.
+- `test_text_chunk_normalizes_newlines` — either invoke the
+  `render_event` path with a `\n`-bearing `TextChunk`, or extract the
+  normalize step into a small `fn normalize_for_raw(s: &str) ->
+  String` for direct testing. Assert the result contains `\r\n` and
+  no bare `\n`.
+
+**Do not modify:**
+
+- `agent-core/src/agent.rs` — keep forwarding the provider's
+  `finish_reason` verbatim. Display semantics belong in the CLI.
+- WS protocol, worker, server.
+
+**Verify:**
+
+- `cargo test --workspace` — three new tests pass
+- Manual: `agent cli`, send "hello", observe smoothly-flowing
+  assistant text ending in green `✓ Done`
+- Manual: with sandbox temporarily broken to force a worker crash,
+  observe `✖ Aborted` on the CLI
+
+**Notes:**
+- Modified: `agent-cli/src/interactive.rs` — Fix 1: `render_event`'s `TextChunk` arm now calls `normalize_for_raw(content)` which replaces `\r\n` → `\n` then `\n` → `\r\n` for raw-mode terminal output; added `normalize_for_raw()` function. Fix 2: `render_done` now maps `"stop"` and `"complete"` to green `✓ Done`, `"length"` to yellow `⚠ Stopped at length limit`, `"aborted"` to red `✖ Aborted`, and unknown to yellow `■ Done ({status})`.
+- Tests added: `test_render_done_stop_is_happy_path`, `test_render_done_complete_is_happy_path`, `test_render_done_aborted_is_red`, `test_render_done_length`, `test_normalize_for_raw_replaces_bare_newlines`, `test_normalize_for_raw_no_double_carriage_return`, `test_normalize_for_raw_no_newlines`, `test_normalize_for_raw_mixed`
+- Verified: `cargo test --workspace` → 119 passed, 0 failed; `cargo clippy --workspace` → no new warnings_
