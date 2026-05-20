@@ -36,6 +36,7 @@ fn extract_error(resp: http::Response<ureq::Body>) -> String {
 #[derive(Clone)]
 pub struct AgentClient {
     base: String,
+    server: String,
 }
 
 impl AgentClient {
@@ -43,7 +44,13 @@ impl AgentClient {
     pub fn new(server: &str) -> Self {
         Self {
             base: base_url(server),
+            server: server.to_string(),
         }
+    }
+
+    /// Return the raw server address string (for WS connection construction).
+    pub fn server_addr(&self) -> &str {
+        &self.server
     }
 
     fn get_json<T: for<'a> serde::Deserialize<'a>>(&self, path: &str) -> Result<T, String> {
@@ -167,7 +174,7 @@ impl AgentClient {
 // ── WebSocket session for agent communication ──
 
 /// Parse host and port from a server string like "localhost:8080" or "http://localhost:8080".
-fn parse_host_port(server: &str) -> Result<(String, u16), String> {
+pub fn parse_host_port(server: &str) -> Result<(String, u16), String> {
     let s = server.strip_prefix("http://").or_else(|| server.strip_prefix("https://")).unwrap_or(server);
     let s = s.trim_end_matches('/');
     let (host, port_str) = s.split_once(':').ok_or_else(|| format!("invalid server address '{}': expected host:port", server))?;
@@ -194,6 +201,22 @@ impl AgentSession {
         let (host, port) = parse_host_port(server)?;
         let url = format!("ws://{}:{}/trees/{}/ws", host, port, tree_id);
         let (ws, _resp) = tungstenite::connect(url).map_err(|e| format!("WS connect failed: {}", e))?;
+        Ok(Self { ws })
+    }
+
+    /// Perform a WebSocket client handshake over an already-connected stream.
+    /// Used for the in-process socketpair path; the stream need not be a real
+    /// TCP socket — any SOCK_STREAM fd cast as TcpStream works on Linux.
+    pub fn from_stream(
+        stream: std::net::TcpStream,
+        tree_id: &str,
+    ) -> Result<Self, String> {
+        let url = format!("ws://localhost/trees/{}/ws", tree_id);
+        // Wrap in MaybeTlsStream so tungstenite::client returns the
+        // WebSocket<MaybeTlsStream<TcpStream>> type that the struct field expects.
+        let stream = tungstenite::stream::MaybeTlsStream::Plain(stream);
+        let (ws, _) = tungstenite::client(url, stream)
+            .map_err(|e| format!("WS handshake failed: {}", e))?;
         Ok(Self { ws })
     }
 

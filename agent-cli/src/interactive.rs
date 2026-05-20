@@ -23,7 +23,7 @@ use agent_core::types::{Entry, ServerEvent, TreeMeta};
 
 use crate::client::TryEvent;
 
-use crate::client::AgentClient;
+use crate::Backend;
 
 // ── Command parsing ──
 
@@ -1061,10 +1061,10 @@ fn select_or_create_tree(
     input_line: &mut InputLine,
     keys: &mut impl Iterator<Item = Result<Key, std::io::Error>>,
     out: &mut impl Write,
-    client: &AgentClient,
+    backend: &Backend,
 ) -> Result<String, String> {
     loop {
-        let trees = client.list_trees()?;
+        let trees = backend.list_trees()?;
 
         if !trees.is_empty() {
             write!(out, "\r\nYour trees:\r\n").ok();
@@ -1095,7 +1095,7 @@ fn select_or_create_tree(
                 std::process::exit(0);
             }
             if input == "new" {
-                return create_tree_interactive(input_line, keys, out, client);
+                return create_tree_interactive(input_line, keys, out, backend);
             }
 
             if let Ok(idx) = input.parse::<usize>() {
@@ -1119,7 +1119,7 @@ fn select_or_create_tree(
             write!(out, "Invalid selection.\r\n").ok();
         } else {
             write!(out, "No trees found. Let's create one.\r\n").ok();
-            return create_tree_interactive(input_line, keys, out, client);
+            return create_tree_interactive(input_line, keys, out, backend);
         }
     }
 }
@@ -1128,7 +1128,7 @@ fn create_tree_interactive(
     input_line: &mut InputLine,
     keys: &mut impl Iterator<Item = Result<Key, std::io::Error>>,
     out: &mut impl Write,
-    client: &AgentClient,
+    backend: &Backend,
 ) -> Result<String, String> {
     let mut input_text = |prompt: &str| -> String {
         write!(out, "{}", prompt).ok();
@@ -1169,7 +1169,7 @@ fn create_tree_interactive(
     let model = model.trim().to_string();
     let model = if model.is_empty() { None } else { Some(model) };
 
-    let meta = client.create_tree(
+    let meta = backend.create_tree(
         Some(&title),
         repo_path.as_deref(),
         model.as_deref(),
@@ -1218,13 +1218,13 @@ fn poll_key() -> Option<Key> {
 }
 
 fn process_message(
-    server: &str,
+    backend: &Backend,
     tree_id: &str,
     text: &str,
     out: &mut impl Write,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    let mut session = crate::client::AgentSession::connect(server, tree_id)?;
+    let mut session = backend.connect_session(tree_id)?;
     session.set_nonblocking(true)?;
     session.send_message(text)?;
 
@@ -1247,6 +1247,10 @@ fn process_message(
                     }
                     erase_spinner(out, &mut state);
                     let done = matches!(&ev, ServerEvent::Done { .. });
+                    // INTENTIONAL: fatal errors must exit the loop just like Done.
+                    // Without this the dead worker never sends Done and the loop
+                    // spins forever, leaving the terminal frozen with no exit.
+                    let fatal = matches!(&ev, ServerEvent::Error { fatal: true, .. });
                     render_event(out, &ev, &mut state);
                     // All events except streaming chunks always end with \r\n.
                     // ToolStart writes nothing so col is unchanged.
@@ -1258,7 +1262,7 @@ fn process_message(
                     ) {
                         state.col = 0;
                     }
-                    if done {
+                    if done || fatal {
                         return Ok(());
                     }
                     draw_spinner(out, &mut state, SPINNER_FRAMES[spin_frame]);
@@ -1321,7 +1325,7 @@ fn process_message(
 
 /// Run the interactive TUI.
 pub fn run_interactive(
-    server: &str,
+    backend: &Backend,
     initial_repo_path: Option<String>,
     stop: &AtomicBool,
 ) -> Result<(), String> {
@@ -1332,19 +1336,17 @@ pub fn run_interactive(
 
     write!(
         out,
-        "{}Connected to server at {}{}\r\n",
+        "{}Connected{}",
         color::Fg(color::Green),
-        server,
         style::Reset
     )
     .ok();
     print_help(&mut out);
     write!(out, "\r\n").ok();
 
-    let client = AgentClient::new(server);
     let mut input_line = InputLine::new();
     let mut current_tree_id = if let Some(rp) = initial_repo_path {
-        let meta = client
+        let meta = backend
             .create_tree(Some("untitled"), Some(&rp), None, &[], None, &[], &[])
             .map_err(|e| format!("failed to create tree: {}", e))?;
         let sid = if meta.id.len() > 8 {
@@ -1355,7 +1357,7 @@ pub fn run_interactive(
         write!(out, "Created tree {} in {}\r\n", sid, rp).ok();
         meta.id
     } else {
-        select_or_create_tree(&mut input_line, &mut keys, &mut out, &client)?
+        select_or_create_tree(&mut input_line, &mut keys, &mut out, backend)?
     };
     let mut show_header = true;
 
@@ -1365,7 +1367,7 @@ pub fn run_interactive(
             break;
         }
         if show_header {
-            match client.get_tree(&current_tree_id) {
+            match backend.get_tree(&current_tree_id) {
                 Ok(meta) => {
                     let title = meta.title.as_deref().unwrap_or("untitled");
                     let short_id = if current_tree_id.len() > 8 {
@@ -1385,7 +1387,7 @@ pub fn run_interactive(
                     )
                     .ok();
 
-                    if let Ok(entries) = client.get_entries(&current_tree_id) {
+                    if let Ok(entries) = backend.get_entries(&current_tree_id) {
                         if !entries.is_empty() {
                             let last: Vec<_> =
                                 entries.iter().rev().take(10).rev().cloned().collect();
@@ -1430,7 +1432,7 @@ pub fn run_interactive(
                 break;
             }
             CliCommand::Help => print_help(&mut out),
-            CliCommand::ListTrees => match client.list_trees() {
+            CliCommand::ListTrees => match backend.list_trees() {
                 Ok(trees) => {
                     write!(out, "\r\n").ok();
                     for (i, t) in trees.iter().enumerate() {
@@ -1444,7 +1446,7 @@ pub fn run_interactive(
                 repo_path,
                 model,
             } => {
-                match client.create_tree(
+                match backend.create_tree(
                     if title.is_empty() { None } else { Some(&title) },
                     repo_path.as_deref(),
                     model.as_deref(),
@@ -1479,7 +1481,7 @@ pub fn run_interactive(
                     print_error(&mut out, "Usage: /switch <tree_id>");
                     continue;
                 }
-                match client.get_tree(&id) {
+                match backend.get_tree(&id) {
                     Ok(meta) => {
                         current_tree_id = meta.id;
                         show_header = true;
@@ -1495,7 +1497,7 @@ pub fn run_interactive(
                     Err(e) => print_error(&mut out, &format!("Tree not found: {}", e)),
                 }
             }
-            CliCommand::Stop => match client.stop_agent(&current_tree_id) {
+            CliCommand::Stop => match backend.stop_agent(&current_tree_id) {
                 Ok(()) => {
                     let _ = write!(
                         out,
@@ -1506,7 +1508,7 @@ pub fn run_interactive(
                 }
                 Err(e) => print_error(&mut out, &format!("Failed to stop: {}", e)),
             },
-            CliCommand::Show => match client.get_tree(&current_tree_id) {
+            CliCommand::Show => match backend.get_tree(&current_tree_id) {
                 Ok(meta) => {
                     write!(out, "{}Tree info:{}\r\n", style::Bold, style::Reset).ok();
                     write!(out, "  ID:        {}\r\n", meta.id).ok();
@@ -1536,7 +1538,7 @@ pub fn run_interactive(
             },
             CliCommand::Entries(n) => {
                 let limit = n.unwrap_or(10);
-                match client.get_entries(&current_tree_id) {
+                match backend.get_entries(&current_tree_id) {
                     Ok(entries) => {
                         let last: Vec<_> = entries.iter().rev().take(limit).rev().collect();
                         write!(
@@ -1557,7 +1559,7 @@ pub fn run_interactive(
             CliCommand::Message(text) => {
                 write!(out, "\x1b[?25l").ok();
                 out.flush().ok();
-                process_message(server, &current_tree_id, &text, &mut out, stop)?;
+                process_message(backend, &current_tree_id, &text, &mut out, stop)?;
             }
         }
     }

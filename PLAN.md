@@ -63,8 +63,6 @@ Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
   to stop a later reader (human or model) from "improving" the code into
   a bug.
 
----
-
 ## Future ideas
 
 Small things worth doing eventually; promote to a step when picked up.
