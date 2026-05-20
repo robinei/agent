@@ -377,8 +377,8 @@ enum ThinkingSegment {
 
 /// Split a content delta into alternating thinking/text segments.
 ///
-/// `in_thinking` tracks whether the parser is currently inside a ` thinking` block
-/// across chunk boundaries. Both ` thinking` and ` response` may land in the middle
+/// `in_thinking` tracks whether the parser is currently inside a `<think>` block
+/// across chunk boundaries. Both `<think>` and `</think>` may land in the middle
 /// of a chunk or straddle two chunks; the caller preserves `in_thinking` between
 /// calls to handle the cross-boundary case.
 fn split_thinking_chunks(text: &str, in_thinking: &mut bool) -> Vec<ThinkingSegment> {
@@ -386,13 +386,13 @@ fn split_thinking_chunks(text: &str, in_thinking: &mut bool) -> Vec<ThinkingSegm
     let mut rest = text;
     loop {
         if *in_thinking {
-            match rest.find(" response") {
+            match rest.find("</think>") {
                 Some(pos) => {
                     if pos > 0 {
                         result.push(ThinkingSegment::Thinking(rest[..pos].to_string()));
                     }
                     *in_thinking = false;
-                    rest = &rest[pos + " response".len()..];
+                    rest = &rest[pos + "</think>".len()..];
                 }
                 None => {
                     if !rest.is_empty() {
@@ -402,13 +402,13 @@ fn split_thinking_chunks(text: &str, in_thinking: &mut bool) -> Vec<ThinkingSegm
                 }
             }
         } else {
-            match rest.find(" thinking") {
+            match rest.find("<think>") {
                 Some(pos) => {
                     if pos > 0 {
                         result.push(ThinkingSegment::Text(rest[..pos].to_string()));
                     }
                     *in_thinking = true;
-                    rest = &rest[pos + " thinking".len()..];
+                    rest = &rest[pos + "<think>".len()..];
                 }
                 None => {
                     if !rest.is_empty() {
@@ -677,7 +677,7 @@ pub fn run_agent(
                 // chunks with reasoning fields before the actual text)
 
                 // Explicit reasoning field (some providers like DeepSeek / Qwen)
-                if let Some(rc) = &choice.delta.reasoning_content {
+                if let Some(rc) = &choice.delta.reasoning {
                     if !rc.is_empty() {
                         let _ = event_tx.send(ServerEvent::ThinkingChunk { content: rc.clone() });
                     }
@@ -1114,7 +1114,7 @@ mod tests {
     #[test]
     fn test_split_full_block() {
         let mut in_thinking = false;
-        let result = split_thinking_chunks(" thinkingreason responseanswer", &mut in_thinking);
+        let result = split_thinking_chunks("<think>reason</think>answer", &mut in_thinking);
         assert_eq!(result.len(), 2);
         assert!(matches!(&result[0], ThinkingSegment::Thinking(t) if t == "reason"));
         assert!(matches!(&result[1], ThinkingSegment::Text(t) if t == "answer"));
@@ -1124,7 +1124,7 @@ mod tests {
     #[test]
     fn test_split_open_only() {
         let mut in_thinking = false;
-        let result = split_thinking_chunks(" thinkingpartial", &mut in_thinking);
+        let result = split_thinking_chunks("<think>partial", &mut in_thinking);
         assert_eq!(result.len(), 1);
         assert!(matches!(&result[0], ThinkingSegment::Thinking(t) if t == "partial"));
         assert!(in_thinking);
@@ -1133,17 +1133,17 @@ mod tests {
     #[test]
     fn test_split_close_only() {
         let mut in_thinking = true;
-        let result = split_thinking_chunks("end response rest", &mut in_thinking);
+        let result = split_thinking_chunks("end</think>rest", &mut in_thinking);
         assert_eq!(result.len(), 2);
         assert!(matches!(&result[0], ThinkingSegment::Thinking(t) if t == "end"));
-        assert!(matches!(&result[1], ThinkingSegment::Text(t) if t == " rest"));
+        assert!(matches!(&result[1], ThinkingSegment::Text(t) if t == "rest"));
         assert!(!in_thinking);
     }
 
     #[test]
     fn test_split_empty_think_block() {
         let mut in_thinking = false;
-        let result = split_thinking_chunks(" thinking responseafter", &mut in_thinking);
+        let result = split_thinking_chunks("<think></think>after", &mut in_thinking);
         assert_eq!(result.len(), 1);
         assert!(matches!(&result[0], ThinkingSegment::Text(t) if t == "after"));
         assert!(!in_thinking);

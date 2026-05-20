@@ -381,7 +381,7 @@ pub struct Delta {
     #[serde(default)]
     pub tool_calls: Vec<DeltaToolCall>,
     #[serde(default)]
-    pub reasoning_content: Option<String>,
+    pub reasoning: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]

@@ -20,6 +20,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.provider.base_url.clone(),
         config.provider.api_key.clone(),
         config.provider.model.clone(),
+        config.provider.enable_thinking,
     );
 
     let (input_tx, input_rx) = mpsc::channel::<AgentInput>();

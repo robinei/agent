@@ -34,6 +34,10 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Send `thinking: {type: "enabled"}` and `reasoning_effort: "high"` in
+    /// the request body. Required for DeepSeek and some other providers to
+    /// emit reasoning content. Has no effect on models that don't support it.
+    pub enable_thinking: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -68,6 +72,7 @@ impl Default for Config {
                 base_url: "http://localhost:8080/v1".into(),
                 api_key: String::new(),
                 model: "qwen2.5-coder-7b-instruct".into(),
+                enable_thinking: true,
             },
             summary: SummaryConfig {
                 model: "qwen2.5-coder-1.5b-instruct".into(),
@@ -199,6 +204,9 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
         }
         if let Some(v) = section.get("model").and_then(|v| v.as_str()) {
             cfg.provider.model = v.to_string();
+        }
+        if let Some(v) = section.get("enable_thinking").and_then(|v| v.as_bool()) {
+            cfg.provider.enable_thinking = v;
         }
     }
 

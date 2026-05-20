@@ -181,6 +181,7 @@ fn print_tree_meta(out: &mut impl Write, meta: &TreeMeta, index: usize) {
 
 /// Replay old entries as if they just happened — seamless, no "quit" feel.
 fn replay_entries(out: &mut impl Write, entries: &[Entry]) {
+    write!(out, "\x1b[?25l").ok();
     let mut in_turn = false;
     let mut state = RenderState::default();
 
@@ -192,13 +193,7 @@ fn replay_entries(out: &mut impl Write, entries: &[Entry]) {
                 if message.role == agent_core::types::MessageRole::User =>
             {
                 if in_turn {
-                    write!(
-                        out,
-                        "{}──────────────────────{}\r\n",
-                        color::Fg(color::Blue),
-                        style::Reset
-                    )
-                    .ok();
+                    write!(out, "\r\n").ok();
                 }
                 in_turn = true;
 
@@ -235,61 +230,28 @@ fn replay_entries(out: &mut impl Write, entries: &[Entry]) {
 
     if let Some(last) = entries.last() {
         if !matches!(last, Entry::SessionEnd { .. }) && in_turn {
-            write!(
-                out,
-                "{}──────────────────────{}\r\n",
-                color::Fg(color::Blue),
-                style::Reset
-            )
-            .ok();
+            // blank line before prompt
         }
     }
 }
 
+
 fn render_done(out: &mut impl Write, status: &str) {
-    let _ = match status {
-        // Provider's "stop" finish_reason = model decided it was done.
-        // "complete" is reserved for synthetic completion paths.
-        // Both are happy-path turn endings.
-        "stop" | "complete" => {
-            write!(
-                out,
-                "\r\n  {}✓{} Done\r\n",
-                color::Fg(color::Green),
-                style::Reset
-            )
+    match status {
+        "stop" | "complete" => {}
+        "length" => {
+            write!(out, "\r\n  {}⚠{} Stopped at length limit\r\n", color::Fg(color::Yellow), style::Reset).ok();
         }
-        // Model hit the provider's max_tokens or our hard cap.
-        "length" => write!(
-            out,
-            "\r\n  {}⚠{} Stopped at length limit\r\n",
-            color::Fg(color::Yellow),
-            style::Reset
-        ),
-        // Worker crashed or was killed mid-turn.
-        "aborted" => write!(
-            out,
-            "\r\n  {}✖{} Aborted\r\n",
-            color::Fg(color::Red),
-            style::Reset
-        ),
-        // User pressed Esc during the turn.
-        "cancelled" => write!(
-            out,
-            "\r\n  {}✋{} Cancelled\r\n",
-            color::Fg(color::Yellow),
-            style::Reset
-        ),
-        // Unknown status — show it so we notice in testing.
-        other => write!(
-            out,
-            "\r\n  {}■{} Done ({}){}\r\n",
-            color::Fg(color::Yellow),
-            style::Reset,
-            other,
-            style::Reset
-        ),
-    };
+        "aborted" => {
+            write!(out, "\r\n  {}✖{} Aborted\r\n", color::Fg(color::Red), style::Reset).ok();
+        }
+        "cancelled" => {
+            write!(out, "\r\n  {}✋{} Cancelled\r\n", color::Fg(color::Yellow), style::Reset).ok();
+        }
+        other => {
+            print_warning(out, &format!("unknown completion status: {}", other));
+        }
+    }
 }
 
 fn print_entry_summary(out: &mut impl Write, entry: &Entry) {
@@ -360,6 +322,27 @@ struct RenderState {
     assistant_header_shown: bool,
     last_tool_args: Option<(String, serde_json::Value)>,
     in_thinking: bool,
+    /// Consecutive \r\n pairs at the end of the most recent content write.
+    /// Capped at 2. Used to avoid double blank lines when events each add
+    /// a leading separator.
+    trailing_newlines: u8,
+}
+
+/// Count trailing \r\n pairs in a string (max 2).
+fn count_trailing_crlf(s: &str) -> u8 {
+    let trimmed = s.trim_end_matches("\r\n");
+    (s.len().saturating_sub(trimmed.len()) / 2).min(2) as u8
+}
+
+/// Write a blank-line separator, adding only as many \r\n as needed to reach
+/// exactly one blank line (== 2 consecutive \r\n), given how many are already
+/// at the end of the previous write.
+fn write_blank_line(out: &mut impl Write, trailing: &mut u8) {
+    let needed = 2u8.saturating_sub(*trailing);
+    for _ in 0..needed {
+        write!(out, "\r\n").ok();
+    }
+    *trailing = 2;
 }
 
 /// Normalize bare `\n` to `\r\n` for raw-mode terminal output.
@@ -398,28 +381,46 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
         ServerEvent::TextChunk { content } => {
             if state.in_thinking {
                 state.in_thinking = false;
-                write!(out, "{}\r\n", style::Reset).ok();
+                write!(out, "{}", style::Reset).ok();
+                // Blank line between thinking and response; also suppress the
+                // assistant_header \r\n below so we don't double-count.
+                write_blank_line(out, &mut state.trailing_newlines);
+                state.assistant_header_shown = true;
             }
             if !state.assistant_header_shown {
                 state.assistant_header_shown = true;
                 write!(out, "\r\n").ok();
+                state.trailing_newlines = 1;
             }
             // Raw mode: `\n` alone leaves the cursor at the same column.
             // Normalize existing `\r\n` first (so we don't write `\r\r\n`), then
             // translate bare `\n` to `\r\n`.
-            write!(out, "{}", normalize_for_raw(content)).ok();
+            let normalized = normalize_for_raw(content);
+            write!(out, "{}", normalized).ok();
             out.flush().ok();
+            let non_nl = !normalized.trim_end_matches("\r\n").is_empty();
+            if non_nl {
+                state.trailing_newlines = count_trailing_crlf(&normalized);
+            } else {
+                state.trailing_newlines =
+                    state.trailing_newlines.saturating_add(count_trailing_crlf(&normalized)).min(2);
+            }
         }
         ServerEvent::ToolStart { tool, input } => {
             state.last_tool_args = Some((tool.clone(), input.clone()));
         }
         ServerEvent::ToolResult { tool, exit, output } => {
+            if state.in_thinking {
+                state.in_thinking = false;
+                write!(out, "{}", style::Reset).ok();
+            }
             let args_str = state
                 .last_tool_args
                 .take()
                 .map(|(_, input)| format_tool_args(tool, &input))
                 .unwrap_or_default();
-            write!(out, "\r\n  ⚙ {}{}{}", style::Bold, tool, style::Reset).ok();
+            write_blank_line(out, &mut state.trailing_newlines);
+            write!(out, "  ⚙ {}{}{}", style::Bold, tool, style::Reset).ok();
             if !args_str.is_empty() {
                 write!(out, "  {}", args_str).ok();
             }
@@ -430,8 +431,11 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
             };
             write!(out, "  (exit: {}{}{})\r\n", c, *exit, style::Reset).ok();
             if !output.is_empty() {
+                write!(out, "{}", color::Fg(color::LightBlack)).ok();
                 print_indented(out, output, "│");
+                write!(out, "{}", style::Reset).ok();
             }
+            state.trailing_newlines = 1; // print_indented / exit line ends with \r\n
         }
         ServerEvent::Entry(entry) => match entry {
             Entry::Message { message, .. }
@@ -542,7 +546,16 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
                 print_warning(out, &format!("Error: {}", message));
             }
         }
-        ServerEvent::Done { status } => render_done(out, status),
+        ServerEvent::Done { status } => {
+            if state.in_thinking {
+                state.in_thinking = false;
+                write!(out, "{}", style::Reset).ok();
+            }
+            if state.trailing_newlines == 0 {
+                write!(out, "\r\n").ok();
+            }
+            render_done(out, status);
+        }
         ServerEvent::FileChanged { path, kind } => {
             write!(out, "\r\n").ok();
             write!(out, "  📄 {} ({})\r\n", path, kind).ok();
@@ -557,9 +570,18 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
             if !state.in_thinking {
                 state.in_thinking = true;
                 write!(out, "\r\n{}\x1b[2m", color::Fg(color::LightBlack)).ok();
+                state.trailing_newlines = 0;
             }
-            write!(out, "{}", normalize_for_raw(content)).ok();
+            let normalized = normalize_for_raw(content);
+            write!(out, "{}", normalized).ok();
             out.flush().ok();
+            let non_nl = !normalized.trim_end_matches("\r\n").is_empty();
+            if non_nl {
+                state.trailing_newlines = count_trailing_crlf(&normalized);
+            } else {
+                state.trailing_newlines =
+                    state.trailing_newlines.saturating_add(count_trailing_crlf(&normalized)).min(2);
+            }
         }
     }
 }
@@ -832,7 +854,7 @@ impl InputLine {
         }
         write!(out, "\r{}", clear::AfterCursor).ok();
 
-        write!(out, "{}", prompt).ok();
+        write!(out, "{}{}{}", color::Fg(color::Yellow), prompt, style::Reset).ok();
         let content: String = self.buf.iter().collect();
         write!(out, "{}", content.replace('\n', "\r\n")).ok();
 
@@ -1061,14 +1083,8 @@ fn process_message(
     let mut session = crate::client::AgentSession::connect(server, tree_id)?;
     session.set_nonblocking(true)?;
     session.send_message(text)?;
-    write!(
-        out,
-        "  {}────────────────────────{}\r\n",
-        color::Fg(color::LightBlack),
-        style::Reset
-    )
-    .ok();
-    out.flush().ok();
+
+    write!(out, "\x1b[?25l").ok();
 
     let mut state = RenderState::default();
     let mut cancel_signalled = false;
@@ -1207,7 +1223,7 @@ pub fn run_interactive(
             show_header = false;
         }
 
-        write!(out, "\r\n> ").ok();
+        write!(out, "\r\n\x1b[?25h{}>{} ", color::Fg(color::Yellow), style::Reset).ok();
         out.flush().ok();
 
         input_line.clear();
@@ -1378,88 +1394,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_render_done_stop_is_happy_path() {
-        let mut buf = Vec::new();
-        render_done(&mut buf, "stop");
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains('✓'), "stop should show ✓, got: {output}");
-        assert!(
-            output.contains("Done"),
-            "stop should show Done, got: {output}"
-        );
-        assert!(
-            !output.contains("Stopped"),
-            "stop should not show Stopped, got: {output}"
-        );
-        assert!(
-            !output.contains("Aborted"),
-            "stop should not show Aborted, got: {output}"
-        );
-    }
-
-    #[test]
-    fn test_render_done_complete_is_happy_path() {
-        let mut buf = Vec::new();
-        render_done(&mut buf, "complete");
-        let output = String::from_utf8(buf).unwrap();
-        assert!(
-            output.contains('✓'),
-            "complete should show ✓, got: {output}"
-        );
-        assert!(
-            output.contains("Done"),
-            "complete should show Done, got: {output}"
-        );
-    }
-
-    #[test]
-    fn test_render_done_aborted_is_red() {
-        let mut buf = Vec::new();
-        render_done(&mut buf, "aborted");
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains('✖'), "aborted should show ✖, got: {output}");
-        assert!(
-            output.contains("Aborted"),
-            "aborted should show Aborted, got: {output}"
-        );
-    }
-
-    #[test]
-    fn test_render_done_cancelled() {
-        let mut buf = Vec::new();
-        render_done(&mut buf, "cancelled");
-        let output = String::from_utf8(buf).unwrap();
-        assert!(
-            output.contains('✋'),
-            "cancelled should show ✋, got: {output}"
-        );
-        assert!(
-            output.contains("Cancelled"),
-            "cancelled should show Cancelled, got: {output}"
-        );
-        assert!(
-            !output.contains("Done"),
-            "cancelled should not show Done, got: {output}"
-        );
-        assert!(
-            !output.contains("Aborted"),
-            "cancelled should not show Aborted, got: {output}"
-        );
-    }
-
-    #[test]
-    fn test_render_done_length() {
-        let mut buf = Vec::new();
-        render_done(&mut buf, "length");
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains('⚠'), "length should show ⚠, got: {output}");
-        assert!(
-            output.contains("Stopped at length limit"),
-            "length should show warning, got: {output}"
-        );
-    }
-
-    #[test]
     fn test_normalize_for_raw_replaces_bare_newlines() {
         let input = "hello\nworld\n";
         let result = normalize_for_raw(input);
@@ -1471,6 +1405,48 @@ mod tests {
         let input = "hello\r\nworld\r\n";
         let result = normalize_for_raw(input);
         assert_eq!(result, "hello\r\nworld\r\n");
+    }
+
+    #[test]
+    fn test_render_done_stop_is_silent() {
+        let mut buf = Vec::new();
+        render_done(&mut buf, "stop");
+        assert!(buf.is_empty(), "stop should produce no output");
+    }
+
+    #[test]
+    fn test_render_done_complete_is_silent() {
+        let mut buf = Vec::new();
+        render_done(&mut buf, "complete");
+        assert!(buf.is_empty(), "complete should produce no output");
+    }
+
+    #[test]
+    fn test_render_done_aborted_is_red() {
+        let mut buf = Vec::new();
+        render_done(&mut buf, "aborted");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains('✖'), "aborted should show ✖, got: {output}");
+        assert!(output.contains("Aborted"), "aborted should show Aborted, got: {output}");
+    }
+
+    #[test]
+    fn test_render_done_cancelled() {
+        let mut buf = Vec::new();
+        render_done(&mut buf, "cancelled");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains('✋'), "cancelled should show ✋, got: {output}");
+        assert!(output.contains("Cancelled"), "cancelled should show Cancelled, got: {output}");
+        assert!(!output.contains("Done"), "cancelled should not show Done, got: {output}");
+    }
+
+    #[test]
+    fn test_render_done_length() {
+        let mut buf = Vec::new();
+        render_done(&mut buf, "length");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains('⚠'), "length should show ⚠, got: {output}");
+        assert!(output.contains("Stopped at length limit"), "length should show warning, got: {output}");
     }
 
     #[test]

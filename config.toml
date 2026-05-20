@@ -10,6 +10,7 @@ port = 8080
 base_url = "http://localhost:8080/v1"
 api_key = ""
 model = "qwen2.5-coder-7b-instruct"
+# enable_thinking = false  # disable thinking/reasoning (default: true)
 
 [summary]
 model = "qwen2.5-coder-1.5b-instruct"

@@ -116,10 +116,13 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
 
     let stderr_buf: StderrBuf = Arc::new(Mutex::new(VecDeque::with_capacity(20)));
 
+    log::info!(
+        "[lifecycle] Spawned worker for tree {} (pid {}) model={} thinking={}",
+        tree_id, pid, cfg.provider.model, cfg.provider.enable_thinking
+    );
     spawn_stdin_writer(stdin, stdin_rx);
     spawn_stdout_proxy(tree_id.to_string(), stdout, entry.clone(), store, cfg, stderr_buf.clone());
     spawn_stderr_demux(tree_id.to_string(), stderr, stderr_buf);
-    log::info!("[lifecycle] Spawned worker for tree {} (pid {})", tree_id, pid);
     Ok(())
 }
 
@@ -324,6 +327,7 @@ fn spawn_stdout_proxy(
                         cfg_for_title.summary.base_url.clone(),
                         cfg_for_title.summary.api_key.clone(),
                         cfg_for_title.summary.model.clone(),
+                        false,
                     );
                     match agent_core::agent::auto_title(&store_for_title, &provider, &tid) {
                         Ok(title) => {

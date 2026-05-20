@@ -24,14 +24,16 @@ pub struct Provider {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub enable_thinking: bool,
 }
 
 impl Provider {
-    pub fn new(base_url: String, api_key: String, model: String) -> Self {
+    pub fn new(base_url: String, api_key: String, model: String, enable_thinking: bool) -> Self {
         Self {
             base_url,
             api_key,
             model,
+            enable_thinking,
         }
     }
 
@@ -70,6 +72,11 @@ impl Provider {
 
         if stream {
             body["stream_options"] = json!({"include_usage": true});
+        }
+
+        if self.enable_thinking {
+            body["thinking"] = json!({"type": "enabled"});
+            body["reasoning_effort"] = json!("high");
         }
 
         body
@@ -364,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_serialize_message_user() {
-        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into());
+        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into(), false);
         let msg = Message {
             role: MessageRole::User,
             content: MessageContent::Text("hello".into()),
@@ -382,7 +389,7 @@ mod tests {
 
     #[test]
     fn test_serialize_message_assistant_with_tool_calls() {
-        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into());
+        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into(), false);
         let msg = Message {
             role: MessageRole::Assistant,
             content: MessageContent::Text("Let me check".into()),
@@ -404,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_serialize_message_tool_result() {
-        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into());
+        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into(), false);
         let msg = Message {
             role: MessageRole::Tool,
             content: MessageContent::Text("file contents".into()),
@@ -422,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_build_body_streaming() {
-        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into());
+        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into(), false);
         let msg = Message {
             role: MessageRole::User,
             content: MessageContent::Text("hi".into()),
@@ -441,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_build_body_with_tools() {
-        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into());
+        let p = Provider::new("http://localhost".into(), "".into(), "test-model".into(), false);
         let msg = Message {
             role: MessageRole::User,
             content: MessageContent::Text("hi".into()),
