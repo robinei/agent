@@ -623,3 +623,229 @@ Add to `#[cfg(test)] mod tests` in `interactive.rs`:
   positioning via `termion::cursor::Up/Left`. Buffer cleared on submit.
 - Verified: `cargo test --workspace` → 127 passed (6 new InputLine tests),
   `cargo clippy --workspace` → no new warnings.
+
+---
+
+## Step 4 — Output rendering cleanup
+
+- [x] Suppress Entry events during live streaming (fix duplicate content)
+- [x] Remove spurious Done at end of history replay
+- [x] Smart tool-arg display (extract command/path, not raw JSON)
+- [x] Remove redundant "Assistant:" header
+- [x] Merge ToolStart + ToolResult into a single block
+- [x] Lighter user label and session header
+
+**Goal:** Fix two rendering bugs (duplicate content, spurious Done), then apply a
+focused set of visual improvements so the output is clean and easy to scan.
+
+### Bug 1 — Duplicate content during streaming
+
+**Root cause:** `render_event` handles both streaming event variants
+(`TextChunk`, `ToolStart`, `ToolResult`) *and* `Entry` variants. The server
+emits Entry events alongside streaming events to notify the CLI that content has
+been persisted. Because `process_message` passes all incoming events through
+`render_event`, every piece of content renders twice: once from the streaming
+event and once from the Entry event.
+
+**Fix:** In `process_message`, skip `ServerEvent::Entry` events entirely:
+
+```rust
+TryEvent::Event(ev) => {
+    if matches!(&ev, ServerEvent::Entry(_)) { continue; }
+    let done = matches!(&ev, ServerEvent::Done { .. });
+    render_event(out, &ev, &mut state);
+    if done { return Ok(()); }
+    continue;
+}
+```
+
+`Entry` events are already used by `replay_entries` for history display; they
+serve no additional purpose in the live streaming path.
+
+### Bug 2 — Spurious Done at session entry
+
+**Root cause:** `replay_entries` (`interactive.rs:149-158`) appends
+`render_done(out, "complete")` when the last replayed entry is not a
+`SessionEnd`. The intent was to mark the previous turn as finished, but it
+produces a stray `✓ Done` at the end of history whenever you enter a tree,
+with no corresponding turn having just completed.
+
+**Fix:** Delete the trailing `render_done` call. The idle prompt appearing
+immediately after is already sufficient to communicate that no turn is in
+progress.
+
+```rust
+// Remove entirely:
+if let Some(last) = entries.last() {
+    if !matches!(last, Entry::SessionEnd { .. }) {
+        if in_turn { … blue separator … }
+        render_done(out, "complete");   // ← delete this
+    }
+}
+```
+
+Keep the blue separator if `in_turn` — that visual break between history and
+the prompt is still useful.
+
+### Style 1 — Smart tool-arg display
+
+File: `interactive.rs`, `render_event`, `ServerEvent::ToolStart` arm.
+
+Currently: `🛠  find: {"pattern":"*.py","type":"file"}` — raw JSON.
+
+Replace `args_str` construction with a helper that extracts the most meaningful
+single argument for known tool names, falling back to a truncated JSON string:
+
+```rust
+fn format_tool_args(tool: &str, input: &serde_json::Value) -> String {
+    let obj = match input.as_object() { Some(o) => o, None => return String::new() };
+    let pick = match tool {
+        "bash"             => obj.get("command"),
+        "read" | "write"
+        | "edit"           => obj.get("path"),
+        "find"             => obj.get("pattern").or_else(|| obj.get("path")),
+        "grep"             => obj.get("pattern"),
+        "git"              => obj.get("command").or_else(|| obj.get("args")),
+        _                  => None,
+    };
+    match pick.and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let raw = serde_json::to_string(input).unwrap_or_default();
+            if raw.len() > 80 { format!("{}…", &raw[..80]) } else { raw }
+        }
+    }
+}
+```
+
+Display: `  ⚙ bash  python fibonacci.py` (two spaces of indentation, `⚙` in
+dim/default color, tool name bold, arg in default color).
+
+### Style 2 — Remove "Assistant:" header
+
+File: `interactive.rs`, `render_event`, `ServerEvent::TextChunk` arm.
+
+The `  Assistant:\r\n` header printed on `!state.assistant_header_shown` is
+redundant — text following tool results is obviously the model's response.
+Remove the header write; keep `assistant_header_shown` only to decide whether
+to emit a leading blank line before the first chunk of a new assistant turn (so
+text doesn't run into the previous line):
+
+```rust
+ServerEvent::TextChunk { content } => {
+    if !state.assistant_header_shown {
+        state.assistant_header_shown = true;
+        write!(out, "\r\n").ok();   // blank line before first chunk only
+    }
+    write!(out, "{}", normalize_for_raw(content)).ok();
+    out.flush().ok();
+}
+```
+
+### Style 3 — Merge ToolStart + ToolResult into one block
+
+Currently `ToolStart` prints a line immediately when the tool is called, and
+`ToolResult` prints a second block when it returns. This produces two visually
+separate entries for every tool call.
+
+Change:
+- `ToolStart`: print nothing (or print a dim "  ⚙ bash  …" line with a trailing
+  `…` to indicate in-progress — but only if this is useful during long calls;
+  for simplicity, **suppress ToolStart entirely** since the result follows
+  quickly and the Result contains everything needed).
+- `ToolResult`: print a single combined block:
+
+```
+  ⚙ bash  python fibonacci.py  (exit 0)
+  │ First 10 Fibonacci numbers: [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+```
+
+Format: `  ⚙ {tool}  {args}  (exit {code})` — bold tool name, dim exit code
+when 0, red when non-zero. Output lines follow with `  │ ` prefix as today.
+If output is empty, omit the output block entirely.
+
+`RenderState` gains `last_tool_start: Option<(String, serde_json::Value)>` so
+`ToolResult` can recover the tool name and args for its single-line header
+(since ToolResult carries tool name and exit but not the input args):
+
+```rust
+struct RenderState {
+    assistant_header_shown: bool,
+    last_tool_args: Option<(String, serde_json::Value)>,  // (tool_name, input)
+}
+```
+
+`ToolStart` arm stores into `state.last_tool_args` and returns without writing
+anything. `ToolResult` arm reads `state.last_tool_args.take()` to get the args.
+
+### Style 4 — User label and session header
+
+**User label:** Replace `{}●  {}User:{}  {}` with `{}▸{} {}`:
+
+```rust
+write!(out, "\r\n{}▸{} {}\r\n",
+       color::Fg(color::Green), style::Reset, text).ok();
+```
+
+One character, no colon, no double-space. The green `▸` is enough to mark user
+input visually distinct from assistant text.
+
+**Session header:** Replace the two heavy blue separator lines with a single
+compact header:
+
+```
+{bold}{tree_title}{reset}  {dim}·  {short_id}{reset}
+```
+
+No `──────` lines. The title is the dominant element; ID is dimmed to the right.
+Keep a blank line above and below. Example:
+
+```
+untitled  ·  87eb722e
+
+[history replay…]
+
+▸ run the python script
+```
+
+Use `color::Fg(color::LightBlack)` for the dimmed `·  id` portion.
+
+### Tests
+
+- `test_render_tool_suppresses_start` — drive `render_event` with a
+  `ToolStart{bash}` followed by `ToolResult{bash, exit:0, output:"hi"}`; the
+  combined output should contain `⚙` exactly once and contain "hi".
+- `test_render_no_assistant_header` — drive `render_event` with a `TextChunk`;
+  output must contain the chunk text and must NOT contain "Assistant".
+- `test_format_tool_args_bash` — `format_tool_args("bash", json!({"command":"ls","description":"d"}))` == `"ls"`.
+- `test_format_tool_args_fallback` — unknown tool with no matching key falls
+  back to a JSON string.
+
+### Do not modify
+
+- `replay_entries` entry rendering logic beyond the Done removal.
+- Wire protocol, server, agent-core.
+- `process_message`'s Esc / cancel path.
+- The existing `render_done` function (status labels unchanged).
+
+**Verify:**
+
+- `cargo test --workspace` — all tests pass, four new tests pass.
+- `cargo clippy --workspace` — no new warnings.
+- Manual: start a session on an existing tree; confirm history replays without
+  a trailing `✓ Done`.
+- Manual: send a message that calls bash; confirm each tool call appears exactly
+  once, with clean arg display and no "Assistant:" label.
+- Manual: send a message that returns a non-zero exit code; confirm it renders
+  in red.
+
+**Notes:**
+- Modified: `agent-cli/src/interactive.rs` — all 6 items implemented:
+  1. Suppressed Entry events in `process_message` via `if matches!(&ev, ServerEvent::Entry(_)) { continue; }`
+  2. Removed `render_done(out, "complete")` from end of `replay_entries`
+  3. Added `format_tool_args` helper extracting `command`/`file_path`/`pattern` per tool name, falling back to truncated JSON
+  4. Removed `Assistant:` header from `TextChunk` arm
+  5. Added `last_tool_args` to `RenderState`; `ToolStart` stores args and suppresses output; `ToolResult` renders combined `⚙ {tool}  {args}  (exit {code})` line with output
+  6. Replaced user label `●  User:` with green `▸`; replaced session header `───` separators with compact `{title}  ·  {short_id}`
+- Added 4 new tests: `test_render_tool_suppresses_start`, `test_render_no_assistant_header`, `test_format_tool_args_bash`, `test_format_tool_args_fallback`
+- Verified: `cargo test --workspace` → 136 passed, `cargo clippy --workspace` → no new warnings.

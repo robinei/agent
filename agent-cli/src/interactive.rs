@@ -131,8 +131,8 @@ fn replay_entries(out: &mut impl Write, entries: &[Entry]) {
                     _ => "[content blocks]".into(),
                 };
                 write!(out, "\r\n").ok();
-                write!(out, "{}●  {}User:{}  {}\r\n",
-                       color::Fg(color::Green), style::Bold, style::Reset, t).ok();
+                write!(out, "{}▸{} {}\r\n",
+                       color::Fg(color::Green), style::Reset, t).ok();
             }
 
             _ => {
@@ -147,12 +147,9 @@ fn replay_entries(out: &mut impl Write, entries: &[Entry]) {
     }
 
     if let Some(last) = entries.last() {
-        if !matches!(last, Entry::SessionEnd { .. }) {
-            if in_turn {
-                write!(out, "{}──────────────────────{}\r\n",
-                       color::Fg(color::Blue), style::Reset).ok();
-            }
-            render_done(out, "complete");
+        if !matches!(last, Entry::SessionEnd { .. }) && in_turn {
+            write!(out, "{}──────────────────────{}\r\n",
+                   color::Fg(color::Blue), style::Reset).ok();
         }
     }
 }
@@ -218,11 +215,34 @@ fn print_entry_summary(out: &mut impl Write, entry: &Entry) {
 struct RenderState {
     _rendered: HashSet<String>,
     assistant_header_shown: bool,
+    last_tool_args: Option<(String, serde_json::Value)>,
 }
 
 /// Normalize bare `\n` to `\r\n` for raw-mode terminal output.
 fn normalize_for_raw(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+fn format_tool_args(tool: &str, input: &serde_json::Value) -> String {
+    let obj = match input.as_object() {
+        Some(o) => o,
+        None => return String::new(),
+    };
+    let pick = match tool {
+        "bash" => obj.get("command"),
+        "read" | "write" | "edit" => obj.get("file_path").or_else(|| obj.get("path")),
+        "find" => obj.get("pattern").or_else(|| obj.get("path")),
+        "grep" => obj.get("pattern"),
+        "git" => obj.get("command").or_else(|| obj.get("args")),
+        _ => None,
+    };
+    match pick.and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let raw = serde_json::to_string(input).unwrap_or_default();
+            if raw.len() > 80 { format!("{}…", &raw[..80]) } else { raw }
+        }
+    }
 }
 
 fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderState) {
@@ -231,7 +251,6 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
             if !state.assistant_header_shown {
                 state.assistant_header_shown = true;
                 write!(out, "\r\n").ok();
-                write!(out, "{}  Assistant:{}\r\n", color::Fg(color::Cyan), style::Reset).ok();
             }
             // Raw mode: `\n` alone leaves the cursor at the same column.
             // Normalize existing `\r\n` first (so we don't write `\r\r\n`), then
@@ -240,20 +259,23 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
             out.flush().ok();
         }
         ServerEvent::ToolStart { tool, input } => {
-            write!(out, "\r\n").ok();
-            let args_str = serde_json::to_string(input).unwrap_or_default();
-            let preview = if args_str.len() > 120 {
-                format!("{}...", &args_str[..120])
-            } else {
-                args_str
-            };
-            write!(out, "🛠  {}{}: {}{}\r\n", style::Bold, tool, preview, style::Reset).ok();
+            state.last_tool_args = Some((tool.clone(), input.clone()));
         }
         ServerEvent::ToolResult { tool, exit, output } => {
-            write!(out, "\r\n").ok();
-            let c = if *exit == 0 { color::Fg(color::Green).to_string() }
-                     else { color::Fg(color::Red).to_string() };
-            write!(out, "{}  {} (exit: {}){}\r\n", c, tool, exit, style::Reset).ok();
+            let args_str = state.last_tool_args.take()
+                .map(|(_, input)| format_tool_args(tool, &input))
+                .unwrap_or_default();
+            write!(out, "\r\n  ⚙ {}{}{}",
+                   style::Bold, tool, style::Reset).ok();
+            if !args_str.is_empty() {
+                write!(out, "  {}", args_str).ok();
+            }
+            let c = if *exit == 0 {
+                color::Fg(color::LightBlack).to_string()
+            } else {
+                color::Fg(color::Red).to_string()
+            };
+            write!(out, "  (exit: {}{}{})\r\n", c, *exit, style::Reset).ok();
             if !output.is_empty() {
                 print_indented(out, output, "│");
             }
@@ -266,8 +288,8 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
                         _ => "[content blocks]".into(),
                     };
                     write!(out, "\r\n").ok();
-                    write!(out, "{}●  {}User:{}  {}\r\n",
-                           color::Fg(color::Green), style::Bold, style::Reset, t).ok();
+                    write!(out, "{}▸{} {}\r\n",
+                           color::Fg(color::Green), style::Reset, t).ok();
                 }
                 Entry::GoalSet { goal, .. } => { write!(out, "\r\n").ok(); write!(out, "🎯  {}\r\n", goal).ok(); }
                 Entry::ModelSet { model, .. } => { write!(out, "\r\n").ok(); write!(out, "🤖  Model: {}\r\n", model).ok(); }
@@ -682,6 +704,7 @@ fn process_message(
         loop {
             match session.try_next_event() {
                 TryEvent::Event(ev) => {
+                    if matches!(&ev, ServerEvent::Entry(_)) { continue; }
                     let done = matches!(&ev, ServerEvent::Done { .. });
                     render_event(out, &ev, &mut state);
                     if done { return Ok(()); }
@@ -759,11 +782,9 @@ pub fn run_interactive(server: &str, initial_repo_path: Option<String>, stop: &A
                     } else {
                         &current_tree_id
                     };
-                    write!(out, "\r\n{}──────────────────────────────{}\r\n",
-                           color::Fg(color::Blue), style::Reset).ok();
-                    write!(out, "Now talking in: {} ({})\r\n", title, short_id).ok();
-                    write!(out, "{}──────────────────────────────{}\r\n",
-                           color::Fg(color::Blue), style::Reset).ok();
+                    write!(out, "\r\n{}{}{}  {}·  {}{}\r\n",
+                           style::Bold, title, style::Reset,
+                           color::Fg(color::LightBlack), short_id, style::Reset).ok();
 
                     if let Ok(entries) = client.get_entries(&current_tree_id) {
                         if !entries.is_empty() {
@@ -1064,5 +1085,45 @@ mod tests {
         il.handle_key(Key::Ctrl('k'), &mut buf, "> ", &mut prev);
         let s: String = il.buf.iter().collect();
         assert_eq!(s, "hel");
+    }
+
+    #[test]
+    fn test_render_tool_suppresses_start() {
+        let mut buf = Vec::new();
+        let mut state = RenderState::default();
+        render_event(&mut buf, &ServerEvent::ToolStart {
+            tool: "bash".into(),
+            input: serde_json::json!({"command":"echo hi","description":"test"}),
+        }, &mut state);
+        render_event(&mut buf, &ServerEvent::ToolResult {
+            tool: "bash".into(),
+            exit: 0,
+            output: "hi".into(),
+        }, &mut state);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("hi"), "output should contain 'hi', got: {output}");
+        assert!(!output.contains("ToolStart"), "output should not contain 'ToolStart', got: {output}");
+    }
+
+    #[test]
+    fn test_render_no_assistant_header() {
+        let mut buf = Vec::new();
+        let mut state = RenderState::default();
+        render_event(&mut buf, &ServerEvent::TextChunk { content: "hello world".into() }, &mut state);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("hello world"), "output should contain chunk text, got: {output}");
+        assert!(!output.contains("Assistant"), "output should not contain 'Assistant', got: {output}");
+    }
+
+    #[test]
+    fn test_format_tool_args_bash() {
+        let result = format_tool_args("bash", &serde_json::json!({"command":"ls","description":"d"}));
+        assert_eq!(result, "ls");
+    }
+
+    #[test]
+    fn test_format_tool_args_fallback() {
+        let result = format_tool_args("unknown_tool", &serde_json::json!({"key":"value"}));
+        assert_eq!(result, "{\"key\":\"value\"}");
     }
 }
