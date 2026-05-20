@@ -180,8 +180,18 @@ pub fn build_bwrap_argv(
     }
     for p in &hide_set {
         let expanded = agent_core::types::expand_tilde(p);
-        if expanded.exists() {
+        let meta = match std::fs::symlink_metadata(&expanded) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
             args.extend(["--tmpfs".into(), expanded.into()]);
+        } else {
+            args.extend([
+                "--bind".into(),
+                std::path::PathBuf::from("/dev/null").into(),
+                expanded.into(),
+            ]);
         }
     }
 
@@ -775,5 +785,61 @@ mod tests {
                 .count();
             assert_eq!(aws_tmpfs_count, 1, "~/.aws should be tmpfs'd (still hidden)");
         }
+    }
+
+    #[test]
+    fn test_build_bwrap_argv_file_hide() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file_path = tmp.path().join("fake_history");
+        let dir_path = tmp.path().join("fake_dir");
+        std::fs::write(&file_path, b"some history data").unwrap();
+        std::fs::create_dir(&dir_path).unwrap();
+
+        let exe = Path::new("/usr/local/bin/agent");
+        let tree_id = "test-tree-file-hide";
+        let meta = TreeMeta {
+            id: tree_id.into(),
+            parent_id: None,
+            repo_path: None,
+            title: None,
+            created_at: 100,
+            updated_at: 100,
+            leaf_id: None,
+            sandbox: TreeSandbox::default(),
+        };
+        let cfg = Config {
+            sandbox: SandboxConfig {
+                enabled: true,
+                bwrap_path: None,
+                defaults: SandboxDefaults {
+                    hide: vec![file_path.clone(), dir_path.clone()],
+                },
+            },
+            ..Config::default()
+        };
+
+        let args = build_bwrap_argv(exe, tree_id, &meta, &cfg);
+
+        // The file should appear as --bind /dev/null <file_path>
+        let file_bind_count = args.windows(3)
+            .filter(|w| w[0] == OsString::from("--bind"))
+            .filter(|w| w[1] == OsString::from("/dev/null"))
+            .filter(|w| w[2] == OsString::from(file_path.clone().into_os_string()))
+            .count();
+        assert_eq!(file_bind_count, 1, "file should be bound from /dev/null, not tmpfs'd");
+
+        // The directory should appear as --tmpfs <dir_path>
+        let dir_tmpfs_count = args.windows(2)
+            .filter(|w| w[0] == OsString::from("--tmpfs"))
+            .filter(|w| w[1] == OsString::from(dir_path.clone().into_os_string()))
+            .count();
+        assert_eq!(dir_tmpfs_count, 1, "directory should be tmpfs'd");
+
+        // The file must NOT appear as --tmpfs
+        let file_tmpfs_count = args.windows(2)
+            .filter(|w| w[0] == OsString::from("--tmpfs"))
+            .filter(|w| w[1] == OsString::from(file_path.clone().into_os_string()))
+            .count();
+        assert_eq!(file_tmpfs_count, 0, "file should not be tmpfs'd");
     }
 }

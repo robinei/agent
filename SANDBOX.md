@@ -2107,3 +2107,113 @@ endpoint and the existing method name suggests it should work.
 - Modified: `agent-cli/src/client.rs` — Fix 3: `get_entries` uses `self.entries_url(tree_id)` returning `/trees/{id}/entries` instead of `/trees/{id}`; added `entries_url()` helper and `test_get_entries_url` test
 - Deviation: Fix 2's `recover_tree` on an empty tree (no `leaf_id`) skips entirely rather than writing a `SessionEnd` with `parent_id: None` — cleaner and matches the spec's "just log and skip" suggestion
 - Verified: `cargo test --workspace` → 110 passed, 0 failed; `cargo clippy --workspace` → no new warnings_
+
+---
+
+### Step 12 — bwrap rejects file paths in hide list
+
+- [x] done
+
+**Goal:** Fix `build_bwrap_argv` so it correctly hides credential **files**
+(shell histories, `~/.netrc`, etc.) in addition to credential **directories**.
+
+**Symptom observed:**
+
+```
+$ agent server &
+$ agent cli   # create tree, send "hello"
+✖ Fatal: worker exited unexpectedly
+
+# Server log:
+[worker abcd...] bwrap: Can't mkdir /home/user/.bash_history: Not a directory
+[proxy abcd...] worker exited with error
+```
+
+**Root cause:** The default `[sandbox.defaults] hide` list in
+`agent-core/src/config.rs` includes shell histories and `~/.netrc`,
+which are regular files on most systems. `build_bwrap_argv` emits
+`--tmpfs <path>` for every entry, but `--tmpfs` requires the path to
+be a directory — bwrap aborts at the first file it encounters and the
+worker is killed before it can read any stdin.
+
+This blocks **all** worker spawns on a system where any of the listed
+files exist as files (i.e., every shell user).
+
+**Spec details:**
+
+File modified: `agent-server/src/lifecycle.rs`, function `build_bwrap_argv`.
+
+Current code (around line 181):
+```rust
+for p in &hide_set {
+    let expanded = agent_core::types::expand_tilde(p);
+    if expanded.exists() {
+        args.extend(["--tmpfs".into(), expanded.into()]);
+    }
+}
+```
+
+Replace with file-vs-directory branching:
+```rust
+for p in &hide_set {
+    let expanded = agent_core::types::expand_tilde(p);
+    let meta = match std::fs::symlink_metadata(&expanded) {
+        Ok(m) => m,
+        Err(_) => continue,            // path doesn't exist → nothing to hide
+    };
+    if meta.is_dir() {
+        // Mount empty tmpfs over the directory.
+        args.extend(["--tmpfs".into(), expanded.into()]);
+    } else {
+        // Files (and symlinks to files): bind /dev/null over them so reads
+        // return empty. `--tmpfs` doesn't work on non-directories.
+        args.extend([
+            "--bind".into(),
+            std::path::PathBuf::from("/dev/null").into(),
+            expanded.into(),
+        ]);
+    }
+}
+```
+
+Use `symlink_metadata` (not `metadata`) so we don't follow symlinks —
+if a credential file is a symlink to elsewhere, we still want to hide
+the file at its named path, not the target.
+
+**Test to add (in `lifecycle.rs`):**
+
+`test_build_bwrap_argv_file_hide` — set up a tempdir with one file
+(e.g., `tempdir/fake_history`) and one directory (e.g.,
+`tempdir/fake_dir`). Build a `Config` whose `sandbox.defaults.hide`
+points at both. Call `build_bwrap_argv`. Assert:
+- The file appears as `--bind /dev/null <path>` (look for the windowed
+  3-tuple `["--bind", "/dev/null", "<path>"]`)
+- The directory appears as `--tmpfs <path>`
+- Neither appears with the wrong flag
+
+The existing `test_build_bwrap_argv_unhide` doesn't catch this because
+it only checks that paths are **absent** from `--tmpfs` after `unhide`
+— it doesn't probe the file-vs-dir distinction.
+
+**Do not modify:**
+
+- The default hide list in `config.rs`. Shell histories and `~/.netrc`
+  are legitimate credential-leak surfaces (secrets get pasted into
+  commands, `.netrc` literally stores tokens) and should stay hidden.
+  This step makes the hiding mechanism actually work for those files,
+  not remove them.
+- `agent-core` (other than the test). Worker, ws.rs, http.rs.
+
+**Verify:**
+
+- `cargo test --workspace` — new test passes
+- Manual: with the worker bug fixed, `agent cli` → create tree → send
+  "hello" → worker starts cleanly, agent processes the message, no
+  "worker exited unexpectedly" error
+- Inside a running worker, `cat ~/.bash_history` returns empty (the
+  `/dev/null` bind makes it read as zero bytes)
+
+**Notes:**
+- Modified: `agent-server/src/lifecycle.rs` — `build_bwrap_argv` hide loop now uses `symlink_metadata` to distinguish files from directories; directories get `--tmpfs`, files get `--bind /dev/null <path>` so shell histories, `.netrc`, etc. are correctly hidden without causing bwrap to abort with "Not a directory"
+- Test added: `test_build_bwrap_argv_file_hide` — creates a temp dir with one file and one directory, asserts the file gets `--bind /dev/null` and the directory gets `--tmpfs`, and the file does not appear with `--tmpfs`
+- Verified: `cargo test --workspace` → 111 passed, 0 failed

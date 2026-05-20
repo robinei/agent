@@ -1,165 +1,183 @@
 # Debugging Guide
 
-Quick reference for debugging the agent-server and CLI.
+Quick reference for debugging the agent server, worker, and CLI.
 
-## Running the Stack
+## Running the stack
 
 ```bash
-# Terminal 1 — Server with full logs
-cd /home/robin/Code/agent
-export LLM_API_KEY="sk-or-v1-..."
+# Build everything (creates target/debug/agent — one binary, three subcommands)
+cargo build --workspace
+
+# Terminal 1 — Server with info logs to stdout + /tmp/agent-server.log
+export LLM_API_KEY="sk-..."
 export AGENT_BASE_URL="https://openrouter.ai/api/v1"
-export AGENT_MODEL="deepseek/deepseek-v4-flash"
+export AGENT_MODEL="anthropic/claude-3.5-sonnet"
 export RUST_LOG=info
-cargo run -p agent-server
+./target/debug/agent server
 
-# Terminal 2 — Send a one-shot message
-export LLM_API_KEY="sk-or-v1-..."
-export AGENT_BASE_URL="https://openrouter.ai/api/v1"
-export AGENT_MODEL="deepseek/deepseek-v4-flash"
-cargo run -p agent-cli msg <tree-uuid> "your message"
+# Terminal 2 — interactive TUI (default subcommand)
+./target/debug/agent cli
 
-# List / create trees
-cargo run -p agent-cli trees
-cargo run -p agent-cli create "my tree title"
+# Terminal 2 — one-shot send and stream
+./target/debug/agent cli msg <tree-uuid> "your message"
+
+# Terminal 2 — list / create trees (HTTP only, no worker spawn)
+./target/debug/agent cli trees
+./target/debug/agent cli create "title" --repo-path ~/Code/myrepo
 ```
 
-## Diagnosing SSE Streaming Issues
+## What lives where
 
-### Step 1 — Check raw SSE from OpenRouter
+| Thing | Location |
+|---|---|
+| Code | `agent-core/`, `agent-server/`, `agent-worker/`, `agent-cli/`, `agent/` |
+| Config (optional) | `~/.agent/config.toml` — missing file means defaults |
+| Tree data | `~/.agent/trees/{uuid}/data.jsonl` (header + entries, append-only) |
+| Tree metadata | `~/.agent/trees/{uuid}/meta.json` (server-only writer) |
+| Server log | `/tmp/agent-server.log` + stderr (set via `[logging]`) |
+| Plan | `SANDBOX.md` (steps + notes) |
 
-Look for "SSE raw:" lines in the server log. They show every SSE line from the
-provider (truncated to 500 chars). This is the most useful signal:
+## Architecture cheat sheet
 
 ```
-[INFO agent_core::agent] SSE raw: data: {"id":"gen-...","choices":[{"index":0,"delta":{"content":"Hello",...}}]}
-[INFO agent_core::agent] SSE raw: data: [DONE]
-[INFO agent_core::agent] SSE stream ended ([DONE])
+CLI (tungstenite client) ── WS ──▶ Server (one TcpListener, one port)
+                                       │
+                                       ├── HTTP routes (tree CRUD)
+                                       │
+                                       └── WS upgrade per tree
+                                              │
+                                              ▼
+                                       Worker subprocess (bwrap-sandboxed)
+                                       stdin: JSON commands
+                                       stdout: JSON ServerEvents
+                                       stderr: demuxed to server log
 ```
 
-If you see `[DONE]` but the CLI got no output → skip to Step 3.
+- One worker process per active tree, lives across multiple turns
+- WS thread on the server owns the socket exclusively (non-blocking + 10ms poll)
+- Stdout proxy thread reads worker events, fans out to subscribers + ring buffer
+- bwrap argv built from per-tree `TreeSandbox` config + global `[sandbox.defaults]`
 
-If you see no SSE raw lines at all → the provider HTTP call failed (check
-`AGENT_BASE_URL`, `LLM_API_KEY`, network).
+## Quick diagnosis: "Fatal: worker exited unexpectedly"
 
-### Step 2 — Test SSE streaming independently with curl
+This is the message the CLI shows when the worker subprocess died. **First place to look is the server log** — `[worker {short-id}] ...` lines are the worker's stderr.
+
+### bwrap failures (most common)
+
+```
+[worker abcd...] bwrap: Can't mkdir /home/user/.bash_history: Not a directory
+```
+
+The hide list contained a file. Fix per Step 12 in `SANDBOX.md`: emit `--bind /dev/null <path>` for files, `--tmpfs <path>` for directories.
+
+```
+[worker abcd...] bwrap: setting up uid map: Permission denied
+```
+
+User namespaces aren't enabled in the kernel. Either enable
+`kernel.unprivileged_userns_clone=1` or set `sandbox.enabled = false` in config.
+
+```
+[worker abcd...] bwrap: Can't bind mount /home/user/repo on /home/user/repo: No such file or directory
+```
+
+`repo_path` in the tree's meta.json points at a missing directory. Fix the meta or recreate the tree.
+
+### Worker panics inside the agent loop
+
+Look for backtrace lines following the worker's stderr. Often a tool execution error or provider issue. Test the worker in isolation:
 
 ```bash
-# Terminal 1 — Start SSE stream (this auto-spawns the agent, waiting for input)
-curl -v -N "http://localhost:8080/trees/<tree-uuid>/stream"
-
-# Terminal 2 — Send message
-curl -s -X POST "http://localhost:8080/trees/<tree-uuid>/message" \
-  -H "Content-Type: application/json" \
-  -d '{"text":"say hello"}'
+echo '{"method":"message","params":{"text":"list files"}}' \
+  | ./target/debug/agent worker --tree-id <id> --config ~/.agent/config.toml
 ```
 
-Expected curl output:
-```
-< HTTP/1.1 200 OK
-< Content-Type: text/event-stream
-< Transfer-Encoding: chunked
-<
-data: {"type":"text_chunk","content":"Hello"}
-data: {"type":"done","status":"stop"}
-...
-```
+Direct invocation skips bwrap and shows the full stderr.
 
-If curl hangs with no data → the `SseUpgrade` / `Upgrade` mechanism isn't
-sending data (check `[sse-upgrade]` logs).
+### Provider misconfiguration
 
-If curl shows `HTTP/1.1 200 OK` but stalls at 0 bytes → tiny_http's BufWriter
-is buffering (this was the root cause — fixed by using `rouille::Upgrade`
-instead of `ResponseBody::from_reader`).
+Default provider points at `http://localhost:8080/v1` (the server itself). If `AGENT_BASE_URL` / `LLM_API_KEY` aren't set, the LLM call fails and the agent emits a fatal Error event before exiting. Worker exits cleanly (status 0), so this shows as `Error: ...` not `worker exited unexpectedly`.
 
-### Step 3 — Check `[sse]` logs
+## Inspecting a tree's state
 
-The SSE handler logs every step. Enable `RUST_LOG=info` and grep for `[sse]`:
-
-```
-[sse] Opening SSE stream for tree <uuid>
-[sse] Auto-spawning agent for tree <uuid>
-[sse] Using SSE upgrade for tree <uuid>
-[sse-upgrade] Starting SSE write loop for tree <uuid>
-```
-
-If you see "Auto-spawning" but curl still gets 404 → the spawn failed (check
-`[lifecycle]` logs).
-
-If you see "Starting SSE write loop" but no data reaches curl → the write loop
-is stuck (check bridge logs).
-
-### Step 4 — Check bridge & agent lifecycle
-
-```
-[lifecycle] Spawned agent + bridge for tree <uuid>
-[lifecycle] Bridge thread exited for tree <uuid>
-[lifecycle] Agent thread exited for tree <uuid>
-```
-
-If agent exits before SSE stream opens → race condition (fixed by auto-spawn
-in `handle_sse_stream`). Verify the CLI opens the SSE stream FIRST.
-
-If bridge never exits → the `event_tx` channel never closed (agent still running
-or blocked on LLM call). Check for "Agent loop started" and "Processing message"
-logs.
-
-## Common Problems
-
-### CLI hangs with no output
-Most likely cause: SSE stream opens but the BufWriter buffers everything.
-**Fix:** The `SseUpgrade` upgrade mechanism flushes after every event. If it's
-still happening, check that `rouille::Upgrade` is being used (not
-`ResponseBody::from_reader`).
-
-### "Read-only file system (os error 30)" when writing to store
-The root filesystem `/` is btrfs and mounted `ro`. `~/.agent` inherits this.
-Workaround (already applied):
 ```bash
-export AGENT_DIR="/home/robin/Code/agent/.agent-data"
-mkdir -p "$AGENT_DIR/trees"
-```
-Or verify bind mounts are active: `mount | grep "/home/robin/.agent"`.
+# Raw entries (one JSON object per line, header on line 1)
+cat ~/.agent/trees/<uuid>/data.jsonl | jq
 
-### CLI shows warnings: "failed to parse SSE event"
-The client received non-JSON data on the SSE stream. This happens when
-`SseUpgrade` writes raw HTTP headers alongside event data. The fix is the
-`headers_written` flag — headers should only come from the initial upgrade
-response, not duplicated in `build()`. If warnings appear, check that
-`headers_written: true` is set on the `SseUpgrade` struct and that no
-manual headers are written in `build()`.
+# Metadata (atomic-written, server-only)
+cat ~/.agent/trees/<uuid>/meta.json | jq
 
-### "No active agent for tree ..."
-The SSE stream opened but the agent already exited. The CLI now opens the
-stream FIRST (which auto-spawns), then sends the message. If this error
-still appears, check: is the agent spawning? (look for `[lifecycle] Spawned`
-logs). Is the tree valid? (`cargo run -p agent-cli trees`).
-
-## Architecture (Data Flow)
-
-```
-CLI                          Server
- │                            │
- ├── GET /stream ─────────────┤  Opens SSE first, auto-spawns agent
- │                            ├── SseUpgrade::build() gets raw socket
- │                            │   writes HTTP 200 + SSE headers
- │                            │   subscribes to event broadcast
- │                            │
- ├── POST /message ───────────┤  Sends message to agent via channel
- │                            ├── agent → LLM → events → bridge
- │                            │   bridge → event_broadcast → SseUpgrade
- │                            │   SseUpgrade flushes each event to socket
- ◄══ data: {text_chunk} ══════╪══ Real-time streaming to CLI
- ◄══ data: {done} ════════════╪══
+# Server's view via HTTP
+curl -s http://localhost:8080/trees/<uuid> | jq
+curl -s http://localhost:8080/trees/<uuid>/entries | jq
 ```
 
-## Key Files
+## Testing the WS layer directly
 
-| File | Purpose |
-|------|---------|
-| `agent-cli/src/main.rs` | CLI entry point. `send_and_stream()` opens SSE first, sends message second |
-| `agent-cli/src/client.rs` | HTTP client. `SseEventStream::next_event()` parses SSE |
-| `agent-server/src/routes.rs` | HTTP handlers. `SseUpgrade` struct does direct socket writes |
-| `agent-server/src/lifecycle.rs` | Agent lifecycle. Bridge buffers ALL events, clears broadcast on exit |
-| `agent-core/src/agent.rs` | Agent loop. `run_agent()` processes messages, emits `ServerEvent`s |
-| `agent-core/src/provider.rs` | LLM provider. `stream_chat()` sends HTTP request, returns chunk stream |
+```bash
+# Requires `pip install websocket-client` or use wscat
+python3 -c "
+import websocket, json
+ws = websocket.create_connection('ws://localhost:8080/trees/<uuid>/ws')
+ws.send(json.dumps({'method':'message','params':{'text':'hi'}}))
+while True:
+    print(ws.recv())
+"
+```
+
+If the WS connection drops immediately, the worker spawn failed — check the server log for `[lifecycle]` and `[worker]` lines.
+
+## SIGINT / clean shutdown
+
+`Ctrl-C` on the server triggers `signal_hook` → `shutting_down` flag → main accept loop breaks → `lifecycle::shutdown_all` walks active workers, sends `{"method":"stop"}` on each stdin, polls `try_wait` for up to 60s, escalates to `child.kill()` for stragglers, then `recover_tree` appends a linked synthetic `SessionEnd` (status `Aborted`) so the next session boundary is clean.
+
+If the server is killed with SIGKILL (no graceful shutdown), `--die-with-parent` on bwrap kills the workers, and on next startup `scan_unterminated` writes synthetic `SessionEnd`s for any tree whose last entry isn't one.
+
+## Integration test (Step 10)
+
+The end-to-end test spawns a real `agent worker` subprocess with `AGENT_TEST_STUB=1` set, which makes `provider.stream_chat()` return canned SSE data instead of hitting a real API. Useful for validating the full RPC roundtrip:
+
+```bash
+cargo test -p agent-worker --test end_to_end
+```
+
+If you want to manually exercise the stub path:
+
+```bash
+AGENT_TEST_STUB=1 ./target/debug/agent worker --tree-id <id> --config <path>
+```
+
+## Common log tags
+
+| Tag | Source | What it means |
+|---|---|---|
+| `[lifecycle]` | server | worker spawn / shutdown / recover |
+| `[proxy <id>]` | server stdout-proxy thread | worker stdout reader |
+| `[worker <id>]` | server stderr-demux thread | a line the worker wrote to stderr |
+| `[ws <id>]` | server WS session thread | per-connection events (pong timeout, etc.) |
+| `[auto-title <id>]` | server side thread | LLM-driven title generation after first turn |
+
+## Sandbox toggle for development
+
+When iterating on something that's hard to debug inside bwrap (e.g., a tool that wants to spawn a subprocess), set `sandbox.enabled = false` in `~/.agent/config.toml`:
+
+```toml
+[sandbox]
+enabled = false
+```
+
+The worker spawns directly via `Command::new("agent")` with no namespace isolation. All other behavior is identical.
+
+## "I deleted ~/.agent but trees still show up"
+
+The CLI's interactive tree picker pulls from the server's in-memory `INDEX_CACHE`, which is populated at startup from `~/.agent/trees/*/meta.json`. Restart the server after deleting tree directories.
+
+## Legacy flat-layout files in ~/.agent/trees/
+
+Pre-restructure trees were stored as `~/.agent/trees/{id}.jsonl` + `{id}.meta.json` (flat). The current code uses `~/.agent/trees/{id}/data.jsonl` + `meta.json` (subdirectory). There's no migration — delete the old flat files manually:
+
+```bash
+find ~/.agent/trees -maxdepth 1 -type f -delete
+```
+
+The subdirectories are untouched.
