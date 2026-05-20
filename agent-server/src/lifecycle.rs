@@ -12,6 +12,7 @@ use agent_core::store::Store;
 use agent_core::types::{Entry, ServerEvent, TreeId, TreeMeta};
 
 const BUFFER_CAPACITY: usize = 1000;
+type StderrBuf = Arc<Mutex<VecDeque<String>>>;
 
 // ── Worker subprocess lifecycle ──
 
@@ -99,9 +100,11 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
         .unwrap()
         .insert(tree_id.to_string(), entry.clone());
 
+    let stderr_buf: StderrBuf = Arc::new(Mutex::new(VecDeque::with_capacity(20)));
+
     spawn_stdin_writer(stdin, stdin_rx);
-    spawn_stdout_proxy(tree_id.to_string(), stdout, entry.clone(), store, cfg);
-    spawn_stderr_demux(tree_id.to_string(), stderr);
+    spawn_stdout_proxy(tree_id.to_string(), stdout, entry.clone(), store, cfg, stderr_buf.clone());
+    spawn_stderr_demux(tree_id.to_string(), stderr, stderr_buf);
     log::info!("[lifecycle] Spawned worker for tree {} (pid {})", tree_id, pid);
     Ok(())
 }
@@ -263,6 +266,7 @@ fn spawn_stdout_proxy(
     entry: Arc<Mutex<WorkerEntry>>,
     store: Arc<Store>,
     cfg: Arc<Config>,
+    stderr_buf: StderrBuf,
 ) {
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(stdout);
@@ -333,8 +337,16 @@ fn spawn_stdout_proxy(
 
         if !exit_ok {
             log::warn!("[proxy {}] worker exited with error", tree_id);
+            let detail = {
+                let g = stderr_buf.lock().unwrap();
+                if g.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", g.iter().cloned().collect::<Vec<_>>().join("\n"))
+                }
+            };
             let err_event = ServerEvent::Error {
-                message: "worker exited unexpectedly".into(),
+                message: format!("worker exited unexpectedly{}", detail),
                 fatal: true,
             };
             let done_event = ServerEvent::Done { status: "aborted".into() };
@@ -347,16 +359,24 @@ fn spawn_stdout_proxy(
     });
 }
 
-fn spawn_stderr_demux(tree_id: String, stderr: ChildStderr) {
+fn spawn_stderr_demux(tree_id: String, stderr: ChildStderr, buf: StderrBuf) {
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(stderr);
-        let mut buf = String::new();
+        let mut line = String::new();
         let short = &tree_id[..tree_id.len().min(8)];
         loop {
-            buf.clear();
-            match reader.read_line(&mut buf) {
+            line.clear();
+            match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => break,
-                Ok(_) => log::info!("[worker {}] {}", short, buf.trim_end()),
+                Ok(_) => {
+                    let trimmed = line.trim_end().to_string();
+                    log::info!("[worker {}] {}", short, trimmed);
+                    let mut g = buf.lock().unwrap();
+                    if g.len() >= 20 {
+                        g.pop_front();
+                    }
+                    g.push_back(trimmed);
+                }
             }
         }
     });

@@ -336,7 +336,7 @@ Tests (`#[cfg(test)] mod tests` in `client.rs`):
 
 ## Step 2 — Fix bash cancellation latency
 
-- [ ] Reduce stop-poll interval in bash timeout thread
+- [x] Reduce stop-poll interval in bash timeout thread
 - [ ] Verify cancellation feels immediate
 
 **Goal:** Make pressing Esc during a bash tool call feel instantaneous (< ~20ms to
@@ -395,7 +395,7 @@ assertion comment to "within ~200ms" to lock in the improvement.
 **Notes:**
 - Modified: `agent-core/src/tools/bash.rs` — reduced poll interval from 100ms to 5ms,
   iteration count computed from `(timeout_secs * 1000) / poll_ms` instead of `timeout_secs * 10`.
-- Verified: `cargo test --workspace` → 127 passed, `cargo clippy --workspace` → no new warnings.
+- Verified: `cargo test --workspace` → 132 passed, `cargo clippy --workspace` → no new warnings.
 
 ---
 
@@ -849,3 +849,126 @@ Use `color::Fg(color::LightBlack)` for the dimmed `·  id` portion.
   6. Replaced user label `●  User:` with green `▸`; replaced session header `───` separators with compact `{title}  ·  {short_id}`
 - Added 4 new tests: `test_render_tool_suppresses_start`, `test_render_no_assistant_header`, `test_format_tool_args_bash`, `test_format_tool_args_fallback`
 - Verified: `cargo test --workspace` → 136 passed, `cargo clippy --workspace` → no new warnings.
+
+---
+
+## Step 5 — Surface worker crash output in the CLI
+
+- [x] Accumulate worker stderr in a shared ring buffer
+- [x] Include last N stderr lines in the error event on unexpected exit
+
+**Goal:** When the worker crashes or fails, the CLI shows the actual error output
+(panic message, stderr lines) instead of the generic "worker exited unexpectedly".
+
+**Root cause:** `spawn_stderr_demux` (`lifecycle.rs:350`) reads worker stderr and
+forwards each line only to the server log (`log::info!`). `spawn_stdout_proxy`
+detects the unexpected exit and sends `ServerEvent::Error { message: "worker
+exited unexpectedly" }` — with no access to the stderr content.
+
+**Spec details:**
+
+File: `agent-server/src/lifecycle.rs`.
+
+### 1. Shared stderr ring buffer
+
+Add a type alias at the top of the file:
+
+```rust
+type StderrBuf = Arc<Mutex<VecDeque<String>>>;
+```
+
+Create it in `spawn_worker`, before spawning the threads, and pass it to both
+thread-spawning functions:
+
+```rust
+let stderr_buf: StderrBuf = Arc::new(Mutex::new(VecDeque::with_capacity(20)));
+spawn_stdout_proxy(tree_id.to_string(), stdout, entry.clone(), store, cfg,
+                   stderr_buf.clone());
+spawn_stderr_demux(tree_id.to_string(), stderr, stderr_buf);
+```
+
+### 2. `spawn_stderr_demux` — fill the buffer
+
+Change signature:
+
+```rust
+fn spawn_stderr_demux(tree_id: String, stderr: ChildStderr, buf: StderrBuf)
+```
+
+In the read loop, push each line into `buf` (cap at 20; drop the oldest when
+full) and continue logging to `log::info!` as today:
+
+```rust
+Ok(_) => {
+    let line = buf.trim_end().to_string();
+    log::info!("[worker {}] {}", short, line);
+    let mut g = buf.lock().unwrap();
+    if g.len() >= 20 { g.pop_front(); }
+    g.push_back(line);
+}
+```
+
+### 3. `spawn_stdout_proxy` — include stderr in crash event
+
+Change signature:
+
+```rust
+fn spawn_stdout_proxy(
+    tree_id: String,
+    stdout: ChildStdout,
+    entry: Arc<Mutex<WorkerEntry>>,
+    store: Arc<Store>,
+    cfg: Arc<Config>,
+    stderr_buf: StderrBuf,
+)
+```
+
+In the `if !exit_ok` block, build the error message from the buffer:
+
+```rust
+if !exit_ok {
+    log::warn!("[proxy {}] worker exited with error", tree_id);
+    let detail = {
+        let g = stderr_buf.lock().unwrap();
+        if g.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", g.iter().cloned().collect::<Vec<_>>().join("\n"))
+        }
+    };
+    let err_event = ServerEvent::Error {
+        message: format!("worker exited unexpectedly{}", detail),
+        fatal: true,
+    };
+    …
+}
+```
+
+### No CLI changes needed
+
+`ServerEvent::Error { message, fatal: true }` already renders in the CLI as
+`✖ Fatal: {message}`. Multi-line messages render correctly because
+`print_error` writes the whole string and raw-mode newlines are handled by the
+existing `\r\n` in the format string — except that embedded `\n` need to
+become `\r\n`. Add a `normalize_for_raw` call in `print_error`:
+
+```rust
+fn print_error(out: &mut impl Write, text: &str) {
+    let text = normalize_for_raw(text);
+    write!(out, "{}{}✖ {}{}\r\n", …).ok();
+}
+```
+
+`normalize_for_raw` already exists in `interactive.rs`.
+
+**Verify:**
+
+- `cargo test --workspace` — all tests pass.
+- Manual: cause a worker crash (e.g. break the config so the worker panics on
+  start); confirm the CLI shows the Rust panic message rather than only "worker
+  exited unexpectedly".
+
+**Notes:** _(filled on completion)_
+- Modified: `agent-server/src/lifecycle.rs` — added `StderrBuf` type alias, created ring buffer in `spawn_worker`, passed to both `spawn_stdout_proxy` and `spawn_stderr_demux`; `spawn_stderr_demux` fills buffer (cap 20); `spawn_stdout_proxy` reads buffer on crash to include stderr in error message.
+- Modified: `agent-cli/src/interactive.rs` — `print_error` now calls `normalize_for_raw` so multi-line error messages render correctly in raw mode.
+- Verified: `cargo test --workspace` → all pass, `cargo clippy --workspace` → no new warnings.
