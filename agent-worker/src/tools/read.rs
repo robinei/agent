@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::{resolve_path, Tool, ToolResult};
-use crate::types::{ToolDefinition, ToolOutput};
+use agent_core::types::{ToolDefinition, ToolOutput};
 
 pub struct ReadTool {
     cwd: PathBuf,

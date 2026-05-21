@@ -55,7 +55,7 @@ fn make_tool_result_message(output: &ToolOutput, call: &ToolCall) -> Message {
     }
 }
 
-fn collect_tool_definitions(tools: &[Box<dyn agent_core::tools::Tool>]) -> Vec<ToolDefinition> {
+fn collect_tool_definitions(tools: &[Box<dyn crate::tools::Tool>]) -> Vec<ToolDefinition> {
     tools.iter().map(|t| t.definition()).collect()
 }
 
@@ -135,7 +135,7 @@ pub fn begin_turn(
     tree_id: &str,
     store: &Store,
     session_cfg: &SessionConfig,
-    tools: &[Box<dyn agent_core::tools::Tool>],
+    tools: &[Box<dyn crate::tools::Tool>],
     cwd: &std::path::Path,
     _stop: &Arc<AtomicBool>,
     out: &mut BufWriter<std::io::Stdout>,
@@ -168,7 +168,7 @@ pub fn begin_turn(
 
     let leaf_id = tree_meta.leaf_id.clone();
     let leaf_ref = leaf_id.as_deref().unwrap_or("root");
-    let mut messages = agent_core::agent::build_context(&entries, leaf_ref);
+    let mut messages = crate::agent::build_context(&entries, leaf_ref);
 
     let user_msg_id = agent_core::util::generate_entry_id();
     let mut leaf_id = leaf_id.clone();
@@ -180,8 +180,8 @@ pub fn begin_turn(
 
     messages.push(user_msg);
 
-    let ctx_files = agent_core::context_files::load_context_files(cwd, store.base_dir());
-    let context_section = agent_core::context_files::format_context_section(&ctx_files);
+    let ctx_files = crate::context_files::load_context_files(cwd, store.base_dir());
+    let context_section = crate::context_files::format_context_section(&ctx_files);
     messages.insert(
         0,
         Message {
@@ -202,7 +202,7 @@ pub fn begin_turn(
         return AgentState::Idle;
     }
 
-    let estimated = agent_core::agent::estimate_context_tokens(&messages);
+    let estimated = crate::agent::estimate_context_tokens(&messages);
     if check_context_cap(estimated, session_cfg, tree_id, store, out).is_err() {
         return AgentState::Idle;
     }
@@ -214,7 +214,7 @@ pub fn begin_turn(
 }
 
 fn execute_tool(
-    tools: &[Box<dyn agent_core::tools::Tool>],
+    tools: &[Box<dyn crate::tools::Tool>],
     name: &str,
     args: &serde_json::Value,
     stop: &Arc<AtomicBool>,
@@ -371,7 +371,7 @@ pub fn finish_response(
     tree_id: &str,
     store: &Store,
     session_cfg: &SessionConfig,
-    tools: &[Box<dyn agent_core::tools::Tool>],
+    tools: &[Box<dyn crate::tools::Tool>],
     stop: &Arc<AtomicBool>,
     out: &mut BufWriter<std::io::Stdout>,
 ) -> AgentState {

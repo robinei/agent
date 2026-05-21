@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use unicode_normalization::UnicodeNormalization;
 
 use super::{resolve_path, Tool, ToolResult};
-use crate::types::{ToolDefinition, ToolOutput};
+use agent_core::types::{ToolDefinition, ToolOutput};
 
 /// Per-file mutex for serializing concurrent edits/writes to the same file.
 static EDIT_FILE_LOCKS: LazyLock<Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<()>>>>> =

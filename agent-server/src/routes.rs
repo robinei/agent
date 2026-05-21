@@ -1,14 +1,13 @@
 use std::sync::Arc;
 
-use agent_core::config::Config;
-use agent_core::store::Store;
 use serde::Deserialize;
 
-use agent_core::agent;
-use agent_core::provider::Provider;
-use agent_core::types::{Entry, TreeMeta, TreeSandbox};
-
+use crate::auto_title;
 use crate::lifecycle;
+use crate::provider::Provider;
+use agent_core::config::Config;
+use agent_core::store::Store;
+use agent_core::types::{Entry, TreeMeta, TreeSandbox};
 
 #[derive(Deserialize)]
 pub struct CreateTreeBody {
@@ -227,7 +226,7 @@ fn handle_auto_title(id: &str, store: &Store, config: &Config) -> (u16, Vec<u8>,
         None,
         None,
     );
-    match agent::auto_title(store, &provider, id) {
+    match auto_title::auto_title(store, &provider, id) {
         Ok(title) => {
             lifecycle::broadcast_meta_update(id, Some(title.clone()));
             json(200, &serde_json::json!({"title": title}))

@@ -131,7 +131,7 @@ let mut meta = meta;
     }
 
     pub fn auto_title(&self, tree_id: &str) -> Result<String, String> {
-        let provider = agent_core::provider::Provider::new(
+        let provider = agent_server::provider::Provider::new(
             self.config.summary.base_url.clone(),
             self.config.summary.api_key.clone(),
             self.config.summary.model.clone(),
@@ -140,6 +140,6 @@ let mut meta = meta;
             None,
             None,
         );
-        agent_core::agent::auto_title(&self.store, &provider, tree_id)
+        agent_server::auto_title::auto_title(&self.store, &provider, tree_id)
     }
 }

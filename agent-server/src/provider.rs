@@ -1,7 +1,7 @@
 use serde_json::json;
 use thiserror::Error;
 
-use crate::types::{Message, MessageContent, MessageRole, ToolCall, ToolDefinition};
+use agent_core::types::{Message, MessageContent, MessageRole, ToolCall, ToolDefinition};
 
 #[derive(Error, Debug)]
 pub enum ProviderError {
@@ -116,10 +116,10 @@ impl Provider {
                 let arr: Vec<serde_json::Value> = blocks
                     .iter()
                     .map(|b| match b {
-                        crate::types::ContentBlock::Text { text } => {
+                        agent_core::types::ContentBlock::Text { text } => {
                             json!({"type": "text", "text": text})
                         }
-                        crate::types::ContentBlock::ToolCall {
+                        agent_core::types::ContentBlock::ToolCall {
                             id,
                             name,
                             arguments,
@@ -170,7 +170,7 @@ impl Provider {
             .unwrap_or("")
             .to_string();
 
-        let usage = crate::types::TokenUsage {
+        let usage = agent_core::types::TokenUsage {
             prompt_tokens: json["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
             completion_tokens: json["usage"]["completion_tokens"].as_u64().unwrap_or(0),
             total_tokens: json["usage"]["total_tokens"].as_u64().unwrap_or(0),
@@ -244,7 +244,7 @@ pub struct ChatResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: String,
-    pub usage: crate::types::TokenUsage,
+    pub usage: agent_core::types::TokenUsage,
 }
 
 /// Generate a continuation brief by making a separate LLM call with just the
@@ -252,7 +252,7 @@ pub struct ChatResponse {
 pub fn generate_continuation_brief(
     provider: &Provider,
     messages: &[Message],
-) -> Result<(String, crate::types::SessionStatus)> {
+) -> Result<(String, agent_core::types::SessionStatus)> {
     let summary_prompt = Message {
         role: MessageRole::System,
         content: MessageContent::Text(
@@ -286,14 +286,14 @@ pub fn generate_continuation_brief(
     let status = if let Some(line) = text.lines().last() {
         let lower = line.trim().to_lowercase();
         if lower.contains("completed") || lower.contains("done") {
-            crate::types::SessionStatus::Completed
+            agent_core::types::SessionStatus::Completed
         } else if lower.contains("blocked") {
-            crate::types::SessionStatus::Blocked
+            agent_core::types::SessionStatus::Blocked
         } else {
-            crate::types::SessionStatus::Continuing
+            agent_core::types::SessionStatus::Continuing
         }
     } else {
-        crate::types::SessionStatus::Continuing
+        agent_core::types::SessionStatus::Continuing
     };
 
     // Strip STATUS lines from the text

@@ -5,8 +5,9 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use agent_core::config::Config;
-use agent_core::provider::Provider;
 use agent_core::rpc::{LlmRequest, LlmResponse, PipeIn};
+
+use crate::provider::Provider;
 use nix::poll::PollFlags;
 use rustls::pki_types::ServerName;
 

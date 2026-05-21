@@ -11,7 +11,7 @@ use regex::Regex;
 use walkdir::WalkDir;
 
 use super::{resolve_path, Tool, ToolResult};
-use crate::types::{ToolDefinition, ToolOutput};
+use agent_core::types::{ToolDefinition, ToolOutput};
 
 /// Directories to skip during recursive search.
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".hg", ".svn", "vendor"];

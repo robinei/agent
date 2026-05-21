@@ -13,8 +13,8 @@ use std::sync::Arc;
 use walkdir::WalkDir;
 
 use super::{Tool, ToolResult};
-use crate::config::agent_dir;
-use crate::types::{Entry, MessageContent, ToolDefinition, ToolOutput};
+use agent_core::config::agent_dir;
+use agent_core::types::{Entry, MessageContent, ToolDefinition, ToolOutput};
 
 // ── Message search tool ──
 
@@ -109,7 +109,7 @@ impl SearchMessagesTool {
     }
 }
 
-fn entry_as_message(entry: &Entry) -> Option<&crate::types::Message> {
+fn entry_as_message(entry: &Entry) -> Option<&agent_core::types::Message> {
     if let Entry::Message { message, .. } = entry {
         Some(message)
     } else {
@@ -117,12 +117,12 @@ fn entry_as_message(entry: &Entry) -> Option<&crate::types::Message> {
     }
 }
 
-fn entry_role_str(role: &crate::types::MessageRole) -> &'static str {
+fn entry_role_str(role: &agent_core::types::MessageRole) -> &'static str {
     match role {
-        crate::types::MessageRole::System => "system",
-        crate::types::MessageRole::User => "user",
-        crate::types::MessageRole::Assistant => "assistant",
-        crate::types::MessageRole::Tool => "tool",
+        agent_core::types::MessageRole::System => "system",
+        agent_core::types::MessageRole::User => "user",
+        agent_core::types::MessageRole::Assistant => "assistant",
+        agent_core::types::MessageRole::Tool => "tool",
     }
 }
 
@@ -132,7 +132,7 @@ fn message_content_text(content: &MessageContent) -> String {
         MessageContent::Blocks(blocks) => {
             let mut text = String::new();
             for block in blocks {
-                if let crate::types::ContentBlock::Text { text: t } = block {
+                if let agent_core::types::ContentBlock::Text { text: t } = block {
                     text.push_str(t);
                     text.push('\n');
                 }
@@ -411,8 +411,8 @@ impl Tool for SearchFilesTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Store;
-    use crate::types::*;
+    use agent_core::store::Store;
+    use agent_core::types::*;
     use std::sync::Mutex;
     use tempfile::TempDir;
 

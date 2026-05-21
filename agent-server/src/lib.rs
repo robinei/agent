@@ -4,10 +4,12 @@ use std::sync::Arc;
 use agent_core::config::Config;
 use agent_core::store::Store;
 
+pub mod auto_title;
 pub mod handlers;
 pub mod http;
 pub mod lifecycle;
 mod llm_handler;
+pub mod provider;
 mod routes;
 pub mod worker_ctx;
 pub mod worker_loop;

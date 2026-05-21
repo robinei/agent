@@ -20,7 +20,7 @@ pub mod read;
 pub mod search;
 pub mod write;
 
-use crate::types::{ToolDefinition, ToolOutput};
+use agent_core::types::{ToolDefinition, ToolOutput};
 
 /// Result type for tool execution.
 pub type ToolResult = Result<ToolOutput, Box<dyn std::error::Error + Send + Sync>>;

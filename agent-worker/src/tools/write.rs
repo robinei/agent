@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::{Tool, ToolResult};
-use crate::types::{ToolDefinition, ToolOutput};
+use agent_core::types::{ToolDefinition, ToolOutput};
 
 pub struct WriteTool {
     cwd: PathBuf,

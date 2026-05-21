@@ -15,7 +15,7 @@ use nix::sys::signal;
 use nix::unistd::Pid;
 
 use super::{truncate_output, Tool, ToolResult};
-use crate::types::{ToolDefinition, ToolOutput};
+use agent_core::types::{ToolDefinition, ToolOutput};
 
 pub struct BashTool {
     cwd: PathBuf,

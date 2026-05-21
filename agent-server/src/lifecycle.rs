@@ -72,7 +72,7 @@ pub fn spawn_auto_title(ctx: &WorkerCtx) {
             if !needs {
                 return;
             }
-            let provider = agent_core::provider::Provider::new(
+            let provider = crate::provider::Provider::new(
                 cfg.summary.base_url.clone(),
                 cfg.summary.api_key.clone(),
                 cfg.summary.model.clone(),
@@ -81,7 +81,7 @@ pub fn spawn_auto_title(ctx: &WorkerCtx) {
                 None,
                 None,
             );
-            match agent_core::agent::auto_title(&store, &provider, &tid) {
+            match crate::auto_title::auto_title(&store, &provider, &tid) {
                 Ok(title) => {
                     let ev = ServerEvent::MetaUpdate { title: Some(title) };
                     let _ = msg_tx.send(WorkerMsg::InjectEvent(ev));

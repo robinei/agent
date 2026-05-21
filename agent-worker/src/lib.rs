@@ -1,4 +1,7 @@
+pub mod agent;
+mod context_files;
 mod thinking;
+mod tools;
 mod turn;
 mod util;
 
@@ -10,7 +13,6 @@ use log::{info, warn};
 
 use agent_core::rpc::{LlmResponse, PipeIn, WsCommand};
 use agent_core::store::Store;
-use agent_core::tools;
 
 use crate::turn::{begin_turn, cancel_turn, finish_response, process_chunk};
 use crate::util::{parse_tree_id, read_config, resolve_repo_path};

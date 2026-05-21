@@ -9,14 +9,17 @@ endpoint.
 
 5 crates in a Cargo workspace:
 
-- **`agent-core`** — lib: types, JSONL store, LLM provider, tools
-  (read/write/edit/bash/grep/find/ls/git/search), agent loop, context files,
-  hooks, WsCommand protocol (`rpc.rs`)
+- **`agent-core`** — lib: shared-only modules — types, JSONL store, config,
+  hooks, logging, `rpc.rs` (WsCommand/PipeIn/LlmRequest/LlmResponse protocol)
 - **`agent-server`** — lib: hand-rolled HTTP layer on `TcpListener` +
-  `httparse`, WebSocket upgrade via `tungstenite::WebSocket::from_raw_socket`,
-  worker subprocess lifecycle, bwrap argv builder, graceful shutdown
-- **`agent-worker`** — lib: stdin/stdout JSON bridge, hosts the agent loop
-  inside a sandboxed subprocess
+  `httparse`, WebSocket upgrade, single-threaded per-worker event loop
+  (`worker_loop.rs`, `nix::poll`), LLM HTTP/TLS proxy (`llm_handler.rs`,
+  `rustls`), worker subprocess lifecycle, bwrap argv builder, graceful
+  shutdown, LLM provider (`provider.rs`), auto-title (`auto_title.rs`)
+- **`agent-worker`** — lib: stdin/stdout JSON bridge, state-machine agent loop
+  (`AgentState::Idle | Streaming`), tools
+  (read/write/edit/bash/grep/find/ls/git/search), context building
+  (`agent.rs`), thinking-tag parsing (`thinking.rs`), turn logic (`turn.rs`)
 - **`agent-cli`** — lib: interactive TUI (`termion` raw mode), one-shot
   commands via `clap`, `tungstenite` WebSocket client
 - **`agent`** — bin: dispatches `agent server | cli | worker` to the
@@ -30,16 +33,24 @@ CLI (tungstenite) ── WS ──▶ Server (one TcpListener, one port)
                               └── WS upgrade per tree
                                      │
                                      ▼
+                              worker_loop (one thread, nix::poll)
+                              ├── StdoutHandler  — reads worker stdout (JSON events)
+                              ├── StderrHandler  — demuxes worker stderr to log
+                              ├── WsClient(s)    — per connected CLI session
+                              ├── LlmHandler     — rustls TLS socket, streams LLM response
+                              └── NotifyHandler  — wakes loop on new WS writes
+                                     │
+                                     ▼
                               Worker subprocess (bwrap-sandboxed)
-                              stdin: JSON command lines
-                              stdout: JSON ServerEvent lines
-                              stderr: demuxed to server log
+                              stdin: PipeIn JSON lines (Cmd | Llm | Config)
+                              stdout: ServerEvent JSON lines
+                              stderr: forwarded to server log
 ```
 
-One worker process per active tree, lives across many turns. WS thread on the
-server owns the socket exclusively (non-blocking + 10ms poll). A stdout-proxy
-thread reads worker events and fans them out to all WS subscribers + a
-per-tree ring buffer.
+One worker process per active tree, lives across many turns. The server
+manages one event-loop thread per worker using `nix::poll` over all relevant
+fds — no per-client threads. LLM HTTP/TLS streaming is handled as a fd in
+the same poll loop (`LlmHandler`, `rustls` state machine).
 
 ## Build & Run
 
@@ -64,7 +75,7 @@ See `DEBUG.md` for env-var configuration and troubleshooting.
 ## Key conventions
 
 - **No async runtime.** `std::thread`, `std::sync::mpsc`, `Mutex`. No tokio.
-- **Tools implement `Tool`** in `agent-core/src/tools/`. Register in
+- **Tools implement `Tool`** in `agent-worker/src/tools/`. Register in
   `all_tools()` in `mod.rs`. One file per tool.
 - **Tools use the real filesystem** (no I/O trait abstractions). Tests create
   temp dirs with `tempfile::TempDir`.
@@ -77,13 +88,15 @@ See `DEBUG.md` for env-var configuration and troubleshooting.
   meta changes via events; the server applies them. This is what keeps a
   rogue worker from rewriting its own `repo_path` or sandbox config to
   escalate privileges on the next spawn.
-- **WS protocol:** see `agent-core/src/rpc.rs` for `WsCommand`. Each frame is
-  one JSON object: `{"method":"message","params":{"text":"..."}}` or
+- **WS protocol:** see `agent-core/src/rpc.rs` for `WsCommand` (CLI→server),
+  `PipeIn` (server→worker, wraps `WsCommand | LlmResponse | Config`),
+  `LlmRequest`/`LlmResponse` (worker↔server LLM proxy). Each frame is one
+  JSON object: `{"method":"message","params":{"text":"..."}}` or
   `{"method":"stop"}`.
 - **Server events:** `ServerEvent` enum in `agent-core/src/types.rs` —
   `TextChunk`, `ToolStart`, `ToolResult`, `Entry(...)`, `CapWarning`,
-  `MetaUpdate`, `Done`, `Error`. The agent emits via mpsc; the server's WS
-  thread forwards to subscribed clients.
+  `MetaUpdate`, `Done`, `Error`. The worker writes these to stdout as JSON
+  lines; the server's `StdoutHandler` fans them out to WS clients.
 
 ## Sandbox model
 
@@ -98,7 +111,7 @@ See `DEBUG.md` for env-var configuration and troubleshooting.
 
 ## Adding a tool
 
-1. Create `agent-core/src/tools/my_tool.rs`. Implement `Tool` (`fn
+1. Create `agent-worker/src/tools/my_tool.rs`. Implement `Tool` (`fn
    definition()`, `fn execute()`).
 2. Add one line in `all_tools()` in `tools/mod.rs`.
 3. Test with a temp dir + fixture files.
@@ -108,23 +121,30 @@ See `DEBUG.md` for env-var configuration and troubleshooting.
 - **Entry enum** (tagged via `#[serde(tag = "entry_type")]`) —
   `Message`, `BashExec`, `SessionStart`, `SessionEnd`, `GoalSet`, `ModelSet`,
   `Label`.
-- **Agent loop** (`agent-core/src/agent.rs::run_agent`): wait for message →
-  `build_context()` → `provider.stream_chat()` → parse SSE chunks → dispatch
-  tools → persist entries → emit `ServerEvent`s.
-- **Context building** walks the parent chain from `leaf_id` upward,
-  stopping at the first `SessionEnd` with a `continuation_brief`, inserts
-  `GoalSet`/`ModelSet` as system messages, skips `BashExec` (already
-  reflected in tool result messages).
+- **Agent loop** (`agent-worker/src/lib.rs`): state machine on `PipeIn` lines
+  from stdin — `AgentState::Idle` receives `Cmd::Message` → calls
+  `begin_turn()` → emits `LlmRequest` → enters `AgentState::Streaming`.
+  `Llm::Chunk` events drive `process_chunk()`; `Llm::Done` drives
+  `finish_response()` (tool dispatch, re-entry, or `Done` event).
+- **LLM proxy:** server's `LlmHandler` receives an `LlmRequest` from the
+  worker's stdout, opens a TLS connection to the provider, streams SSE chunks
+  back as `PipeIn::Llm(LlmResponse::Chunk)` lines to the worker's stdin.
+- **Context building** (`agent-worker/src/agent.rs::build_context`): walks
+  the parent chain from `leaf_id` upward, stopping at the first `SessionEnd`
+  with a `continuation_brief`, inserts `GoalSet`/`ModelSet` as system
+  messages, skips `BashExec` (already reflected in tool result messages).
+- **Thinking tags:** `agent-worker/src/thinking.rs::split_thinking_chunks`
+  strips `<think>…</think>` spans from streamed chunks; thinking content is
+  suppressed from the stored transcript and WS output.
 - **Token heuristic:** `ceil(len / 3.5)` for context estimation; emit
   `CapWarning` at soft cap, force `session_end` at hard cap.
-- **Stop is dual-path:** the worker's stdin reader thread sets an
-  `Arc<AtomicBool>` *and* pushes `AgentInput::Stop` on the mpsc channel.
-  The atomic is what the agent's tight inner loops check; without it,
-  mid-LLM-stream stop is delayed until the stream ends.
-- **Auto-title** is server-side: the stdout-proxy thread observes a `Done`
-  event, checks `meta.title.is_none()`, and fires a side thread that calls
-  `agent::auto_title`, updates meta, and broadcasts `MetaUpdate` to
-  subscribers.
+- **Stop:** the server sends `PipeIn::Cmd(Stop)` on the worker's stdin.
+  The worker's main loop checks the `stop` atomic before starting a new
+  tool call round; mid-stream, the server can also drop the LLM connection.
+- **Auto-title** is server-side (`agent-server/src/auto_title.rs`): the
+  `StdoutHandler` observes a `Done` event, checks `meta.title.is_none()`,
+  fires a side thread that calls `auto_title`, updates meta, and broadcasts
+  `MetaUpdate` to subscribers.
 - **Crash recovery:** if a worker exits non-zero, the proxy thread emits
   `Error{fatal: true}` + `Done{status: "aborted"}` and removes the entry.
   On server startup, `store.scan_unterminated()` walks every tree and

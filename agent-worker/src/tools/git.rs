@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::process::Command;
 
 use super::{Tool, ToolResult};
-use crate::types::{ToolDefinition, ToolOutput};
+use agent_core::types::{ToolDefinition, ToolOutput};
 
 pub struct GitTool {
     cwd: PathBuf,
