@@ -340,7 +340,7 @@ pub fn build_bwrap_argv(exe: &Path, tree_id: &str, meta: &TreeMeta, cfg: &Config
     }
 
     args.push("--unshare-all".into());
-    let allow_net = meta.sandbox.network.unwrap_or(true);
+    let allow_net = meta.sandbox.network.unwrap_or(false);
     if allow_net {
         args.push("--share-net".into());
     }
@@ -658,7 +658,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "--dev"));
         assert!(args.iter().any(|a| a == "--proc"));
         assert!(args.iter().any(|a| a == "--tmpfs"));
-        assert!(args.iter().any(|a| a == "--share-net"));
+        assert!(!args.iter().any(|a| a == "--share-net"));
         assert!(args.iter().any(|a| a == "--unshare-all"));
         assert!(args.iter().any(|a| a == "--new-session"));
         assert!(args.iter().any(|a| a == "--die-with-parent"));
