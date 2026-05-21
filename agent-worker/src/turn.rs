@@ -1,6 +1,5 @@
 use std::io::BufWriter;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use agent_core::config::SessionConfig;
 use agent_core::hooks;
@@ -119,8 +118,7 @@ pub fn begin_turn(
     store: &Store,
     session_cfg: &SessionConfig,
     tools: &[Box<dyn crate::tools::Tool>],
-    cwd: &std::path::Path,
-    _stop: &Arc<AtomicBool>,
+    ctx: &mut crate::tools::ToolContext,
     out: &mut BufWriter<std::io::Stdout>,
 ) -> AgentState {
     info!("begin_turn: tree={}, text={}", tree_id, text);
@@ -163,13 +161,13 @@ pub fn begin_turn(
 
     messages.push(user_msg);
 
-    let ctx_files = crate::context_files::load_context_files(cwd, store.base_dir());
+    let ctx_files = crate::context_files::load_context_files(&ctx.cwd, store.base_dir());
     let context_section = crate::context_files::format_context_section(&ctx_files);
     messages.insert(
         0,
         Message {
             role: MessageRole::System,
-            content: MessageContent::Text(build_system_prompt(cwd, &context_section)),
+            content: MessageContent::Text(build_system_prompt(&ctx.cwd, &context_section)),
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,
@@ -200,7 +198,7 @@ fn execute_tool(
     tools: &[Box<dyn crate::tools::Tool>],
     name: &str,
     args: &serde_json::Value,
-    stop: &Arc<AtomicBool>,
+    ctx: &mut crate::tools::ToolContext,
 ) -> ToolOutput {
     let tool = match tools.iter().find(|t| t.definition().name == name) {
         Some(t) => t,
@@ -214,7 +212,7 @@ fn execute_tool(
         }
     };
 
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.execute(args, stop))) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.execute(args, ctx))) {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => ToolOutput {
             content: format!("Error: {}", e),
@@ -355,7 +353,7 @@ pub fn finish_response(
     store: &Store,
     session_cfg: &SessionConfig,
     tools: &[Box<dyn crate::tools::Tool>],
-    stop: &Arc<AtomicBool>,
+    ctx: &mut crate::tools::ToolContext,
     out: &mut BufWriter<std::io::Stdout>,
 ) -> AgentState {
     let AgentState::Streaming {
@@ -402,6 +400,8 @@ pub fn finish_response(
                 tool_calls_this_turn += 1;
                 if tool_calls_this_turn > max_per_turn {
                     warn!("Max tool calls per turn reached for tree {}", tree_id);
+                    emit_error(out, format!("Max tool calls per turn ({}) reached", max_per_turn), false);
+                    emit_event(out, ServerEvent::Done { status: "error".into() });
                     return AgentState::Idle;
                 }
 
@@ -423,13 +423,14 @@ pub fn finish_response(
                     },
                 );
 
-                let result = execute_tool(tools, &call.name, &call.arguments, stop);
+                let result = execute_tool(tools, &call.name, &call.arguments, ctx);
 
                 if result.exit_code.unwrap_or(0) != 0 {
                     consecutive_failures += 1;
                     if consecutive_failures >= 3 {
                         warn!("3 consecutive tool failures for tree {}", tree_id);
                         emit_error(out, "3 consecutive tool failures, aborting turn".into(), false);
+                        emit_event(out, ServerEvent::Done { status: "error".into() });
                         return AgentState::Idle;
                     }
                 } else {
@@ -469,6 +470,9 @@ pub fn finish_response(
                 }
 
                 let tool_result_msg = make_tool_result_message(&result, call);
+                let result_msg_id = agent_core::util::generate_entry_id();
+                write_message_entry(store, tree_id, out, &result_msg_id, leaf_id.as_deref(), &tool_result_msg);
+                leaf_id = Some(result_msg_id);
                 messages.push(tool_result_msg);
             }
 
@@ -483,6 +487,7 @@ pub fn finish_response(
                         format!("Max tool call rounds ({}) reached", max_per_turn),
                         false,
                     );
+                    emit_event(out, ServerEvent::Done { status: "error".into() });
                 }
                 return AgentState::Idle;
             }
@@ -522,7 +527,7 @@ pub fn cancel_turn(
     state: AgentState,
     tree_id: &str,
     store: &Store,
-    stop: &Arc<AtomicBool>,
+    ctx: &mut crate::tools::ToolContext,
     out: &mut BufWriter<std::io::Stdout>,
 ) -> AgentState {
     if let AgentState::Streaming {
@@ -539,6 +544,6 @@ pub fn cancel_turn(
     }
 
     emit_event(out, ServerEvent::Done { status: "cancelled".into() });
-    stop.store(false, Ordering::Relaxed);
+    ctx.stop.store(false, Ordering::Relaxed);
     AgentState::Idle
 }

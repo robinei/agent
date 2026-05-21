@@ -1,24 +1,11 @@
 //! WriteTool — write content to a file.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
-use super::{Tool, ToolResult};
+use super::{EditRecord, Tool, ToolContext, ToolResult};
 use agent_core::types::{ToolDefinition, ToolOutput};
 
-pub struct WriteTool {
-    cwd: PathBuf,
-}
-
-impl WriteTool {
-    pub fn new(cwd: &Path) -> Self {
-        Self {
-            cwd: cwd.to_path_buf(),
-        }
-    }
-}
+pub struct WriteTool;
 
 impl Tool for WriteTool {
     fn definition(&self) -> ToolDefinition {
@@ -45,7 +32,7 @@ impl Tool for WriteTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, _stop: &Arc<AtomicBool>) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolResult {
         let path_str = params
             .get("path")
             .and_then(|v| v.as_str())
@@ -56,15 +43,11 @@ impl Tool for WriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required field: content".to_string())?;
 
-        let target = self.cwd.join(path_str);
+        let target = ctx.cwd.join(path_str);
 
-        // Check path is within cwd by resolving ".." components.
-        // We can't canonicalize() if the file doesn't exist, so we
-        // canonicalize cwd and do a simplified path resolution.
-        let cwd_canon = fs::canonicalize(&self.cwd)
+        let cwd_canon = fs::canonicalize(&ctx.cwd)
             .map_err(|e| format!("Cannot resolve repo root: {}", e))?;
 
-        // Resolve path components against cwd
         let target_normalized = path_str
             .split('/')
             .filter(|p| !p.is_empty() && *p != ".")
@@ -85,22 +68,33 @@ impl Tool for WriteTool {
             .into());
         }
 
-        // Create parent directories if needed
+        // Attempt to read pre-existing content for the edit record.
+        let pre_snapshot = fs::read_to_string(&target).ok();
+
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        fs::write(&target, content)?;
+        let new_content = content.to_string();
+        fs::write(&target, &new_content)?;
 
-        let bytes = content.len();
+        let id = ctx.edit_store.insert(EditRecord {
+            file_path: target.clone(),
+            pre_snapshot,
+            edits: vec![],
+            post_snapshot: Some(new_content.clone()),
+        });
+
+        let line_count = new_content.lines().count();
         Ok(ToolOutput {
             content: format!(
-                "Successfully wrote {} bytes to {}",
-                bytes,
-                target.display()
+                "edit_id: {}\nWritten: {} ({} lines)",
+                id,
+                target.display(),
+                line_count
             ),
             truncated: false,
-            original_size: bytes,
+            original_size: new_content.len(),
             exit_code: None,
         })
     }
@@ -109,17 +103,24 @@ impl Tool for WriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::fs;
     use tempfile::TempDir;
+
+    fn make_ctx(dir: &Path) -> ToolContext {
+        ToolContext::new(dir.to_path_buf())
+    }
 
     #[test]
     fn test_write_new_file() {
         let dir = TempDir::new().unwrap();
-        let tool = WriteTool::new(dir.path());
+        let tool = WriteTool;
+        let mut ctx = make_ctx(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"path": "new.txt", "content": "hello world"}), &Arc::new(AtomicBool::new(false)))
+            .execute(&serde_json::json!({"path": "new.txt", "content": "hello world"}), &mut ctx)
             .unwrap();
-        assert!(result.content.contains("11 bytes"));
+        assert!(result.content.contains("edit_id:"));
+        assert!(result.content.contains("Written:"));
 
         let content = fs::read_to_string(dir.path().join("new.txt")).unwrap();
         assert_eq!(content, "hello world");
@@ -128,11 +129,12 @@ mod tests {
     #[test]
     fn test_write_creates_dirs() {
         let dir = TempDir::new().unwrap();
-        let tool = WriteTool::new(dir.path());
+        let tool = WriteTool;
+        let mut ctx = make_ctx(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"path": "sub/dir/file.txt", "content": "test"}), &Arc::new(AtomicBool::new(false)))
+            .execute(&serde_json::json!({"path": "sub/dir/file.txt", "content": "test"}), &mut ctx)
             .unwrap();
-        assert!(result.content.contains("wrote"));
+        assert!(result.content.contains("edit_id:"));
         let content = fs::read_to_string(dir.path().join("sub/dir/file.txt")).unwrap();
         assert_eq!(content, "test");
     }
@@ -141,8 +143,9 @@ mod tests {
     fn test_write_overwrites() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("existing.txt"), "old").unwrap();
-        let tool = WriteTool::new(dir.path());
-        tool.execute(&serde_json::json!({"path": "existing.txt", "content": "new"}), &Arc::new(AtomicBool::new(false)))
+        let tool = WriteTool;
+        let mut ctx = make_ctx(dir.path());
+        tool.execute(&serde_json::json!({"path": "existing.txt", "content": "new"}), &mut ctx)
             .unwrap();
         let content = fs::read_to_string(dir.path().join("existing.txt")).unwrap();
         assert_eq!(content, "new");

@@ -5,7 +5,6 @@
 
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,24 +13,14 @@ use std::time::Duration;
 use nix::sys::signal;
 use nix::unistd::Pid;
 
-use super::{truncate_output, Tool, ToolResult};
+use super::{Tool, ToolContext, ToolResult};
 use agent_core::types::{ToolDefinition, ToolOutput};
 
-pub struct BashTool {
-    cwd: PathBuf,
-}
+pub struct BashTool;
 
 enum KillReason {
     Timeout,
     Cancelled,
-}
-
-impl BashTool {
-    pub fn new(cwd: &Path) -> Self {
-        Self {
-            cwd: cwd.to_path_buf(),
-        }
-    }
 }
 
 impl Tool for BashTool {
@@ -39,8 +28,9 @@ impl Tool for BashTool {
         ToolDefinition {
             name: "bash".to_string(),
             description:
-                "Execute a bash command in the repo directory. Returns stdout and stderr \
-                 combined. Enforces a 60-second timeout and output cap of 2000 lines / 50 KB. \
+                "Execute a bash command in the repo directory. Returns stdout; stderr is shown \
+                 under a [stderr] label when present. On failure also shows exit_code. \
+                 Enforces a 60-second timeout and output cap of 2000 lines / 50 KB. \
                  Use for builds, tests, git, and shell tasks. For search use `rg`; \
                  for listing files use `rg --files` (gitignore-aware) or `fd`."
                     .to_string(),
@@ -67,7 +57,7 @@ impl Tool for BashTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, stop: &Arc<AtomicBool>) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolResult {
         let command = params
             .get("command")
             .and_then(|v| v.as_str())
@@ -79,15 +69,13 @@ impl Tool for BashTool {
             .map(|v| (v as u64).clamp(1, 300))
             .unwrap_or(60);
 
-        // Spawn bash with process group, merging stderr into stdout
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
             .arg(command)
-            .current_dir(&self.cwd)
+            .current_dir(&ctx.cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Create new process group so we can kill all descendants
         cmd.process_group(0);
 
         let mut child = match cmd.spawn() {
@@ -110,8 +98,7 @@ impl Tool for BashTool {
         let done = Arc::new(AtomicBool::new(false));
         let done_clone = done.clone();
 
-        // Spawn a timeout thread that also checks the stop flag
-        let stop_for_thread = stop.clone();
+        let stop = ctx.stop.clone();
         let timeout_handle = std::thread::spawn(move || {
             let poll_ms: u64 = 5;
             let iterations = (timeout_secs * 1000) / poll_ms;
@@ -119,7 +106,7 @@ impl Tool for BashTool {
                 if done_clone.load(Ordering::Relaxed) {
                     return;
                 }
-                if stop_for_thread.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) {
                     cancelled_clone.store(true, Ordering::Relaxed);
                     let pgid = Pid::from_raw(pid);
                     let _ = signal::killpg(pgid, signal::Signal::SIGTERM);
@@ -129,7 +116,6 @@ impl Tool for BashTool {
                 }
                 std::thread::sleep(Duration::from_millis(poll_ms));
             }
-            // Timeout expired — kill the process group
             timed_out_clone.store(true, Ordering::Relaxed);
             let pgid = Pid::from_raw(pid);
             let _ = signal::killpg(pgid, signal::Signal::SIGTERM);
@@ -137,7 +123,6 @@ impl Tool for BashTool {
             let _ = signal::killpg(pgid, signal::Signal::SIGKILL);
         });
 
-        // Thread to read stdout
         let stdout_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
         let stderr_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
 
@@ -159,17 +144,13 @@ impl Tool for BashTool {
             });
         }
 
-        // Wait for process to finish
         let exit_status = child.wait().ok();
         let exit_code = exit_status.and_then(|s| s.code());
 
-        // Mark process as done so timeout thread won't fire unnecessarily
         done.store(true, Ordering::Relaxed);
 
-        // Join timeout thread
         let _ = timeout_handle.join();
 
-        // Give reader threads a moment to finish
         std::thread::sleep(Duration::from_millis(50));
 
         let (out, err) = {
@@ -186,18 +167,19 @@ impl Tool for BashTool {
             None
         };
 
-        let content = Self::combine_output(&out, &err, kill_reason, timeout_secs);
+        let content = Self::combine_output(&out, &err, exit_code, kill_reason, timeout_secs);
 
-        let mut output = truncate_output(&content, 2000, 50 * 1024);
+        let mut output = super::truncate_output(&content, 2000, 50 * 1024);
         output.exit_code = exit_code;
         Ok(output)
     }
 }
 
 impl BashTool {
-    fn combine_output(stdout: &[u8], stderr: &[u8], kill_reason: Option<KillReason>, timeout_secs: u64) -> String {
+    fn combine_output(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>, kill_reason: Option<KillReason>, timeout_secs: u64) -> String {
         let stdout_str = String::from_utf8_lossy(stdout);
         let stderr_str = String::from_utf8_lossy(stderr);
+        let failed = exit_code.map_or(false, |c| c != 0);
 
         let mut output = String::new();
         match kill_reason {
@@ -209,21 +191,31 @@ impl BashTool {
             }
             None => {}
         }
+
         if !stdout_str.is_empty() {
             output.push_str(&stdout_str);
             if !output.ends_with('\n') {
                 output.push('\n');
             }
         }
+
         if !stderr_str.is_empty() {
+            output.push_str("[stderr]\n");
+            output.push_str(&stderr_str);
             if !output.ends_with('\n') {
                 output.push('\n');
             }
-            output.push_str(&stderr_str);
         }
-        if output.is_empty() && kill_reason.is_none() {
+
+        if failed {
+            if let Some(code) = exit_code {
+                output.push_str(&format!("exit_code: {}\n", code));
+            }
+        }
+        if output.is_empty() {
             output.push_str("[Command completed with no output]\n");
         }
+
         output
     }
 }
@@ -231,15 +223,21 @@ impl BashTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::fs;
     use tempfile::TempDir;
+
+    fn make_ctx(dir: &Path) -> ToolContext {
+        ToolContext::new(dir.to_path_buf())
+    }
 
     #[test]
     fn test_bash_echo() {
         let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(dir.path());
+        let tool = BashTool;
+        let mut ctx = make_ctx(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "echo hello world"}), &Arc::new(AtomicBool::new(false)))
+            .execute(&serde_json::json!({"command": "echo hello world"}), &mut ctx)
             .unwrap();
         assert!(result.content.contains("hello world"));
         assert_eq!(result.exit_code, Some(0));
@@ -248,9 +246,10 @@ mod tests {
     #[test]
     fn test_bash_nonzero_exit() {
         let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(dir.path());
+        let tool = BashTool;
+        let mut ctx = make_ctx(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "exit 42"}), &Arc::new(AtomicBool::new(false)))
+            .execute(&serde_json::json!({"command": "exit 42"}), &mut ctx)
             .unwrap();
         assert_eq!(result.exit_code, Some(42));
     }
@@ -258,9 +257,10 @@ mod tests {
     #[test]
     fn test_bash_stderr() {
         let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(dir.path());
+        let tool = BashTool;
+        let mut ctx = make_ctx(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "echo error >&2"}), &Arc::new(AtomicBool::new(false)))
+            .execute(&serde_json::json!({"command": "echo error >&2"}), &mut ctx)
             .unwrap();
         assert!(result.content.contains("error"));
     }
@@ -269,9 +269,10 @@ mod tests {
     fn test_bash_working_dir() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("marker.txt"), "present").unwrap();
-        let tool = BashTool::new(dir.path());
+        let tool = BashTool;
+        let mut ctx = make_ctx(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "ls marker.txt"}), &Arc::new(AtomicBool::new(false)))
+            .execute(&serde_json::json!({"command": "ls marker.txt"}), &mut ctx)
             .unwrap();
         assert!(result.content.contains("marker.txt"));
         assert_eq!(result.exit_code, Some(0));
@@ -280,9 +281,10 @@ mod tests {
     #[test]
     fn test_bash_timeout() {
         let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(dir.path());
+        let tool = BashTool;
+        let mut ctx = make_ctx(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "sleep 10", "timeout": 1}), &Arc::new(AtomicBool::new(false)))
+            .execute(&serde_json::json!({"command": "sleep 10", "timeout": 1}), &mut ctx)
             .unwrap();
         assert!(result.content.contains("timed out"));
     }
@@ -290,9 +292,10 @@ mod tests {
     #[test]
     fn test_bash_invalid_command() {
         let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(dir.path());
+        let tool = BashTool;
+        let mut ctx = make_ctx(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"command": "nonexistent_command_xyz123"}), &Arc::new(AtomicBool::new(false)))
+            .execute(&serde_json::json!({"command": "nonexistent_command_xyz123"}), &mut ctx)
             .unwrap();
         assert_eq!(result.exit_code, Some(127));
     }
@@ -300,12 +303,12 @@ mod tests {
     #[test]
     fn test_bash_cancels_on_stop_flag() {
         let dir = TempDir::new().unwrap();
-        let tool = BashTool::new(dir.path());
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop.clone();
+        let tool = BashTool;
+        let mut ctx = make_ctx(dir.path());
+        let stop = ctx.stop.clone();
 
         let handle = std::thread::spawn(move || {
-            tool.execute(&serde_json::json!({"command": "sleep 30"}), &stop_clone)
+            tool.execute(&serde_json::json!({"command": "sleep 30"}), &mut ctx)
         });
 
         std::thread::sleep(Duration::from_millis(200));

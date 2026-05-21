@@ -2,24 +2,11 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
-use super::{resolve_path, Tool, ToolResult};
+use super::{resolve_path, Tool, ToolContext, ToolResult};
 use agent_core::types::{ToolDefinition, ToolOutput};
 
-pub struct ReadTool {
-    cwd: PathBuf,
-}
-
-impl ReadTool {
-    pub fn new(cwd: &Path) -> Self {
-        Self {
-            cwd: cwd.to_path_buf(),
-        }
-    }
-}
+pub struct ReadTool;
 
 impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
@@ -52,14 +39,13 @@ impl Tool for ReadTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, _stop: &Arc<AtomicBool>) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolResult {
         let path_str = params
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required field: path".to_string())?;
 
-        let resolved = resolve_path(&self.cwd, path_str)
-            .ok_or_else(|| format!("Path '{}' is outside repo root or does not exist", path_str))?;
+        let resolved = resolve_path(&ctx.cwd, path_str)?;
 
         if !resolved.is_file() {
             return Err(format!("Not a file: {}", resolved.display()).into());
@@ -77,16 +63,15 @@ impl Tool for ReadTool {
             .map(|v| v.max(1) as usize)
             .unwrap_or(2000);
 
-        // Read the file with line bounds
         let file = fs::File::open(&resolved)?;
         let reader = BufReader::new(file);
         let mut lines: Vec<String> = Vec::new();
         let mut total_size = 0usize;
-        let max_bytes = 50 * 1024; // 50 KB
+        let max_bytes = 50 * 1024;
 
         for line_result in reader.lines().skip(offset - 1).take(max_lines + 1) {
             let line = line_result?;
-            let line_bytes = line.len() + 1; // +1 for newline
+            let line_bytes = line.len() + 1;
             if total_size + line_bytes > max_bytes || lines.len() >= max_lines {
                 break;
             }
@@ -94,7 +79,6 @@ impl Tool for ReadTool {
             lines.push(line);
         }
 
-        // Count total lines in file for reporting
         let file_content = fs::read_to_string(&resolved)?;
         let total_lines = file_content.lines().count();
         let original_size = file_content.len();
@@ -142,16 +126,22 @@ impl Tool for ReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+use std::path::Path;
     use std::fs;
     use tempfile::TempDir;
+
+    fn make_ctx(dir: &Path) -> ToolContext {
+        ToolContext::new(dir.to_path_buf())
+    }
 
     #[test]
     fn test_read_small_file() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("test.txt"), "hello\nworld\n").unwrap();
-        let tool = ReadTool::new(dir.path());
+        let tool = ReadTool;
+        let mut ctx = make_ctx(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"path": "test.txt"}), &Arc::new(AtomicBool::new(false)))
+            .execute(&serde_json::json!({"path": "test.txt"}), &mut ctx)
             .unwrap();
         assert!(result.content.contains("hello"));
         assert!(result.content.contains("world"));
@@ -166,9 +156,10 @@ mod tests {
             "line1\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        let tool = ReadTool::new(dir.path());
+        let tool = ReadTool;
+        let mut ctx = make_ctx(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"path": "test.txt", "offset": 3}), &Arc::new(AtomicBool::new(false)))
+            .execute(&serde_json::json!({"path": "test.txt", "offset": 3}), &mut ctx)
             .unwrap();
         assert!(result.content.contains("line3"));
         assert!(result.content.contains("line4"));
@@ -178,18 +169,20 @@ mod tests {
     #[test]
     fn test_read_nonexistent_file() {
         let dir = TempDir::new().unwrap();
-        let tool = ReadTool::new(dir.path());
+        let tool = ReadTool;
+        let mut ctx = make_ctx(dir.path());
         let result =
-            tool.execute(&serde_json::json!({"path": "nope.txt"}), &Arc::new(AtomicBool::new(false)));
+            tool.execute(&serde_json::json!({"path": "nope.txt"}), &mut ctx);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_read_escape_rejected() {
         let dir = TempDir::new().unwrap();
-        let tool = ReadTool::new(dir.path());
+        let tool = ReadTool;
+        let mut ctx = make_ctx(dir.path());
         let result = tool
-            .execute(&serde_json::json!({"path": "../etc/passwd"}), &Arc::new(AtomicBool::new(false)));
+            .execute(&serde_json::json!({"path": "../etc/passwd"}), &mut ctx);
         assert!(result.is_err());
     }
 }

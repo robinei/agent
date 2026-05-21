@@ -1,29 +1,14 @@
 //! SearchMessagesTool — search past session messages across all trees.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
-use super::{Tool, ToolResult};
+use super::{Tool, ToolContext, ToolResult};
 use agent_core::config::agent_dir;
 use agent_core::types::{Entry, MessageContent, ToolDefinition, ToolOutput};
 
-// ── Message search tool ──
-
-pub struct SearchMessagesTool {
-    #[allow(dead_code)]
-    cwd: PathBuf,
-}
+pub struct SearchMessagesTool;
 
 impl SearchMessagesTool {
-    pub fn new(cwd: &Path) -> Self {
-        Self {
-            cwd: cwd.to_path_buf(),
-        }
-    }
-
-    /// Search all tree JSONL files for messages containing the query string.
     fn search_trees(
         query: &str,
         tree_id: Option<&str>,
@@ -43,7 +28,6 @@ impl SearchMessagesTool {
             let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
             let path = entry.path();
 
-            // Only process subdirectories (per-tree dirs)
             if !path.is_dir() {
                 continue;
             }
@@ -62,7 +46,6 @@ impl SearchMessagesTool {
 
             _file_count += 1;
 
-            // Parse entries via serde stream
             let content = fs::read_to_string(&jsonl_path)
                 .map_err(|e| format!("Cannot read {}: {}", jsonl_path.display(), e))?;
 
@@ -71,7 +54,7 @@ impl SearchMessagesTool {
                     break;
                 }
                 if line_idx == 0 {
-                    continue; // skip header
+                    continue;
                 }
                 if line.trim().is_empty() {
                     continue;
@@ -186,7 +169,7 @@ impl Tool for SearchMessagesTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, _stop: &Arc<AtomicBool>) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, _ctx: &mut ToolContext) -> ToolResult {
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
@@ -258,13 +241,12 @@ mod tests {
     use super::*;
     use agent_core::store::Store;
     use agent_core::types::*;
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// Serialize tests that modify AGENT_DIR env var (Rust tests run in parallel).
     static AGENT_DIR_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Helper: set AGENT_DIR env var to a temp dir for the test.
     fn with_temp_agent_dir<F>(name: &str, f: F)
     where
         F: FnOnce(PathBuf),
@@ -273,20 +255,23 @@ mod tests {
         let dir = TempDir::with_prefix(&format!("agent-search-{}", name)).unwrap();
         let path = dir.path().to_path_buf();
         std::env::set_var("AGENT_DIR", &path);
-        // Create trees subdirectory
         fs::create_dir_all(path.join("trees")).unwrap();
         f(path);
         std::env::remove_var("AGENT_DIR");
-        // Keep dir alive until end of scope
         let _ = dir;
+    }
+
+    fn make_ctx() -> ToolContext {
+        ToolContext::new(PathBuf::from("/tmp"))
     }
 
     #[test]
     fn test_search_messages_empty() {
         with_temp_agent_dir("empty", |_path| {
-            let tool = SearchMessagesTool::new(&PathBuf::from("/tmp"));
+            let tool = SearchMessagesTool;
+            let mut ctx = make_ctx();
             let result = tool
-                .execute(&serde_json::json!({"query": "hello"}), &Arc::new(AtomicBool::new(false)))
+                .execute(&serde_json::json!({"query": "hello"}), &mut ctx)
                 .unwrap();
             assert!(result.content.contains("No messages found"));
         });
@@ -317,9 +302,10 @@ mod tests {
             };
             store.append_entry(tree_id, &entry).unwrap();
 
-            let tool = SearchMessagesTool::new(&PathBuf::from("/tmp"));
+            let tool = SearchMessagesTool;
+            let mut ctx = make_ctx();
             let result = tool
-                .execute(&serde_json::json!({"query": "hello world"}), &Arc::new(AtomicBool::new(false)))
+                .execute(&serde_json::json!({"query": "hello world"}), &mut ctx)
                 .unwrap();
             assert!(result.content.contains("hello world from search"));
             assert!(result.content.contains("user"));
@@ -343,7 +329,6 @@ mod tests {
                 stop_reason: None,
                 is_error: None,
             };
-            // Need explicit construction since Default isn't derived for Message
             let entry = Entry::Message {
                 id: "bbbb0001".into(),
                 parent_id: None,
@@ -352,13 +337,13 @@ mod tests {
             };
             store.append_entry(tree_id, &entry).unwrap();
 
-            let tool = SearchMessagesTool::new(&PathBuf::from("/tmp"));
-            // Search for a different tree_id — should find nothing
+            let tool = SearchMessagesTool;
+            let mut ctx = make_ctx();
             let result = tool
                 .execute(&serde_json::json!({
                     "query": "secret",
                     "tree_id": "wrong-tree-id"
-                }), &Arc::new(AtomicBool::new(false)))
+                }), &mut ctx)
                 .unwrap();
             assert!(result.content.contains("No messages found"));
         });
@@ -366,7 +351,6 @@ mod tests {
 
     #[test]
     fn test_parse_entry_from_jsonl() {
-        // Verify we can parse entries we serialized
         let entry = Entry::Message {
             id: "cccc0001".into(),
             parent_id: None,

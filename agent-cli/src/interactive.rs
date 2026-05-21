@@ -238,7 +238,7 @@ fn replay_entries(out: &mut impl Write, entries: &[Entry]) {
 
 fn render_done(out: &mut impl Write, status: &str) {
     match status {
-        "stop" | "complete" => {}
+        "stop" | "complete" | "error" => {}
         "length" => {
             write!(out, "\r\n  {}⚠{} Stopped at length limit\r\n", color::Fg(color::Yellow), style::Reset).ok();
         }

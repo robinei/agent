@@ -6,8 +6,7 @@ mod turn;
 mod util;
 
 use std::io::{BufRead, BufReader, BufWriter};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use log::{info, warn};
 
@@ -78,8 +77,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         max_tool_calls_per_turn: config.max_tool_calls_per_turn,
     };
     let cwd = resolve_repo_path(&store, &tree_id);
-    let tools = tools::all_tools(&cwd);
-    let stop = Arc::new(AtomicBool::new(false));
+    let tools = tools::all_tools();
+    let mut ctx = tools::ToolContext::new(cwd.clone());
+    let stop = ctx.stop.clone();
 
     let mut out = BufWriter::new(std::io::stdout());
 
@@ -117,13 +117,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if matches!(state, AgentState::Idle) {
                     state = begin_turn(
                         params.text, &tree_id, &store, &session_cfg,
-                        &tools, &cwd, &stop, &mut out,
+                        &tools, &mut ctx, &mut out,
                     );
                 }
             }
             PipeIn::Cmd(WsCommand::Stop) => {
                 if matches!(state, AgentState::Streaming { .. }) {
-                    state = cancel_turn(state, &tree_id, &store, &stop, &mut out);
+                    state = cancel_turn(state, &tree_id, &store, &mut ctx, &mut out);
                 } else {
                     stop.store(false, Ordering::Relaxed);
                 }
@@ -137,7 +137,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if matches!(state, AgentState::Streaming { .. }) {
                     state = finish_response(
                         state, &tree_id, &store, &session_cfg,
-                        &tools, &stop, &mut out,
+                        &tools, &mut ctx, &mut out,
                     );
                 }
             }
