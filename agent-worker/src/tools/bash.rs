@@ -41,7 +41,8 @@ impl Tool for BashTool {
             description:
                 "Execute a bash command in the repo directory. Returns stdout and stderr \
                  combined. Enforces a 60-second timeout and output cap of 2000 lines / 50 KB. \
-                 Use for running scripts, compilers, tests, and other commands."
+                 Use for builds, tests, git, and shell tasks. For search use `rg`; \
+                 for listing files use `rg --files` (gitignore-aware) or `fd`."
                     .to_string(),
             parameters: serde_json::json!({
                 "type": "object",

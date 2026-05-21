@@ -95,6 +95,46 @@ Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
 
 ## Steps
 
+### Edit tool: show post-edit context window
+
+- [ ] Replace `build_diff` summary with a line-numbered context window around each edit
+- [ ] Merge overlapping/adjacent windows, separate disjoint ones with `...`
+- [ ] Update tests to match new output format
+
+**Goal:** After applying edits the tool currently returns a terse `--- changes
+(N edits)` summary. This is not enough for the LLM to verify its own work,
+causing it to read the file again. Instead, return the final file content in a
+window of ±N lines around each changed region, formatted identically to the
+`read` tool (`{:>6} | {}\n`), with `...` between disjoint windows.
+
+**Spec:**
+
+- Context window: 3 lines before and after each edit's affected line range in
+  the *final* file (i.e. after all edits applied). Configurable as a
+  `CONTEXT_LINES: usize = 3` constant in `edit.rs`.
+- Locate each edit's position in the final file by finding `new_text` after
+  applying (the same position logic already used in `apply_edit`). Record the
+  start/end line numbers of the replaced region in the final file.
+- Build a list of `(start_line, end_line)` windows (1-indexed, inclusive),
+  expand each by `CONTEXT_LINES`, clamp to file bounds, then merge overlapping
+  or adjacent windows.
+- Render: for each window emit numbered lines; between disjoint windows emit a
+  single `...\n` line. Prepend a one-line header: `N edit(s) applied to path`.
+- `build_diff` is replaced entirely; `_original` parameter can be dropped.
+- No change to the `Tool` trait, `ToolOutput` fields, or the apply logic.
+
+**Verify:**
+```
+cargo test -p agent-worker edit
+```
+All existing edit tests pass; new tests cover:
+- single edit → window without `...`
+- two disjoint edits → two windows separated by `...`
+- two nearby edits → merged into one window
+- edit at file start/end → window clamped correctly
+
+---
+
 ### Provider normalization
 
 - [ ] Define `LlmBackend` trait in `agent-core/src/provider.rs`

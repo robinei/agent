@@ -59,34 +59,17 @@ fn collect_tool_definitions(tools: &[Box<dyn crate::tools::Tool>]) -> Vec<ToolDe
     tools.iter().map(|t| t.definition()).collect()
 }
 
-fn build_system_prompt(context_section: &str) -> String {
+fn build_system_prompt(repo_path: &std::path::Path, context_section: &str) -> String {
+    let is_git = repo_path.join(".git").exists();
     format!(
-        "You are a coding agent. You work in a repository and have access to tools.\n\
-         \n\
-         ## Available Tools\n\
-         \n\
-         You can use the following tools to interact with the repository:\n\
-         - `read`: Read file contents (supports offset/limit for large files)\n\
-         - `write`: Write contents to a file (creates parent directories)\n\
-         - `edit`: Edit a file with text replacement (exact match first, fuzzy fallback)\n\
-         - `bash`: Execute shell commands (use for builds, tests, git operations)\n\
-         - `ls`: List directory contents\n\
-         - `grep`: Search file contents with regex\n\
-         - `find`: Find files by pattern\n\
-         - `git`: Git operations (status, diff, log, add, commit, push, pull)\n\
-         - `search_messages`: Search past session messages\n\
-         - `search_files`: Search for files across all sessions\n\
-         \n\
-         ## Guidelines\n\
-         \n\
-         1. Read files, understand what you're working with\n\
-         2. Use the right tool for the job\n\
-         3. Run commands to verify your work\n\
-         4. Write clear, concise code\n\
-         5. Use `edit` for targeted changes instead of rewriting entire files\n\
-         6. When output is truncated, use more specific queries\n\
+        "You are a coding agent working in a repository. Always respond in English.\n\
+         Repo path: {}\n\
+         Version control: {}\n\
+         When listing files, prefer `rg --files` over `find` — it respects .gitignore.\n\
          \n\
          {}",
+        repo_path.display(),
+        if is_git { "git" } else { "none — this is not a git repository, do not run git commands" },
         context_section
     )
 }
@@ -186,7 +169,7 @@ pub fn begin_turn(
         0,
         Message {
             role: MessageRole::System,
-            content: MessageContent::Text(build_system_prompt(&context_section)),
+            content: MessageContent::Text(build_system_prompt(cwd, &context_section)),
             tool_calls: None,
             tool_call_id: None,
             tool_name: None,

@@ -110,7 +110,7 @@ impl Tool for ReadTool {
         } else {
             let end_line = offset + lines.len() - 1;
             for (i, line) in lines.iter().enumerate() {
-                content.push_str(&format!("{:>6}  {}\n", offset + i, line));
+                content.push_str(&format!("{:>6} | {}\n", offset + i, line));
             }
 
             if end_line < total_lines {

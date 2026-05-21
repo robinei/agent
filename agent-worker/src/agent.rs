@@ -86,21 +86,7 @@ pub fn build_context(entries: &[Entry], leaf_id: &str) -> Vec<Message> {
         );
     }
 
-    if let Some(model) = found_model {
-        messages.insert(
-            0,
-            Message {
-                role: MessageRole::System,
-                content: MessageContent::Text(format!("## Current Model\n{}", model)),
-                tool_calls: None,
-                tool_call_id: None,
-                tool_name: None,
-                usage: None,
-                stop_reason: None,
-                is_error: None,
-            },
-        );
-    }
+    let _ = found_model;
 
     messages
 }
@@ -190,16 +176,7 @@ mod tests {
         }
     }
 
-    fn make_model_set(id: &str, parent: Option<&str>, model: &str) -> Entry {
-        Entry::ModelSet {
-            id: id.to_string(),
-            parent_id: parent.map(|s| s.to_string()),
-            timestamp: "2026-01-01T00:00:00Z".to_string(),
-            model: model.to_string(),
-        }
-    }
-
-    #[test]
+#[test]
     fn test_build_context_empty_tree() {
         let entries = vec![make_session_start("1", None)];
         let messages = build_context(&entries, "1");
@@ -258,18 +235,6 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn test_build_context_with_model() {
-        let entries = vec![
-            make_session_start("root", None),
-            make_model_set("mod1", Some("root"), "claude-3.5"),
-            make_message("msg1", Some("mod1"), MessageRole::User, "hello"),
-        ];
-        let messages = build_context(&entries, "msg1");
-        assert!(messages.iter().any(|m| {
-            matches!(&m.content, MessageContent::Text(t) if t.contains("claude-3.5"))
-        }));
-    }
 
     #[test]
     fn test_estimate_tokens_short() {

@@ -20,7 +20,7 @@ pub struct ContextFile {
 pub fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     let mut files = Vec::new();
 
-    // Check global context file first (~/.agent/AGENTS.md)
+    // Check global context files first (~/.agent/AGENTS.md and ~/.agent/skills/*/SKILL.md)
     let global_path = agent_dir.join("AGENTS.md");
     if global_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&global_path) {
@@ -30,6 +30,26 @@ pub fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
                     content,
                     depth: usize::MAX,
                 });
+            }
+        }
+    }
+
+    let global_skills_dir = agent_dir.join("skills");
+    if global_skills_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&global_skills_dir) {
+            for entry in entries.flatten() {
+                let skill_md = entry.path().join("SKILL.md");
+                if skill_md.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                        if !content.trim().is_empty() {
+                            files.push(ContextFile {
+                                path: skill_md,
+                                content,
+                                depth: usize::MAX,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
