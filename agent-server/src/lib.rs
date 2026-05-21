@@ -44,9 +44,6 @@ pub fn embed_init(config: Arc<Config>, store: Arc<Store>) {
         );
     }
 
-    if let Err(e) = agent_core::hooks::run_startup_hooks() {
-        log::warn!("Startup hooks issue: {}", e);
-    }
 }
 
 /// Bind the TCP listener and run the accept loop (blocks until shutdown signal).

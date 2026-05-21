@@ -68,8 +68,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let log_file = config.logging_to_file.as_ref().and_then(|p| p.to_str());
     agent_core::logging::init_logging(log_file, &config.logging_level);
-    agent_core::hooks::run_startup_hooks().ok();
-
     let store = Store::default();
     let session_cfg = agent_core::config::SessionConfig {
         soft_cap_pct: config.session_soft_cap_pct,

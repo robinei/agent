@@ -2,7 +2,6 @@ use std::io::BufWriter;
 use std::sync::atomic::Ordering;
 
 use agent_core::config::SessionConfig;
-use agent_core::hooks;
 use agent_core::store::Store;
 use agent_core::types::*;
 use log::{error, info, warn};
@@ -176,12 +175,6 @@ pub fn begin_turn(
             is_error: None,
         },
     );
-
-    if let Err(e) = hooks::run_before_llm_hooks(&mut messages) {
-        warn!("Before-LLM hook blocked: {}", e);
-        emit_error(out, format!("Hook blocked message: {}", e), false);
-        return AgentState::Idle;
-    }
 
     let estimated = crate::agent::estimate_context_tokens(&messages);
     if check_context_cap(estimated, session_cfg, tree_id, store, out).is_err() {
@@ -403,16 +396,6 @@ pub fn finish_response(
                     emit_error(out, format!("Max tool calls per turn ({}) reached", max_per_turn), false);
                     emit_event(out, ServerEvent::Done { status: "error".into() });
                     return AgentState::Idle;
-                }
-
-                if let Err(e) = hooks::run_tool_call_hooks(&call.name, &call.arguments) {
-                    emit_error(
-                        out,
-                        format!("Hook blocked tool call: {}", e),
-                        false,
-                    );
-                    consecutive_failures += 1;
-                    continue;
                 }
 
                 emit_event(
