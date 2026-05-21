@@ -1,8 +1,7 @@
-use log::info;
 use serde_json::json;
 use thiserror::Error;
 
-use crate::types::{ChatStream, Message, MessageContent, MessageRole, ToolCall, ToolDefinition};
+use crate::types::{Message, MessageContent, MessageRole, ToolCall, ToolDefinition};
 
 #[derive(Error, Debug)]
 pub enum ProviderError {
@@ -27,43 +26,11 @@ pub struct Provider {
     pub enable_thinking: bool,
     pub reasoning_effort: String,
     pub max_tokens: Option<u32>,
+    pub sort: Option<String>,
 }
 
 impl Provider {
-    pub fn stream_chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatStream> {
-        // INTENTIONAL: no AGENT_TEST_STUB check here — that logic moved to
-        // lifecycle.rs::handle_llm_request so the worker never sees it.
-        let body = self.build_body(messages, tools, true);
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-
-        info!(
-            "LLM request: {} messages, {} tools, model={}",
-            messages.len(),
-            tools.len(),
-            self.model
-        );
-
-        let resp = match ureq::post(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", &format!("Bearer {}", self.api_key))
-            .send_json(&body)
-        {
-            Ok(r) => r,
-            Err(ureq::Error::StatusCode(status)) => {
-                return Err(ProviderError::Api(format!("HTTP {}", status)));
-            }
-            Err(e) => {
-                return Err(ProviderError::Http(format!("{}", e)));
-            }
-        };
-
-        let reader = resp.into_body().into_reader();
-        Ok(ChatStream::new(reader))
-    }
-}
-
-impl Provider {
-    pub fn new(base_url: String, api_key: String, model: String, enable_thinking: bool, reasoning_effort: String, max_tokens: Option<u32>) -> Self {
+    pub fn new(base_url: String, api_key: String, model: String, enable_thinking: bool, reasoning_effort: String, max_tokens: Option<u32>, sort: Option<String>) -> Self {
         Self {
             base_url,
             api_key,
@@ -71,11 +38,12 @@ impl Provider {
             enable_thinking,
             reasoning_effort,
             max_tokens,
+            sort,
         }
     }
 
     /// Build the JSON body for a chat completions request.
-    fn build_body(
+    pub fn build_body(
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
@@ -109,6 +77,10 @@ impl Provider {
 
         if stream {
             body["stream_options"] = json!({"include_usage": true});
+        }
+
+        if let Some(sort) = &self.sort {
+            body["provider"] = json!({"sort": sort});
         }
 
         if self.enable_thinking {
@@ -378,6 +350,7 @@ mod tests {
             false,
             "medium".into(),
             None,
+            None,
         );
         let msg = Message {
             role: MessageRole::User,
@@ -402,6 +375,7 @@ mod tests {
             "test-model".into(),
             false,
             "medium".into(),
+            None,
             None,
         );
         let msg = Message {
@@ -432,6 +406,7 @@ mod tests {
             false,
             "medium".into(),
             None,
+            None,
         );
         let msg = Message {
             role: MessageRole::Tool,
@@ -456,6 +431,7 @@ mod tests {
             "test-model".into(),
             false,
             "medium".into(),
+            None,
             None,
         );
         let msg = Message {
@@ -484,6 +460,7 @@ mod tests {
             "test-model".into(),
             false,
             "medium".into(),
+            None,
             None,
         );
         let msg = Message {

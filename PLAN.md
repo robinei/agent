@@ -365,6 +365,310 @@ structure differ.
 
 ---
 
+### Server: single-threaded per-worker event loop
+
+- [x] Add `nix` + `rustls` + `webpki-roots` to `agent-server/Cargo.toml`; remove `mio`
+- [x] Add `WorkerMsg` enum and slim down `WorkerEntry` in `lifecycle.rs`
+- [x] Write `agent-server/src/worker_loop.rs`: `PollHandler` trait, `WorkerCtx`, all handler types, `run_event_loop`
+- [x] Rewrite `spawn_worker` to start a single event-loop thread
+- [x] Remove `spawn_stdin_writer`, `spawn_stderr_demux`, `run_stdout_proxy`, `handle_llm_request`, `worker_subscribe`, `worker_send_command` from `lifecycle.rs`
+- [x] Simplify `ws.rs`: HTTP upgrade → `WorkerMsg::NewClient` → return; delete `run_session`
+- [x] Remove `stream_chat` + `ChatStream` from `agent-core/src/provider.rs` (now dead)
+- [x] `cargo build && cargo test`
+
+**Goal:** Replace 1+N threads per worker (keeper + 1 per WS connection + stdin
+writer + stderr demux) with a single event-loop thread per worker using
+`nix::poll`. LLM HTTP streaming becomes a `rustls`-backed fd in the same loop.
+Eliminates the `mpsc` subscriber channels, the `Waker` mechanism, and all
+per-WS-session threads.
+
+---
+
+#### Thread model
+
+**Before (per worker):**
+- Keeper/stdout-proxy thread (blocks until worker exits; keeps bwrap PDEATHSIG alive)
+- Stdin writer thread (drains `mpsc::Receiver<String>`, blocking-writes to child stdin)
+- Stderr demux thread (drains child stderr, logs)
+- 1 thread per connected WS client (blocks in `mio::Poll`; holds `mpsc::Receiver<ServerEvent>` + `Waker`)
+- Ad-hoc LLM threads (1 per LLM request; blocking HTTP via `ureq`)
+- Ad-hoc auto-title thread (post-Done; off-loop, injects via `Waker`)
+
+**After (per worker):**
+- 1 event-loop thread (owns child stdio, all WS connections, LLM TLS state;
+  also serves as the keeper thread so bwrap PDEATHSIG still works)
+- Ad-hoc auto-title thread (unchanged; injects via `WorkerMsg::InjectEvent`)
+
+---
+
+#### Dep changes (`agent-server/Cargo.toml`)
+
+Remove `mio`. Add:
+
+```toml
+nix          = { version = "0.29", features = ["poll", "fs"] }
+rustls       = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
+webpki-roots = "0.26"
+```
+
+`tungstenite` stays (still used for WS frame parsing/writing).
+
+---
+
+#### `agent-server/src/lifecycle.rs` — changes
+
+**`WorkerEntry` becomes:**
+
+```rust
+pub struct WorkerEntry {
+    pub pid: u32,
+    pub child: Option<Child>,
+    pub msg_tx: mpsc::SyncSender<WorkerMsg>,
+    pub notify_write: std::fs::File,  // write end of wakeup pipe; write one byte to unblock poll
+}
+```
+
+**New enum:**
+
+```rust
+pub enum WorkerMsg {
+    NewClient(Box<crate::worker_loop::WsClient>),
+    InjectEvent(ServerEvent),  // from auto-title thread
+    Stop,
+}
+```
+
+**`spawn_worker`:** after spawning the subprocess (unchanged), build a
+`nix::unistd::pipe()`, create a `mpsc::sync_channel(64)`, then spawn ONE
+thread that calls `worker_loop::run_event_loop(...)`. The `WorkerEntry`
+inserted into `ACTIVE_WORKERS` holds the `msg_tx` and the write end of the
+wakeup pipe. The rendezvous pattern (sync_channel for spawn confirmation) is
+unchanged.
+
+**Remove entirely:** `spawn_stdin_writer`, `spawn_stderr_demux`,
+`run_stdout_proxy`, `handle_llm_request`, `worker_subscribe`,
+`worker_send_command`.
+
+**`worker_stop`:** now sends `WorkerMsg::Stop` via `msg_tx` and writes one
+byte to `notify_write` to unblock the poll. Called unchanged from
+`shutdown_all`.
+
+**`broadcast_meta_update`:** sends `WorkerMsg::InjectEvent(MetaUpdate {...})`
+via `msg_tx` + writes one byte to `notify_write`.
+
+---
+
+#### `agent-server/src/worker_loop.rs` — new file
+
+**`PollHandler` trait:**
+
+```rust
+pub trait PollHandler {
+    fn fd(&self) -> RawFd;
+    fn interests(&self) -> PollFlags;
+    /// Return false to deregister (handler is dropped).
+    fn on_ready(&mut self, ctx: &mut WorkerCtx) -> bool;
+}
+```
+
+**`WorkerCtx`:**
+
+```rust
+pub struct WorkerCtx {
+    pub tree_id: String,
+    pub stdin: BufWriter<ChildStdin>,
+    pub ws_clients: Vec<WsClient>,
+    pub event_buffer: VecDeque<ServerEvent>,   // catch-up for new subscribers
+    pub store: Arc<Store>,
+    pub cfg: Arc<Config>,
+    pub msg_rx: mpsc::Receiver<WorkerMsg>,
+    pub tls_config: Arc<rustls::ClientConfig>,  // built once; reused per LLM request
+    pub new_handlers: Vec<Box<dyn PollHandler>>, // handlers to add after on_ready returns
+}
+```
+
+`WorkerCtx::broadcast(ev)` buffers `Entry` events in `event_buffer` (cap 1000,
+pop front when full), then serializes and sends to all `ws_clients`. Clients
+that fail to write are removed.
+
+`WorkerCtx::stdin_send(json_line)` writes a line to `self.stdin` and flushes.
+
+**`WsClient`** (owns one live WebSocket connection):
+
+```rust
+pub struct WsClient {
+    ws: tungstenite::WebSocket<std::net::TcpStream>,
+    last_ping: Instant,
+    last_pong: Instant,
+}
+```
+
+`WsClient::write_event(ev)` serializes the event and calls `ws.send(Text(...))`.
+
+`WsClient::on_readable(stdin: &mut BufWriter<ChildStdin>) -> bool`:
+- `ws.read()` → `Text(s)` → deserialize as `WsCommand`, serialize as
+  `PipeIn::Cmd(cmd)`, write to `stdin`
+- `Pong(_)` → update `last_pong`
+- `Close(_)` / any error except `WouldBlock` → return `false`
+- `WouldBlock` → return `true`
+
+`WsClient::tick(stdin: &mut BufWriter<ChildStdin>) -> bool`: send keepalive
+pings every 30s; return `false` if pong has not arrived within 90s.
+
+**`StdoutHandler`** owns a `BufReader<ChildStdout>`:
+
+`on_ready`: read one line; parse as `PipeOut`. On `PipeOut::Event(ev)`: call
+`ctx.broadcast(ev)`; if the event is `Done { .. }`, check if tree needs a
+title and if so spawn an auto-title thread (same logic as current
+`run_stdout_proxy`) — the thread gets a clone of `msg_tx` + `notify_write` and
+sends `WorkerMsg::InjectEvent(MetaUpdate {...})` when done. On
+`PipeOut::Llm(req)`: build `LlmHandler::new(req, &ctx.cfg, ctx.tls_config.clone())`
+(synchronous TCP connect + set nonblocking) and push to `ctx.new_handlers`.
+Return `false` only on EOF/error (signals event loop to exit).
+
+**`StderrHandler`** owns a `BufReader<ChildStderr>`:
+
+`on_ready`: read one line, log it, append to a `VecDeque<String>` cap 20.
+On EOF, stores the buffer so the post-exit crash-detection (currently in
+`run_stdout_proxy`) can use it. Returns `false` on EOF.
+
+After the loop exits (stdout closed), the crash detection and `ACTIVE_WORKERS`
+removal logic (currently at the end of `run_stdout_proxy`) runs in the event
+loop function body, not inside a handler.
+
+**`NotifyHandler`** owns the read end of the wakeup pipe and a reference to
+`mpsc::Receiver<WorkerMsg>`:
+
+`on_ready`: drain the pipe (read until `EAGAIN`); then drain `ctx.msg_rx`:
+- `NewClient(ws_client)`: send catch-up snapshot from `ctx.event_buffer`, then
+  push to `ctx.ws_clients`
+- `InjectEvent(ev)`: call `ctx.broadcast(ev)`
+- `Stop`: write `PipeIn::Cmd(WsCommand::Stop)` to `ctx.stdin`
+
+Returns `true` always (stays registered).
+
+**`LlmHandler`** drives a single HTTPS streaming request:
+
+```rust
+pub struct LlmHandler {
+    tcp: std::net::TcpStream,    // set non-blocking after connect
+    tls: rustls::ClientConnection,
+    state: LlmState,
+    req_id: u64,
+    line_buf: String,            // partial SSE line accumulator (Streaming state)
+}
+
+enum LlmState {
+    TlsHandshake,
+    SendRequest { body: Vec<u8>, sent: usize },
+    ReadHeaders  { buf: Vec<u8> },
+    Streaming,
+}
+```
+
+`LlmHandler::new(req, cfg, tls_config)`:
+1. Parse `cfg.provider.base_url` to extract host, port (default 443), path.
+2. `TcpStream::connect((host, port))` — synchronous; fine here because
+   connect time (<100ms) is negligible vs. LLM turn latency, and each worker
+   has its own thread.
+3. `tcp.set_nonblocking(true)`.
+4. Build `rustls::ClientConnection::new(tls_config, ServerName::try_from(host))`.
+5. Serialize the HTTP POST request (headers + JSON body from `req`) into `body`.
+6. Return handler in `TlsHandshake` state.
+
+`interests()`: returns `POLLIN` if `tls.wants_read()`, `POLLOUT` if
+`tls.wants_write()` (covers both handshake and data phases transparently).
+
+`on_ready`:
+- **Any state**: call `tls.read_tls(&mut tcp)` if `POLLIN` was ready;
+  call `tls.write_tls(&mut tcp)` if `POLLOUT` was ready;
+  call `tls.process_new_packets()` after reads.
+- **`TlsHandshake`**: if `!tls.is_handshaking()`, advance to `SendRequest`.
+- **`SendRequest`**: write `body[sent..]` into `tls.writer()`, update `sent`.
+  When `sent == body.len()`, advance to `ReadHeaders { buf: Vec::new() }`.
+- **`ReadHeaders`**: read from `tls.reader()` into `buf`; use `httparse` to
+  find the header/body boundary. On non-200 status, send
+  `PipeIn::Llm(LlmResponse::Error)` to `ctx.stdin` and return `false`.
+  On success advance to `Streaming`.
+- **`Streaming`**: read from `tls.reader()` into `line_buf`; emit each
+  complete `\n`-terminated line as `PipeIn::Llm(LlmResponse::Chunk { id:
+  req_id, data: line })` to `ctx.stdin`. On EOF/error/`[DONE]`, send
+  `PipeIn::Llm(LlmResponse::Done { id: req_id })` and return `false`.
+
+**`run_event_loop`:**
+
+```rust
+pub fn run_event_loop(
+    tree_id: String,
+    child_stdin: ChildStdin,
+    child_stdout: ChildStdout,
+    child_stderr: ChildStderr,
+    msg_rx: mpsc::Receiver<WorkerMsg>,
+    notify_read: std::fs::File,
+    notify_write: std::fs::File,   // kept alive to prevent EOF on read end
+    store: Arc<Store>,
+    cfg: Arc<Config>,
+    stderr_buf: Arc<Mutex<VecDeque<String>>>,  // shared with WorkerEntry for crash reporting
+    spawn_tx: mpsc::SyncSender<Result<(), String>>,
+    child: Child,
+)
+```
+
+1. Build `tls_config` (load `webpki_roots::TLS_SERVER_ROOTS`; construct
+   `ClientConfig`; wrap in `Arc`).
+2. Signal `spawn_tx.send(Ok(()))` (unblocks `spawn_worker`).
+3. Build `WorkerCtx`, initial handler list:
+   `[StdoutHandler, StderrHandler, NotifyHandler]`.
+4. Main loop:
+   ```
+   loop {
+       // Build pollfds from handlers + ws_clients
+       nix::poll::poll(&mut pollfds, 30_000ms timeout)?;
+       // Dispatch ready handlers (collect indices first, swap_remove on false)
+       // Dispatch ready ws_clients (on_readable; remove on false)
+       // Append ctx.new_handlers to handlers
+       // Tick all ws_clients (keepalive); remove timed-out ones
+       // Break when StdoutHandler returns false (EOF)
+   }
+   ```
+5. After loop: child.wait(), check exit status, emit crash events if needed
+   (same logic as current `run_stdout_proxy` post-loop). Remove from
+   `ACTIVE_WORKERS`.
+
+---
+
+#### `agent-server/src/ws.rs` — simplify
+
+`accept()` keeps everything up to and including the WS handshake and the
+catch-up snapshot send. After upgrade:
+- Look up `WorkerEntry` from `ACTIVE_WORKERS`
+- Call `stream.set_nonblocking(true)`
+- Box the `WsClient`, send as `WorkerMsg::NewClient`
+- Write one byte to `entry.notify_write`
+- Return (the per-connection thread exits immediately)
+
+Delete `run_session` entirely.
+
+---
+
+#### `agent-core/src/provider.rs` — remove dead code
+
+Remove `stream_chat` and `ChatStream` (both are dead after this step; no
+callers remain in agent-core or agent-server).
+
+---
+
+**Verify:**
+
+```
+cargo build
+cargo test
+# manual smoke: start server, open two WS connections to the same tree,
+# send a message, confirm both receive streaming events
+```
+
+---
+
 ### Provider normalization
 
 - [ ] Define `LlmBackend` trait in `agent-core/src/provider.rs`

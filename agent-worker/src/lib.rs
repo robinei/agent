@@ -66,8 +66,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         let msg: PipeIn = match serde_json::from_str(line.trim_end()) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                warn!("Ignoring unparseable PipeIn: {} — line: {}", e, line.trim_end());
+                continue;
+            }
         };
+        match &msg {
+            PipeIn::Cmd(WsCommand::Message { params }) => info!("-> Cmd::Message: {}", params.text),
+            PipeIn::Cmd(WsCommand::Stop) => info!("-> Cmd::Stop"),
+            PipeIn::Llm(LlmResponse::Chunk { data, .. }) => log::debug!("-> Llm::Chunk: {}", data.chars().take(100).collect::<String>()),
+            PipeIn::Llm(LlmResponse::Done { .. }) => info!("-> Llm::Done"),
+            PipeIn::Llm(LlmResponse::Error { message, .. }) => info!("-> Llm::Error: {}", message),
+            PipeIn::Config(_) => info!("-> Config"),
+        }
         match msg {
             PipeIn::Cmd(WsCommand::Message { params }) => {
                 if matches!(state, AgentState::Idle) {
@@ -133,6 +144,19 @@ fn read_config(reader: &mut BufReader<std::io::Stdin>, buf: &mut String) -> Resu
 }
 
 fn emit_event(out: &mut BufWriter<std::io::Stdout>, event: ServerEvent) {
+    let ev_debug = match &event {
+        ServerEvent::TextChunk { content } => format!("TextChunk(len={})", content.len()),
+        ServerEvent::ThinkingChunk { content } => format!("ThinkingChunk(len={})", content.len()),
+        ServerEvent::ToolStart { tool, .. } => format!("ToolStart({})", tool),
+        ServerEvent::ToolResult { tool, exit, .. } => format!("ToolResult({}, exit={})", tool, exit),
+        ServerEvent::Entry(e) => format!("Entry({})", e.id()),
+        ServerEvent::CapWarning { level, pct } => format!("CapWarning({},{}%)", level, pct),
+        ServerEvent::Error { message, fatal } => format!("Error(fatal={}, {})", fatal, message),
+        ServerEvent::Done { status } => format!("Done({})", status),
+        ServerEvent::FileChanged { path, kind } => format!("FileChanged({},{})", kind, path),
+        ServerEvent::MetaUpdate { .. } => "MetaUpdate".into(),
+    };
+    log::info!("emit_event: {}", ev_debug);
     let msg = PipeOut::Event(event);
     if let Ok(json) = serde_json::to_string(&msg) {
         writeln!(out, "{}", json).ok();
@@ -145,8 +169,12 @@ fn send_llm_request(
     messages: Vec<Message>,
     tools: Vec<ToolDefinition>,
 ) {
+    let n_msg = messages.len();
+    let n_tools = tools.len();
+    log::info!("send_llm_request: {} messages, {} tools", n_msg, n_tools);
     let req = PipeOut::Llm(LlmRequest { id: 0, messages, tools });
     if let Ok(json) = serde_json::to_string(&req) {
+        log::debug!("send_llm_request pipe out: {}", json.chars().take(200).collect::<String>());
         writeln!(out, "{}", json).ok();
         out.flush().ok();
     }
@@ -162,6 +190,7 @@ fn begin_turn(
     _stop: &Arc<AtomicBool>,
     out: &mut BufWriter<std::io::Stdout>,
 ) -> AgentState {
+    info!("begin_turn: tree={}, text={}", tree_id, text);
     let entries = match store.read_all_entries(tree_id) {
         Ok(e) => e,
         Err(e) => {
@@ -279,6 +308,7 @@ fn process_chunk(
     let AgentState::Streaming { .. } = state else { return };
 
     let trimmed = data.trim();
+    log::debug!("process_chunk raw data: {}", trimmed.chars().take(160).collect::<String>());
     if trimmed.is_empty() || trimmed == ":" || trimmed == "data: [DONE]" {
         return;
     }
@@ -291,7 +321,7 @@ fn process_chunk(
     let chunk: ChatChunk = match serde_json::from_str(raw) {
         Ok(c) => c,
         Err(e) => {
-            warn!("Failed to parse SSE chunk: {}", e);
+            warn!("Failed to parse SSE chunk: {} — raw: {}", e, raw.chars().take(120).collect::<String>());
             return;
         }
     };

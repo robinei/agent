@@ -4,15 +4,23 @@ use std::sync::Arc;
 use agent_core::config::Config;
 use agent_core::store::Store;
 
+pub mod handlers;
 pub mod http;
 pub mod lifecycle;
+mod llm_handler;
 mod routes;
+pub mod worker_ctx;
+pub mod worker_loop;
 mod ws;
+pub mod ws_client;
 
 /// Initialise shared state: index rebuild, session recovery, startup hooks.
 /// Does not bind any socket or register signal handlers.
 /// Called by both `run()` and the CLI's embedded boot path.
-pub fn embed_init(_config: Arc<Config>, store: Arc<Store>) {
+pub fn embed_init(config: Arc<Config>, store: Arc<Store>) {
+    let log_file = config.logging.to_file.as_ref().and_then(|p| p.to_str());
+    agent_core::logging::init_logging(log_file, &config.logging.level);
+
     match store.rebuild_index() {
         Ok(trees) => log::info!("Rebuilt index: {} trees loaded", trees.len()),
         Err(e) => log::warn!("Index rebuild issue: {}", e),
@@ -21,11 +29,17 @@ pub fn embed_init(_config: Arc<Config>, store: Arc<Store>) {
     // Scan for unterminated sessions from a previous unclean shutdown
     let unterm = store.scan_unterminated();
     for id in &unterm {
-        log::info!("[lifecycle] recovering unterminated session for tree {}", id);
+        log::info!(
+            "[lifecycle] recovering unterminated session for tree {}",
+            id
+        );
         lifecycle::recover_tree(&store, id);
     }
     if !unterm.is_empty() {
-        log::info!("[lifecycle] cleaned up {} unterminated session(s)", unterm.len());
+        log::info!(
+            "[lifecycle] cleaned up {} unterminated session(s)",
+            unterm.len()
+        );
     }
 
     if let Err(e) = agent_core::hooks::run_startup_hooks() {
@@ -40,7 +54,7 @@ pub fn embed_init(_config: Arc<Config>, store: Arc<Store>) {
 pub fn serve(config: Arc<Config>, store: Arc<Store>, shutdown: Arc<AtomicBool>) {
     let bind = format!("{}:{}", config.server.host, config.server.port);
     let listener = std::net::TcpListener::bind(&bind).expect("bind");
-    log::info!("Listening on http://{}", bind);
+    log::debug!("Listening on http://{}", bind);
     listener.set_nonblocking(true).ok();
 
     loop {
@@ -70,11 +84,7 @@ pub fn run(args: Vec<String>) {
 
     let config = Arc::new(agent_core::config::load_config());
 
-    let log_file = config
-        .logging
-        .to_file
-        .as_ref()
-        .and_then(|p| p.to_str());
+    let log_file = config.logging.to_file.as_ref().and_then(|p| p.to_str());
     agent_core::logging::init_logging(log_file, &config.logging.level);
 
     log::info!("Starting agent-server...");

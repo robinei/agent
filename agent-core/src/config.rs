@@ -45,6 +45,10 @@ pub struct ProviderConfig {
     /// If set, sent as `max_tokens` in the request body. Leave unset to use
     /// the provider's default.
     pub max_tokens: Option<u32>,
+    /// OpenRouter provider sorting strategy: "throughput", "latency", or "price".
+    /// If set, adds `provider: { sort: "..." }` to the request body to disable
+    /// the default price-based load balancing and route to the fastest provider.
+    pub sort: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +86,7 @@ impl Default for Config {
                 enable_thinking: true,
                 reasoning_effort: "medium".into(),
                 max_tokens: None,
+                sort: None,
             },
             summary: SummaryConfig {
                 model: "qwen2.5-coder-1.5b-instruct".into(),
@@ -223,6 +228,9 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
         if let Some(v) = section.get("max_tokens").and_then(|v| v.as_integer()) {
             cfg.provider.max_tokens = Some(v as u32);
         }
+        if let Some(v) = section.get("sort").and_then(|v| v.as_str()) {
+            cfg.provider.sort = Some(v.to_string());
+        }
     }
 
     // [summary]
@@ -246,7 +254,10 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
         if let Some(v) = section.get("hard_cap_pct").and_then(|v| v.as_integer()) {
             cfg.session.hard_cap_pct = v as u8;
         }
-        if let Some(v) = section.get("max_tool_calls_per_turn").and_then(|v| v.as_integer()) {
+        if let Some(v) = section
+            .get("max_tool_calls_per_turn")
+            .and_then(|v| v.as_integer())
+        {
             cfg.session.max_tool_calls_per_turn = v as usize;
         }
     }

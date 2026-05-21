@@ -1,4 +1,3 @@
-use std::io::BufRead;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
@@ -388,38 +387,6 @@ pub struct DeltaToolCall {
 pub struct DeltaToolCallFunction {
     pub name: Option<String>,
     pub arguments: Option<String>,
-}
-
-/// Iterator over SSE lines from the LLM streaming response.
-pub struct ChatStream {
-    reader: Box<dyn std::io::BufRead + Send>,
-}
-
-impl ChatStream {
-    pub fn new(reader: ureq::BodyReader<'static>) -> Self {
-        Self {
-            reader: Box::new(std::io::BufReader::new(reader)),
-        }
-    }
-
-    /// Construct a ChatStream from canned data (used by test stub provider).
-    /// The data should be SSE-formatted lines separated by `\n`.
-    pub fn from_canned(data: &str) -> Self {
-        Self {
-            reader: Box::new(std::io::BufReader::new(std::io::Cursor::new(
-                data.as_bytes().to_vec(),
-            ))),
-        }
-    }
-
-    /// Read the next SSE line. Returns `None` on EOF or error.
-    pub fn next_line(&mut self) -> Option<String> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(line),
-        }
-    }
 }
 
 // ── Server events (sent from agent thread to CLI/PWA over SSE) ──

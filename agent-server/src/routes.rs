@@ -225,6 +225,7 @@ fn handle_auto_title(id: &str, store: &Store, config: &Config) -> (u16, Vec<u8>,
         false,
         "medium".into(),
         None,
+        None,
     );
     match agent::auto_title(store, &provider, id) {
         Ok(title) => {

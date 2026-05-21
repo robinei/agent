@@ -138,6 +138,7 @@ let mut meta = meta;
             false,
             "medium".into(),
             None,
+            None,
         );
         agent_core::agent::auto_title(&self.store, &provider, tree_id)
     }
