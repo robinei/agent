@@ -73,7 +73,7 @@ pub fn emit_event(out: &mut BufWriter<std::io::Stdout>, event: ServerEvent) {
         ServerEvent::FileChanged { path, kind } => format!("FileChanged({},{})", kind, path),
         ServerEvent::MetaUpdate { .. } => "MetaUpdate".into(),
     };
-    log::info!("emit_event: {}", ev_debug);
+    log::debug!("emit_event: {}", ev_debug);
     let msg = PipeOut::Event(event);
     if let Ok(json) = serde_json::to_string(&msg) {
         writeln!(out, "{}", json).ok();

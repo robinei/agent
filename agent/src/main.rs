@@ -1,4 +1,5 @@
 fn main() {
+    std::env::set_var("RUST_LOG", "debug");
     let mut args = std::env::args();
     let _ = args.next();
     let sub = args.next().unwrap_or_default();

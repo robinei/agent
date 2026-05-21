@@ -95,6 +95,7 @@ pub fn accept(
             if let Err(e) = msg_tx.send(WorkerMsg::NewClient(ws_client)) {
                 log::warn!("[ws] failed to deliver NewClient to event loop (worker exited?): {}", e);
             } else {
+                log::info!("[ws] client connected for tree {}", tree_id);
                 let _ = nix::unistd::write(&nw, b"\x00");
             }
         }

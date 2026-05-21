@@ -53,6 +53,13 @@ enum LlmState {
     Streaming,
 }
 
+#[derive(Copy, Clone)]
+enum ChunkDecode {
+    Size,
+    Data(usize),
+    Trailer,
+}
+
 // ── LlmHandler ──
 
 pub struct LlmHandler {
@@ -60,6 +67,9 @@ pub struct LlmHandler {
     state: LlmState,
     req_id: u64,
     line_buf: String,
+    is_chunked: bool,
+    chunk_decode: ChunkDecode,
+    chunk_size_buf: Vec<u8>,
 }
 
 impl LlmHandler {
@@ -119,6 +129,9 @@ impl LlmHandler {
             },
             req_id: req.id,
             line_buf: String::new(),
+            is_chunked: false,
+            chunk_decode: ChunkDecode::Size,
+            chunk_size_buf: Vec::new(),
         })
     }
 
@@ -150,6 +163,54 @@ impl LlmHandler {
                 }
             } else {
                 self.line_buf.push(ch);
+            }
+        }
+        true
+    }
+
+    fn feed_bytes(&mut self, ctx: &mut WorkerCtx, data: &[u8]) -> bool {
+        if !self.is_chunked {
+            return self.feed_sse_bytes(ctx, data);
+        }
+        let mut i = 0;
+        while i < data.len() {
+            match self.chunk_decode {
+                ChunkDecode::Size => {
+                    let b = data[i];
+                    i += 1;
+                    if b == b'\n' {
+                        let size_str = std::str::from_utf8(&self.chunk_size_buf).unwrap_or("0");
+                        let hex = size_str.split(';').next().unwrap_or("0").trim();
+                        let size = usize::from_str_radix(hex, 16).unwrap_or(0);
+                        self.chunk_size_buf.clear();
+                        if size == 0 {
+                            return true;
+                        }
+                        self.chunk_decode = ChunkDecode::Data(size);
+                    } else if b != b'\r' {
+                        self.chunk_size_buf.push(b);
+                    }
+                }
+                ChunkDecode::Data(remaining) => {
+                    let to_read = (data.len() - i).min(remaining);
+                    let end = i + to_read;
+                    let new_remaining = remaining - to_read;
+                    self.chunk_decode = if new_remaining == 0 {
+                        ChunkDecode::Trailer
+                    } else {
+                        ChunkDecode::Data(new_remaining)
+                    };
+                    if !self.feed_sse_bytes(ctx, &data[i..end]) {
+                        return false;
+                    }
+                    i = end;
+                }
+                ChunkDecode::Trailer => {
+                    if data[i] == b'\n' {
+                        self.chunk_decode = ChunkDecode::Size;
+                    }
+                    i += 1;
+                }
             }
         }
         true
@@ -258,8 +319,14 @@ impl PollHandler for LlmHandler {
                             );
                             return false;
                         }
+                        self.is_chunked = resp.headers.iter().any(|h| {
+                            h.name.eq_ignore_ascii_case("transfer-encoding")
+                                && String::from_utf8_lossy(h.value)
+                                    .to_ascii_lowercase()
+                                    .contains("chunked")
+                        });
                         let trailing = buf[hdr_end..].to_vec();
-                        if !self.feed_sse_bytes(ctx, &trailing) {
+                        if !self.feed_bytes(ctx, &trailing) {
                             return false;
                         }
                         self.state = LlmState::Streaming;
@@ -284,7 +351,7 @@ impl PollHandler for LlmHandler {
                             return false;
                         }
                         Ok(n) => {
-                            if !self.feed_sse_bytes(ctx, &tmp[..n]) {
+                            if !self.feed_bytes(ctx, &tmp[..n]) {
                                 return false;
                             }
                         }
@@ -340,7 +407,7 @@ fn parse_host_port_path(base_url: &str) -> Result<(String, u16, String), String>
 
 fn process_sse_line(ctx: &mut WorkerCtx, req_id: u64, line: &str) -> bool {
     let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed == ":" {
+    if trimmed.is_empty() || trimmed.starts_with(':') {
         return true;
     }
     if trimmed == "data: [DONE]" {

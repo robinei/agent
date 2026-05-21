@@ -31,6 +31,7 @@ impl WsClient {
         match self.ws.read() {
             Ok(tungstenite::Message::Text(s)) => {
                 if let Ok(cmd) = serde_json::from_str::<WsCommand>(&s) {
+                    log::debug!("[ws_client] command: {:?}", cmd);
                     let pipe_in = PipeIn::Cmd(cmd);
                     if let Ok(json) = serde_json::to_string(&pipe_in) {
                         let _ = writeln!(stdin, "{}", json);

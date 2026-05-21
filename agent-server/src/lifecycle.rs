@@ -233,8 +233,11 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
             };
             let config_msg =
                 serde_json::to_string(&agent_core::rpc::PipeIn::Config(worker_cfg)).unwrap();
-            let _ = writeln!(&mut child_stdin, "{}", config_msg);
-            let _ = child_stdin.flush();
+            if let Err(e) = writeln!(&mut child_stdin, "{}", config_msg)
+                .and_then(|_| child_stdin.flush())
+            {
+                log::error!("[lifecycle] write worker config for {}: {}", tree_id_str, e);
+            }
 
             // Run the event loop inline — this keeps the current thread alive
             // until the worker exits, which is what we need for bwrap's PDEATHSIG.
@@ -419,7 +422,9 @@ pub fn recover_tree(store: &Store, tree_id: &str) {
     if let Err(e) = store.save_tree_meta(&meta) {
         log::error!("[lifecycle] recover_tree: save meta for {}: {}", tree_id, e);
     }
-    store.reset_header_tokens(tree_id).ok();
+    if let Err(e) = store.reset_header_tokens(tree_id) {
+        log::warn!("[lifecycle] recover_tree: reset_header_tokens for {}: {}", tree_id, e);
+    }
 }
 
 pub fn shutdown_all(store: &Store) {

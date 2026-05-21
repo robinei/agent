@@ -19,9 +19,9 @@ pub mod ws_client;
 /// Initialise shared state: index rebuild, session recovery, startup hooks.
 /// Does not bind any socket or register signal handlers.
 /// Called by both `run()` and the CLI's embedded boot path.
-pub fn embed_init(config: Arc<Config>, store: Arc<Store>) {
+pub fn embed_init(config: Arc<Config>, store: Arc<Store>, to_stderr: bool) {
     let log_file = config.logging.to_file.as_ref().and_then(|p| p.to_str());
-    agent_core::logging::init_logging(log_file, &config.logging.level);
+    agent_core::logging::init_logging(log_file, &config.logging.level, to_stderr);
 
     match store.rebuild_index() {
         Ok(trees) => log::info!("Rebuilt index: {} trees loaded", trees.len()),
@@ -70,7 +70,10 @@ pub fn serve(config: Arc<Config>, store: Arc<Store>, shutdown: Arc<AtomicBool>) 
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            Err(_) => continue,
+            Err(e) => {
+                log::warn!("[serve] accept error: {e}");
+                continue;
+            }
         }
     }
 
@@ -84,7 +87,7 @@ pub fn run(args: Vec<String>) {
     let config = Arc::new(agent_core::config::load_config());
 
     let log_file = config.logging.to_file.as_ref().and_then(|p| p.to_str());
-    agent_core::logging::init_logging(log_file, &config.logging.level);
+    agent_core::logging::init_logging(log_file, &config.logging.level, config.logging.to_stderr);
 
     log::info!("Starting agent-server...");
     log::info!(
@@ -95,7 +98,7 @@ pub fn run(args: Vec<String>) {
     );
 
     let store = Arc::new(agent_core::store::Store::default());
-    embed_init(config.clone(), store.clone());
+    embed_init(config.clone(), store.clone(), config.logging.to_stderr);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGINT, shutdown.clone()) {

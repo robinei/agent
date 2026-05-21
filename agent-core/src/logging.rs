@@ -69,9 +69,9 @@ impl Log for FileLogger {
     }
 }
 
-/// Initialize logging. Registers `env_logger` for stderr and an optional
-/// `FileLogger` for the given file path.
-pub fn init_logging(log_file: Option<&str>, level: &str) {
+/// Initialize logging. Registers `env_logger` for stderr (when `to_stderr` is
+/// true) and an optional `FileLogger` for the given file path.
+pub fn init_logging(log_file: Option<&str>, level: &str, to_stderr: bool) {
     let filter = match level.to_lowercase().as_str() {
         "error" => LevelFilter::Error,
         "warn" => LevelFilter::Warn,
@@ -81,19 +81,15 @@ pub fn init_logging(log_file: Option<&str>, level: &str) {
         _ => LevelFilter::Info,
     };
 
-    // env_logger for stderr
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(level),
-    )
-    .try_init();
+    if to_stderr {
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or(level),
+        )
+        .try_init();
+    }
 
-    // File logger (secondary — set_boxed_logger won't conflict since env_logger already inited)
     if let Some(path) = log_file {
         if let Ok(file_logger) = FileLogger::new(path, filter) {
-            // We can't call set_boxed_logger because env_logger already took it.
-            // Instead, log::set_max_level and log::set_boxed_logger only fail if
-            // already set. Since env_logger already called set_boxed_logger, we
-            // use log::set_logger (which is the same thing) and ignore the error.
             let _ = log::set_boxed_logger(Box::new(file_logger));
             log::set_max_level(filter);
         }

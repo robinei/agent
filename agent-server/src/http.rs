@@ -61,6 +61,7 @@ pub fn handle_connection(mut stream: TcpStream, store: Arc<Store>, cfg: Arc<Conf
     let is_ws = method == "GET"
         && header_contains(&headers, "upgrade", b"websocket")
         && header_contains(&headers, "connection", b"upgrade");
+    log::debug!("[http] {} {}{}", method, path, if is_ws { " (ws)" } else { "" });
     if is_ws {
         crate::ws::accept(stream, &path, &headers, store, cfg);
         return;

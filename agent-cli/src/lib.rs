@@ -158,12 +158,14 @@ fn resolve_backend(server: &str, explicit: bool) -> Backend {
     // Fast TCP probe — succeeds if a server is already running.
     let addr = parse_server_addr(server).unwrap_or_else(|_| default_server_addr());
     if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)).is_ok() {
+        eprintln!("Connected to server at {server}");
         return Backend::Remote(AgentClient::new(server));
     }
     // No server found — start embedded.
+    eprintln!("No server at {server}, hosting server");
     let config = Arc::new(agent_core::config::load_config());
     let store = Arc::new(agent_core::store::Store::default());
-    agent_server::embed_init(config.clone(), store.clone());
+    agent_server::embed_init(config.clone(), store.clone(), false);
     // Start TCP listener in background so other clients can connect later.
     // Pass a never-signalled AtomicBool — the embedded server runs until the
     // CLI process exits; the CLI owns SIGINT via ctrlc and must not fight the
