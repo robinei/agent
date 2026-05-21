@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use agent_core::config::Config;
-use agent_core::provider::{LlmProvider, Provider};
+use agent_core::provider::Provider;
 use agent_core::rpc::{LlmRequest, LlmResponse, PipeIn, PipeOut};
 use agent_core::store::Store;
 use agent_core::types::{Entry, ServerEvent, TreeId, TreeMeta};

@@ -1,11 +1,7 @@
 use log::info;
 use serde_json::json;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-use crate::rpc::{LlmRequest, LlmResponse, PipeIn, PipeOut, WsCommand};
 use crate::types::{ChatStream, Message, MessageContent, MessageRole, ToolCall, ToolDefinition};
 
 #[derive(Error, Debug)]
@@ -22,13 +18,6 @@ pub enum ProviderError {
 
 pub type Result<T> = std::result::Result<T, ProviderError>;
 
-/// Trait for LLM providers. `run_agent` is generic over this trait so it
-/// works with both the real HTTP provider (server-side) and the pipe provider
-/// (worker-side).
-pub trait LlmProvider {
-    fn stream_chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatStream>;
-}
-
 /// LLM provider — communicates with an OpenAI-compatible chat completions API.
 #[derive(Clone, Debug)]
 pub struct Provider {
@@ -40,8 +29,8 @@ pub struct Provider {
     pub max_tokens: Option<u32>,
 }
 
-impl LlmProvider for Provider {
-    fn stream_chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatStream> {
+impl Provider {
+    pub fn stream_chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatStream> {
         // INTENTIONAL: no AGENT_TEST_STUB check here — that logic moved to
         // lifecycle.rs::handle_llm_request so the worker never sees it.
         let body = self.build_body(messages, tools, true);
@@ -374,155 +363,6 @@ pub fn generate_continuation_brief(
     };
 
     Ok((final_brief, status))
-}
-
-// ── Shared handle types for single-threaded direct-IO ──
-// These use Arc<Mutex<>> so the compiler accepts shared borrows between the
-// SyncPipeProvider struct and the closures passed to run_agent. The mutex is
-// never actually contended because everything runs on one thread.
-
-type StdinHandle = Arc<Mutex<BufReader<std::io::Stdin>>>;
-type StdoutHandle = Arc<Mutex<std::io::Stdout>>;
-
-// ── SyncStdinChunkReader ──
-// Reads PipeIn lines from stdin until it sees an LlmResponse::Chunk, then
-// serves its bytes.  Returns EOF on LlmResponse::Done and an IO error on
-// LlmResponse::Error.  WsCommand::Stop sets the stop flag.
-
-struct SyncStdinChunkReader {
-    stdin: StdinHandle,
-    stop: Arc<AtomicBool>,
-    buf: Vec<u8>,
-    pos: usize,
-    // Set when read() already consumed a Done or Error message so drop() knows
-    // not to drain stdin (there is nothing left to drain).
-    done: bool,
-}
-
-impl Read for SyncStdinChunkReader {
-    fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
-        // Return any buffered bytes from the previous Chunk first.
-        if self.pos < self.buf.len() {
-            let n = std::cmp::min(dst.len(), self.buf.len() - self.pos);
-            dst[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-            self.pos += n;
-            if self.pos >= self.buf.len() {
-                self.buf.clear();
-                self.pos = 0;
-            }
-            return Ok(n);
-        }
-        // Read lines until we get an LlmResponse.
-        loop {
-            let mut line = String::new();
-            let n = self.stdin.lock().unwrap().read_line(&mut line)?;
-            if n == 0 {
-                return Ok(0); // stdin closed → EOF
-            }
-            match serde_json::from_str(line.trim_end()) {
-                Ok(PipeIn::Llm(LlmResponse::Chunk { data, .. })) => {
-                    self.buf = data.into_bytes();
-                    self.pos = 0;
-                    let n = std::cmp::min(dst.len(), self.buf.len());
-                    dst[..n].copy_from_slice(&self.buf[..n]);
-                    self.pos = n;
-                    if self.pos >= self.buf.len() {
-                        self.buf.clear();
-                        self.pos = 0;
-                    }
-                    return Ok(n);
-                }
-                Ok(PipeIn::Llm(LlmResponse::Done { .. })) => {
-                    self.done = true;
-                    return Ok(0);
-                }
-                Ok(PipeIn::Llm(LlmResponse::Error { message, .. })) => {
-                    self.done = true;
-                    return Err(std::io::Error::other(message));
-                }
-                Ok(PipeIn::Cmd(WsCommand::Stop)) => {
-                    self.stop.store(true, Ordering::Relaxed);
-                }
-                // Config and unknown Cmd messages are silently skipped.
-                _ => {}
-            }
-        }
-    }
-}
-
-impl Drop for SyncStdinChunkReader {
-    fn drop(&mut self) {
-        // The agent may break out of the stream loop early (e.g. on "data: [DONE]")
-        // before SyncStdinChunkReader has consumed the trailing PipeIn::Llm(Done)
-        // that the server always sends after the HTTP stream closes.  Without this
-        // drain, the Done leaks into stdin and the *next* stream_chat() call reads
-        // it as an immediate EOF, producing an empty response and a spurious "stop".
-        //
-        // Skip the drain if read() already consumed the terminal message: draining
-        // would block indefinitely waiting for a Done/Error that will never arrive.
-        if self.done {
-            return;
-        }
-        if self.pos < self.buf.len() {
-            // Bytes still buffered from the last Chunk — Done was already consumed.
-            return;
-        }
-        loop {
-            let mut line = String::new();
-            match self.stdin.lock().unwrap().read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => match serde_json::from_str(line.trim_end()) {
-                    Ok(PipeIn::Llm(LlmResponse::Done { .. })) => break,
-                    Ok(PipeIn::Llm(LlmResponse::Error { .. })) => break,
-                    _ => {}
-                },
-            }
-        }
-    }
-}
-
-// ── SyncPipeProvider ──
-// Worker-side LLM provider that writes LlmRequest to stdout and reads
-// LlmResponse chunks back from stdin.  Single-threaded — no channels.
-
-pub struct SyncPipeProvider {
-    stdin: StdinHandle,
-    stdout: StdoutHandle,
-    stop: Arc<AtomicBool>,
-}
-
-impl SyncPipeProvider {
-    pub fn new(stdin: StdinHandle, stdout: StdoutHandle, stop: Arc<AtomicBool>) -> Self {
-        Self {
-            stdin,
-            stdout,
-            stop,
-        }
-    }
-}
-
-impl LlmProvider for SyncPipeProvider {
-    fn stream_chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatStream> {
-        let req = PipeOut::Llm(LlmRequest {
-            id: 0,
-            messages: messages.to_vec(),
-            tools: tools.to_vec(),
-        });
-        let json = serde_json::to_string(&req).map_err(ProviderError::Json)?;
-        {
-            let mut w = self.stdout.lock().unwrap();
-            writeln!(w, "{}", json).map_err(ProviderError::Io)?;
-            w.flush().map_err(ProviderError::Io)?;
-        }
-        let reader = SyncStdinChunkReader {
-            stdin: self.stdin.clone(),
-            stop: self.stop.clone(),
-            buf: Vec::new(),
-            pos: 0,
-            done: false,
-        };
-        Ok(ChatStream::from_reader(Box::new(BufReader::new(reader))))
-    }
 }
 
 #[cfg(test)]

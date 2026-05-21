@@ -352,14 +352,6 @@ pub enum SessionStatus {
     Blocked,
 }
 
-/// Input sent to an agent thread from the server.
-pub enum AgentInput {
-    /// New user message for the agent to process.
-    Message { text: String },
-    /// Signal the agent to stop after the current tool call.
-    Stop,
-}
-
 // ── LLM streaming response types ──
 
 #[derive(Deserialize, Clone, Debug)]
@@ -418,11 +410,6 @@ impl ChatStream {
                 data.as_bytes().to_vec(),
             ))),
         }
-    }
-
-    /// Construct a ChatStream from an arbitrary BufRead source.
-    pub fn from_reader(reader: Box<dyn BufRead + Send>) -> Self {
-        Self { reader }
     }
 
     /// Read the next SSE line. Returns `None` on EOF or error.

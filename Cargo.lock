@@ -81,6 +81,7 @@ name = "agent-worker"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "chrono",
  "env_logger",
  "log",
  "serde",
