@@ -146,14 +146,14 @@ impl LlmHandler {
                 let n = conn.read_tls(tcp).unwrap_or(0);
                 log::debug!("[LlmHandler {}] TLS read_tls={}", ctx.tree_id, n);
             }
-            if conn.wants_write() {
-                let n = conn.write_tls(tcp).unwrap_or(0);
-                log::debug!("[LlmHandler {}] TLS write_tls={}", ctx.tree_id, n);
-            }
             if let Err(e) = conn.process_new_packets() {
                 log::error!("[LlmHandler {}] TLS error: {}", ctx.tree_id, e);
                 send_llm_error(ctx, self.req_id, &format!("TLS error: {e}"));
                 return false;
+            }
+            if conn.wants_write() {
+                let n = conn.write_tls(tcp).unwrap_or(0);
+                log::debug!("[LlmHandler {}] TLS write_tls={}", ctx.tree_id, n);
             }
         }
         true

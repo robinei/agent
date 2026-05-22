@@ -221,7 +221,7 @@ mod tests {
         let json = serde_json::to_string(&pipe).unwrap();
         assert_eq!(
             json,
-            r#"{"ch":"config","msg":{"session_soft_cap_pct":65,"session_hard_cap_pct":85,"max_tool_calls_per_turn":25,"logging_level":"info","logging_to_file":"/tmp/agent.log","logging_to_stderr":true,"lsp":{"enabled":false,"servers":[]}}}"#
+            r#"{"ch":"config","msg":{"session_soft_cap_pct":65,"session_hard_cap_pct":85,"max_tool_calls_per_turn":25,"logging_level":"info","logging_to_file":"/tmp/agent.log","logging_to_stderr":true,"lsp":{"enabled":true,"servers":[]}}}"#
         );
         let parsed: PipeIn = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, PipeIn::Config(_)));
