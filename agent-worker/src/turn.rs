@@ -8,7 +8,7 @@ use log::{error, info, warn};
 
 use crate::lsp_client::{
     default_server, detect_language, format_diagnostics, binary_exists,
-    LspClient, LspFileResult, LspWaitState, PendingLspTool,
+    LspClient, LspWaitState, PendingLspTool,
 };
 use crate::thinking::{split_thinking_chunks, ThinkingSegment};
 use agent_core::types::NotificationLevel;
@@ -138,6 +138,7 @@ pub fn begin_turn(
     out: &mut BufWriter<std::io::Stdout>,
 ) -> AgentState {
     info!("begin_turn: tree={}, text={}", tree_id, text);
+
     let entries = match store.read_all_entries(tree_id) {
         Ok(e) => e,
         Err(e) => {
@@ -267,7 +268,7 @@ fn notify_lsp_saves(
 
         if !binary_exists(&cfg.command) {
             emit_notification(out, NotificationLevel::Warning,
-                format!("LSP: '{}' not found — skipping diagnostics for {}", cfg.command, lang_id));
+                format!("LSP: '{}' not found — skipping diagnostics for {}", cfg.command, lang_display(&lang_id)));
             continue;
         }
 
@@ -275,7 +276,7 @@ fn notify_lsp_saves(
         match LspClient::spawn(&lang_id, &cfg.command, &cfg.args, &root_uri, cfg.timeout_ms) {
             Ok(client) => {
                 emit_notification(out, NotificationLevel::Info,
-                    format!("LSP: started {} for {}", cfg.command, lang_id));
+                    format!("LSP: started {} for {}", cfg.command, lang_display(&lang_id)));
                 max_timeout = max_timeout.max(cfg.timeout_ms);
                 max_silence = max_silence.max(cfg.silence_ms);
                 ctx.lsp_clients.insert(lang_id.clone(), client);
@@ -286,7 +287,7 @@ fn notify_lsp_saves(
                 }
             }
             Err(e) => emit_notification(out, NotificationLevel::Warning,
-                format!("LSP: failed to start {} for {}: {}", cfg.command, lang_id, e)),
+                format!("LSP: failed to start {} for {}: {}", cfg.command, lang_display(&lang_id), e)),
         }
     }
 
@@ -608,7 +609,7 @@ pub fn finish_response(
                 // starts without waiting the full timeout_ms when the server
                 // never responds. Once any notification arrives, silence_until
                 // resets to now+silence_ms and the normal heuristic takes over.
-                let initial_wait_ms = 2000u64.min(timeout_ms);
+                let initial_wait_ms = 1000u64.min(timeout_ms);
                 return AgentState::Streaming {
                     messages, leaf_id,
                     response_text: String::new(), in_thinking: false,
@@ -658,7 +659,7 @@ pub fn finish_response(
 
 pub fn resolve_lsp_wait_into(
     state: AgentState,
-    lsp_clients: &std::collections::HashMap<String, LspClient>,
+    lsp_clients: &mut std::collections::HashMap<String, LspClient>,
     out: &mut BufWriter<std::io::Stdout>,
     tools: &[Box<dyn crate::tools::Tool>],
 ) -> AgentState {
@@ -668,42 +669,51 @@ pub fn resolve_lsp_wait_into(
     } = state else { return state };
 
     let dirty_by_call = lsp_wait.map(|w| w.dirty_by_call).unwrap_or_default();
+    let dirty_paths: Vec<&std::path::PathBuf> = dirty_by_call.iter().map(|(p, _)| p).collect();
 
-    let results: Vec<LspFileResult> = lsp_clients.values()
-        .flat_map(|c| c.all_diagnostics())
-        .collect();
-    if !results.is_empty() {
-        let diag_text = format_diagnostics(&results);
-        emit_event(out, ServerEvent::ToolResult {
-            tool: "lsp_diagnostics".to_string(),
-            exit: 0,
-            output: diag_text.clone(),
-        });
+    for client in lsp_clients.values_mut() {
+        // Display: new vs seen split, updates shown snapshot inside.
+        let display_files = client.take_new_for_display(&dirty_paths);
+        if !display_files.is_empty() {
+            emit_event(out, ServerEvent::Diagnostics {
+                source: client.lang_id.clone(),
+                files: display_files.clone(),
+            });
+        }
 
-        // Group per-file diagnostics and append each to the tool result that
-        // edited that file. Diagnostics for files not in dirty_by_call (e.g.
-        // cross-file type errors) fall back to the last tool result.
-        for file_result in &results {
-            let file_diag = format_diagnostics(std::slice::from_ref(file_result));
-            let suffix = format!("\n\n[LSP diagnostics]\n{}", file_diag);
+        // LLM messages: new diagnostics in full + one-line summary for seen ones.
+        // NOTE: when context compaction is implemented, clear shown_diagnostics on
+        // each client so that all diagnostics are presented in full after compaction.
+        for file in &display_files {
+            let mut suffix = String::new();
+            if !file.diagnostics.is_empty() {
+                let as_result = crate::lsp_client::LspFileResult {
+                    path: file.path.clone(),
+                    diagnostics: file.diagnostics.clone(),
+                };
+                suffix.push_str(&format!("\n\n[LSP diagnostics]\n{}",
+                    format_diagnostics(std::slice::from_ref(&as_result))));
+            }
+            match (file.seen_errors, file.seen_warnings) {
+                (0, 0) => {}
+                (e, 0) => suffix.push_str(&format!("\n({} seen error{} still unresolved)", e, if e == 1 { "" } else { "s" })),
+                (0, w) => suffix.push_str(&format!("\n({} seen warning{} still unresolved)", w, if w == 1 { "" } else { "s" })),
+                (e, w) => suffix.push_str(&format!("\n({} seen error{}, {} seen warning{} still unresolved)",
+                    e, if e == 1 { "" } else { "s" }, w, if w == 1 { "" } else { "s" })),
+            }
+            if suffix.is_empty() { continue; }
 
-            // Find the tool_call_id that dirtied this file.
-            let diag_path = lsp_types::Url::parse(&file_result.path)
-                .ok()
-                .and_then(|u| u.to_file_path().ok());
+            let diag_path = lsp_types::Url::parse(&file.path).ok().and_then(|u| u.to_file_path().ok());
             let call_id = diag_path.as_ref().and_then(|dp| {
                 dirty_by_call.iter().find(|(p, _)| p == dp).map(|(_, id)| id.as_str())
             });
-
             let target = if let Some(id) = call_id {
                 messages.iter_mut().rev().find(|m| m.tool_call_id.as_deref() == Some(id))
             } else {
-                // Cross-file diagnostic: append to last edit/write result.
                 messages.iter_mut().rev().find(|m| {
                     matches!(m.tool_name.as_deref(), Some("edit") | Some("write"))
                 })
             };
-
             if let Some(msg) = target {
                 if let MessageContent::Text(ref mut t) = msg.content {
                     t.push_str(&suffix);
@@ -747,7 +757,7 @@ pub fn resolve_lsp_wait_with_timeout(
                 ..wait
             }),
         },
-        &ctx.lsp_clients, out, tools,
+        &mut ctx.lsp_clients, out, tools,
     )
 }
 

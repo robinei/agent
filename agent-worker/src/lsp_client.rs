@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{IntoRawFd, RawFd};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -8,7 +8,7 @@ use log::{info, warn};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::unistd::read;
 
-use agent_core::types::{Diagnostic, DiagnosticSeverity, LspServerConfig, Position, Range};
+use agent_core::types::{Diagnostic, DiagnosticSeverity, DiagnosticsFile, LspServerConfig, Position, Range};
 
 pub struct LspFileResult {
     pub path: String,
@@ -40,6 +40,7 @@ pub struct LspClient {
     next_id: u64,
     opened: HashSet<lsp_types::Url>,
     pub diagnostics: HashMap<lsp_types::Url, Vec<Diagnostic>>,
+    pre_edit_diagnostics: HashMap<lsp_types::Url, Vec<Diagnostic>>,
     pub pending_responses: HashMap<u64, serde_json::Value>,
     root_uri: String,
     pub lang_id: String,
@@ -62,8 +63,7 @@ impl LspClient {
             .map_err(|e| format!("spawn LSP {}: {}", command, e))?;
 
         let stdin = child.stdin.take().ok_or("no stdin")?;
-        let stdout = child.stdout.take().ok_or("no stdout")?;
-        let stdout_fd = stdout.as_raw_fd();
+        let stdout_fd = child.stdout.take().ok_or("no stdout")?.into_raw_fd();
 
         fcntl(stdout_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| format!("set nonblock: {}", e))?;
@@ -76,6 +76,7 @@ impl LspClient {
             next_id: 1,
             opened: HashSet::new(),
             diagnostics: HashMap::new(),
+            pre_edit_diagnostics: HashMap::new(),
             pending_responses: HashMap::new(),
             root_uri: root_uri.to_string(),
             lang_id: lang_id.to_string(),
@@ -136,6 +137,10 @@ impl LspClient {
                 return;
             }
         };
+
+        // Snapshot current diagnostics as the pre-edit baseline before sending the edit.
+        self.pre_edit_diagnostics.insert(url.clone(),
+            self.diagnostics.get(&url).cloned().unwrap_or_default());
 
         if self.opened.contains(&url) {
             let change_params = serde_json::json!({
@@ -228,6 +233,51 @@ impl LspClient {
                 path,
                 diagnostics: diags.clone(),
             });
+        }
+        results
+    }
+
+    /// Returns diagnostics for dirty files split into new (unseen) and seen counts,
+    /// then updates the shown snapshot. Files with no new issues and no seen issues
+    /// are omitted.
+    pub fn take_new_for_display(&mut self, dirty_paths: &[&std::path::PathBuf]) -> Vec<DiagnosticsFile> {
+        let dirty_urls: Vec<lsp_types::Url> = self.diagnostics.keys()
+            .filter(|url| {
+                let fp = url.to_file_path().ok();
+                dirty_paths.iter().any(|dp| fp.as_ref().map(|p| p == *dp).unwrap_or(false))
+            })
+            .cloned()
+            .collect();
+
+        let mut results = Vec::new();
+        for url in &dirty_urls {
+            let current: Vec<Diagnostic> = self.diagnostics.get(url).cloned().unwrap_or_default();
+            let (new_diags, seen_errors, seen_warnings) = {
+                let pre = self.pre_edit_diagnostics.get(url).map(|v| v.as_slice()).unwrap_or(&[]);
+                let mut new_diags = Vec::new();
+                let mut seen_errors = 0u32;
+                let mut seen_warnings = 0u32;
+                for diag in &current {
+                    if diag_is_seen(diag, pre) {
+                        match diag.severity {
+                            Some(DiagnosticSeverity::Error) => seen_errors += 1,
+                            Some(DiagnosticSeverity::Warning) => seen_warnings += 1,
+                            _ => {}
+                        }
+                    } else {
+                        new_diags.push(diag.clone());
+                    }
+                }
+                (new_diags, seen_errors, seen_warnings)
+            };
+            if !new_diags.is_empty() || seen_errors > 0 || seen_warnings > 0 {
+                results.push(DiagnosticsFile {
+                    path: url.to_string(),
+                    diagnostics: new_diags,
+                    seen_errors,
+                    seen_warnings,
+                });
+            }
         }
         results
     }
@@ -370,6 +420,14 @@ pub fn default_server(lang_id: &str) -> Option<LspServerConfig> {
         }),
         _ => None,
     }
+}
+
+fn diag_is_seen(diag: &Diagnostic, shown: &[Diagnostic]) -> bool {
+    shown.iter().any(|s| {
+        s.range.start.line == diag.range.start.line
+            && s.severity == diag.severity
+            && s.message == diag.message
+    })
 }
 
 pub fn binary_exists(cmd: &str) -> bool {

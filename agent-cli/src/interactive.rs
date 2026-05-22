@@ -19,7 +19,7 @@ use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 use termion::{clear, color, style};
 
-use agent_core::types::{Entry, NotificationLevel, ServerEvent, TreeMeta};
+use agent_core::types::{Entry, NotificationLevel, ServerEvent, TreeMeta, lang_display};
 
 use crate::client::TryEvent;
 
@@ -85,17 +85,6 @@ fn parse_input(line: &str) -> CliCommand {
 }
 
 // ── Rendering helpers (raw-mode aware ──
-
-fn print_info(out: &mut impl Write, text: &str) {
-    write!(
-        out,
-        "{}ℹ {}{}\r\n",
-        color::Fg(color::Cyan),
-        text,
-        style::Reset
-    )
-    .ok();
-}
 
 fn print_warning(out: &mut impl Write, text: &str) {
     write!(
@@ -434,10 +423,34 @@ fn format_tool_args(tool: &str, input: &serde_json::Value) -> String {
     };
     let pick = match tool {
         "bash" => obj.get("command"),
-        "read" | "write" | "edit" => obj.get("file_path").or_else(|| obj.get("path")),
+        "read" => {
+            let path = obj.get("file_path").or_else(|| obj.get("path"))
+                .and_then(|v| v.as_str()).unwrap_or("");
+            let offset = obj.get("offset").and_then(|v| v.as_i64());
+            let limit = obj.get("limit").and_then(|v| v.as_i64());
+            return match (offset, limit) {
+                (Some(o), Some(l)) => format!("{path}  {o}–{}", o + l - 1),
+                (Some(o), None)    => format!("{path}  {o}–"),
+                (None,    Some(l)) => format!("{path}  1–{l}"),
+                (None,    None)    => path.to_string(),
+            };
+        }
+        "write" | "edit" => obj.get("file_path").or_else(|| obj.get("path")),
         "find" => obj.get("pattern").or_else(|| obj.get("path")),
         "grep" => obj.get("pattern"),
         "git" => obj.get("command").or_else(|| obj.get("args")),
+        "search_messages" => obj.get("query"),
+        "restore_edit" => {
+            let id = obj.get("id").and_then(|v| v.as_i64()).map(|n| n.to_string());
+            let mode = obj.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let s = match (id, mode) {
+                (Some(id), Some(mode)) => format!("{id}  {mode}"),
+                (Some(id), None) => id,
+                (None, Some(mode)) => mode,
+                (None, None) => String::new(),
+            };
+            return s;
+        }
         _ => None,
     };
     match pick.and_then(|v| v.as_str()) {
@@ -626,12 +639,86 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
                 write!(out, "{}\r\n", style::Reset).ok();
                 state.col = 0;
             }
+            let text = normalize_for_raw(message);
             match level {
-                NotificationLevel::Info => print_info(out, message),
-                NotificationLevel::Warning => print_warning(out, message),
-                NotificationLevel::Error => print_warning(out, &format!("Error: {}", message)),
-                NotificationLevel::Fatal => print_error(out, &format!("Fatal: {}", message)),
+                NotificationLevel::Info => {
+                    write!(out, "{}  {}{}\r\n", color::Fg(color::Yellow), text, style::Reset).ok();
+                }
+                NotificationLevel::Warning => {
+                    write!(out, "{}  {}{}\r\n", color::Fg(color::Rgb(190, 90, 90)), text, style::Reset).ok();
+                }
+                NotificationLevel::Error => {
+                    write!(out, "{}{}  Error: {}{}\r\n", color::Fg(color::Red), style::Bold, text, style::Reset).ok();
+                }
+                NotificationLevel::Fatal => {
+                    write!(out, "{}{}  Fatal: {}{}\r\n", color::Fg(color::Red), style::Bold, text, style::Reset).ok();
+                }
             }
+        }
+        ServerEvent::Diagnostics { source, files } => {
+            if state.in_thinking {
+                state.in_thinking = false;
+                write!(out, "{}", style::Reset).ok();
+            }
+            use agent_core::types::DiagnosticSeverity;
+
+            fn sev_color_label(sev: Option<DiagnosticSeverity>) -> (&'static str, &'static str) {
+                match sev {
+                    Some(DiagnosticSeverity::Error)       => ("\x1b[31m",    "error  "),
+                    Some(DiagnosticSeverity::Warning)     => ("\x1b[33m",    "warning"),
+                    Some(DiagnosticSeverity::Information) => ("\x1b[36m",    "info   "),
+                    _                                     => ("\x1b[90m",    "hint   "),
+                }
+            }
+
+            fn seen_summary(errors: u32, warnings: u32) -> String {
+                match (errors, warnings) {
+                    (0, 0) => String::new(),
+                    (e, 0) => format!("{} seen error{}", e, if e == 1 { "" } else { "s" }),
+                    (0, w) => format!("{} seen warning{}", w, if w == 1 { "" } else { "s" }),
+                    (e, w) => format!("{} seen error{}, {} seen warning{}", e, if e == 1 { "" } else { "s" }, w, if w == 1 { "" } else { "s" }),
+                }
+            }
+
+            let new_errors: usize = files.iter().flat_map(|f| &f.diagnostics)
+                .filter(|d| matches!(d.severity, Some(DiagnosticSeverity::Error))).count();
+            let new_warnings: usize = files.iter().flat_map(|f| &f.diagnostics)
+                .filter(|d| matches!(d.severity, Some(DiagnosticSeverity::Warning))).count();
+
+            let header_color = if new_errors > 0 { "\x1b[31m" }
+                else if new_warnings > 0 { "\x1b[33m" }
+                else { "\x1b[90m" };
+
+            write_blank_line(out, &mut state.trailing_newlines);
+            write!(out, "  {}◈\x1b[m {}\r\n", header_color, lang_display(source)).ok();
+
+            for file in files {
+                let display_path = std::path::Path::new(&file.path)
+                    .file_name().and_then(|n| n.to_str()).unwrap_or(&file.path);
+
+                write!(out, "    \x1b[1m{}\x1b[m\r\n", display_path).ok();
+
+                let line_width = file.diagnostics.iter()
+                    .map(|d| (d.range.start.line + 1).to_string().len())
+                    .max().unwrap_or(1);
+                for diag in &file.diagnostics {
+                    let (col, label) = sev_color_label(diag.severity);
+                    let first_line = diag.message.lines().next().unwrap_or("");
+                    let msg: String = if first_line.chars().count() > 72 {
+                        format!("{}…", first_line.chars().take(71).collect::<String>())
+                    } else {
+                        first_line.to_string()
+                    };
+                    write!(out, "      {}{}\x1b[m \x1b[90m{:>width$}\x1b[m  {}\r\n",
+                        col, label, diag.range.start.line + 1, msg, width = line_width).ok();
+                }
+
+                let summary = seen_summary(file.seen_errors, file.seen_warnings);
+                if !summary.is_empty() {
+                    write!(out, "      \x1b[90m({})\x1b[m\r\n", summary).ok();
+                }
+            }
+            state.trailing_newlines = 1;
         }
         ServerEvent::Done { status } => {
             if state.in_thinking {

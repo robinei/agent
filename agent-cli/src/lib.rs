@@ -337,7 +337,7 @@ fn stop_agent(backend: &Backend, tree_id: &str) {
 }
 
 fn send_and_stream(backend: &Backend, tree_id: &str, message: &str, stop: &AtomicBool) {
-    use agent_core::types::{NotificationLevel, ServerEvent};
+    use agent_core::types::{DiagnosticSeverity, NotificationLevel, ServerEvent};
     let mut session = backend.connect_session(tree_id).unwrap_or_else(|e| exit_err(&e));
     session.send_message(message).unwrap_or_else(|e| exit_err(&e));
     loop {
@@ -354,6 +354,18 @@ fn send_and_stream(backend: &Backend, tree_id: &str, message: &str, stop: &Atomi
             Some(Ok(ServerEvent::Notification { level, message })) => {
                 if level == NotificationLevel::Fatal { exit_err(&message); }
                 else { eprintln!("{message}"); }
+            }
+            Some(Ok(ServerEvent::Diagnostics { source, files })) => {
+                for file in &files {
+                    for diag in &file.diagnostics {
+                        let sev = match diag.severity {
+                            Some(DiagnosticSeverity::Error) => "error",
+                            Some(DiagnosticSeverity::Warning) => "warning",
+                            _ => "info",
+                        };
+                        eprintln!("[{}] {}:{}  {}: {}", source, file.path, diag.range.start.line + 1, sev, diag.message);
+                    }
+                }
             }
             Some(Err(e)) => { eprintln!("Parse error: {e}"); break; }
             _ => {}
@@ -402,6 +414,19 @@ fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &
             Some(Ok(ServerEvent::Notification { level, message })) => {
                 if level == NotificationLevel::Fatal { exit_err(&message); }
                 else { eprintln!("{message}"); }
+            }
+            Some(Ok(ServerEvent::Diagnostics { source, files })) => {
+                use agent_core::types::DiagnosticSeverity;
+                for file in &files {
+                    for diag in &file.diagnostics {
+                        let sev = match diag.severity {
+                            Some(DiagnosticSeverity::Error) => "error",
+                            Some(DiagnosticSeverity::Warning) => "warning",
+                            _ => "info",
+                        };
+                        eprintln!("[{}] {}:{}  {}: {}", source, file.path, diag.range.start.line + 1, sev, diag.message);
+                    }
+                }
             }
             Some(Err(e)) => { eprintln!("Parse error: {e}"); break; }
             _ => {}

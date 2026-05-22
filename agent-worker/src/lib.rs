@@ -290,7 +290,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let tools_done = wait.pending_tool_requests.is_empty();
             if tools_done && (now >= wait.silence_until || now >= wait.deadline) {
                 let old = std::mem::replace(&mut state, AgentState::Idle);
-                state = resolve_lsp_wait_into(old, &ctx.lsp_clients, &mut out, &tools);
+                state = resolve_lsp_wait_into(old, &mut ctx.lsp_clients, &mut out, &tools);
             } else if !tools_done && now >= wait.deadline {
                 let old = std::mem::replace(&mut state, AgentState::Idle);
                 state = resolve_lsp_wait_with_timeout(old, &mut ctx, &mut out, &tools);

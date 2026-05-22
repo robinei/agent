@@ -62,6 +62,10 @@ impl WorkerCtx {
                 ServerEvent::Done { status } => format!("Done({})", status),
                 ServerEvent::FileChanged { path, kind } => format!("FileChanged({},{})", kind, path),
                 ServerEvent::MetaUpdate { .. } => "MetaUpdate".into(),
+                ServerEvent::Diagnostics { source, files } => {
+                    let total: usize = files.iter().map(|f| f.diagnostics.len()).sum();
+                    format!("Diagnostics({}, {} diags)", source, total)
+                }
             },
             self.ws_clients.len()
         );

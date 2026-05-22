@@ -121,7 +121,7 @@ pub struct LspServerConfig {
 }
 
 fn default_lsp_timeout() -> u64 { 5000 }
-fn default_lsp_silence() -> u64 { 500 }
+fn default_lsp_silence() -> u64 { 150 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Position { pub line: u32, pub character: u32 }
@@ -139,6 +139,27 @@ pub struct Diagnostic {
     pub severity: Option<DiagnosticSeverity>,
     pub message: String,
     pub code: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DiagnosticsFile {
+    pub path: String,
+    pub diagnostics: Vec<Diagnostic>,  // new/unseen only
+    pub seen_errors: u32,
+    pub seen_warnings: u32,
+}
+
+pub fn lang_display(id: &str) -> &'static str {
+    match id {
+        "c"          => "C",
+        "cpp"        => "C++",
+        "rust"       => "Rust",
+        "typescript" => "TypeScript",
+        "javascript" => "JavaScript",
+        "python"     => "Python",
+        "go"         => "Go",
+        _            => "unknown",
+    }
 }
 
 pub fn expand_tilde(p: &PathBuf) -> PathBuf {
@@ -485,6 +506,12 @@ pub enum ServerEvent {
     /// Never stored. Rendered in dimmed color during streaming.
     #[serde(rename = "thinking_chunk")]
     ThinkingChunk { content: String },
+    /// LSP diagnostics collected after tool calls that modified files.
+    #[serde(rename = "diagnostics")]
+    Diagnostics {
+        source: String,
+        files: Vec<DiagnosticsFile>,
+    },
 }
 
 // ── Tool system types ──
