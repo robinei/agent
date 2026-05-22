@@ -92,13 +92,21 @@ fn dirs_home() -> PathBuf {
 
 // ── LSP types ──
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LspConfig {
-    #[serde(default)]
+    #[serde(default = "bool_true")]
     pub enabled: bool,
     #[serde(default)]
     pub servers: Vec<LspServerConfig>,
 }
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self { enabled: true, servers: Vec::new() }
+    }
+}
+
+fn bool_true() -> bool { true }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LspServerConfig {
