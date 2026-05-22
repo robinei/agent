@@ -4,11 +4,9 @@
 //! the original file content, then applied in reverse order so line offsets
 //! remain stable. Overlapping edits are rejected.
 
-use std::fs;
-
 use super::util::{apply_edit, build_context_window, count_fuzzy_matches, find_changed_lines};
-use super::{resolve_path, EditRecord, Tool, ToolContext, ToolResult};
-use agent_core::types::{ToolDefinition, ToolOutput};
+use super::{resolve_path, EditRecord, Tool, ToolContext, ToolOutput};
+use agent_core::types::ToolDefinition;
 
 pub struct EditTool;
 
@@ -77,84 +75,92 @@ impl Tool for EditTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolResult {
+    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
         let file_path = params
             .get("file_path")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing required field: file_path".to_string())?;
+            .ok_or_else(|| "Missing required field: file_path".to_string());
 
-        let resolved = resolve_path(&ctx.cwd, file_path)?;
+        let file_path = match file_path {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::Done(Err(e)),
+        };
+
+        let resolved = match resolve_path(&ctx.cwd, file_path) {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::Done(Err(e)),
+        };
 
         if !resolved.is_file() {
-            return Err(format!("Not a file: {}", resolved.display()).into());
+            return ToolOutput::Done(Err(format!("Not a file: {}", resolved.display())));
         }
 
         let mut edits: Vec<EditInput> = Vec::new();
 
         if let Some(edits_arr) = params.get("edits").and_then(|v| v.as_array()) {
             for (i, edit_val) in edits_arr.iter().enumerate() {
-                let old_text = edit_val
-                    .get("oldText")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| format!("Edit #{}: missing oldText", i + 1))?;
-                let new_text = edit_val
-                    .get("newText")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| format!("Edit #{}: missing newText", i + 1))?;
-                edits.push(EditInput {
-                    old_text: old_text.to_string(),
-                    new_text: new_text.to_string(),
-                });
+                let old_text = match edit_val.get("oldText").and_then(|v| v.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => return ToolOutput::Done(Err(format!("Edit #{}: missing oldText", i + 1))),
+                };
+                let new_text = match edit_val.get("newText").and_then(|v| v.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => return ToolOutput::Done(Err(format!("Edit #{}: missing newText", i + 1))),
+                };
+                edits.push(EditInput { old_text, new_text });
             }
         } else {
-            let old_text = params
-                .get("old_text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "Missing required field: old_text".to_string())?;
-            let new_text = params
-                .get("new_text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "Missing required field: new_text".to_string())?;
-            edits.push(EditInput {
-                old_text: old_text.to_string(),
-                new_text: new_text.to_string(),
-            });
+            let old_text = match params.get("old_text").and_then(|v| v.as_str()) {
+                Some(t) => t.to_string(),
+                None => return ToolOutput::Done(Err("Missing required field: old_text".into())),
+            };
+            let new_text = match params.get("new_text").and_then(|v| v.as_str()) {
+                Some(t) => t.to_string(),
+                None => return ToolOutput::Done(Err("Missing required field: new_text".into())),
+            };
+            edits.push(EditInput { old_text, new_text });
         }
 
         if edits.is_empty() {
-            return Err("No edits provided".into());
+            return ToolOutput::Done(Err("No edits provided".into()));
         }
 
-        let raw = fs::read_to_string(&resolved)?;
+        let raw = match std::fs::read_to_string(&resolved) {
+            Ok(c) => c,
+            Err(e) => return ToolOutput::Done(Err(e.to_string())),
+        };
         let original = Self::normalize(&raw);
 
         for (i, edit) in edits.iter().enumerate() {
             let count = count_fuzzy_matches(&original, &edit.old_text);
             if count == 0 {
-                return Err(format!(
+                return ToolOutput::Done(Err(format!(
                     "Edit #{}: oldText not found in file (exact + fuzzy)",
                     i + 1
-                )
-                .into());
+                )));
             }
             if count > 1 {
-                return Err(format!(
+                return ToolOutput::Done(Err(format!(
                     "Edit #{}: oldText matches {} times (ambiguous)",
                     i + 1,
                     count
-                )
-                .into());
+                )));
             }
         }
 
         let mut content = original.clone();
         for (i, edit) in edits.iter().enumerate().rev() {
-            content = apply_edit(&content, &edit.old_text, &edit.new_text, i)?;
+            content = match apply_edit(&content, &edit.old_text, &edit.new_text, i) {
+                Ok(c) => c,
+                Err(e) => return ToolOutput::Done(Err(e)),
+            };
         }
 
         let pre_snapshot = Some(original.clone());
 
-        fs::write(&resolved, &content)?;
+        if let Err(e) = std::fs::write(&resolved, &content) {
+            return ToolOutput::Done(Err(e.to_string()));
+        }
 
         let edit_tuples: Vec<(String, String)> = edits
             .iter()
@@ -164,6 +170,7 @@ impl Tool for EditTool {
         let new_texts: Vec<String> = edits.iter().map(|e| e.new_text.clone()).collect();
         let changed_lines = find_changed_lines(&content, &new_texts);
 
+        ctx.lsp_dirty.push(resolved.clone());
         let id = ctx.edit_store.insert(EditRecord {
             file_path: resolved,
             pre_snapshot,
@@ -174,12 +181,7 @@ impl Tool for EditTool {
         let diff = build_context_window(file_path, &content, &changed_lines, edits.len(), id);
         let original_size = original.len();
 
-        Ok(ToolOutput {
-            content: diff,
-            truncated: false,
-            original_size,
-            exit_code: None,
-        })
+        ToolOutput::Done(Ok(diff))
     }
 }
 
@@ -194,6 +196,13 @@ mod tests {
         ToolContext::new(dir.to_path_buf())
     }
 
+    fn run_ok(tool: &EditTool, params: serde_json::Value, ctx: &mut ToolContext) -> String {
+        match tool.execute(&params, ctx) {
+            ToolOutput::Done(Ok(c)) => c,
+            _ => panic!("expected Done(Ok)"),
+        }
+    }
+
     #[test]
     fn test_edit_exact_match() {
         let dir = TempDir::new().unwrap();
@@ -204,18 +213,16 @@ mod tests {
         .unwrap();
         let tool = EditTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool
-            .execute(
-                &serde_json::json!({
-                    "file_path": "test.rs",
-                    "old_text": "    println!(\"world\");",
-                    "new_text": "    println!(\"hello world\");"
-                }),
-                &mut ctx,
-            )
-            .unwrap();
-        assert!(!result.truncated);
-        assert!(result.content.contains("edit_id:"));
+        let result = run_ok(
+            &tool,
+            serde_json::json!({
+                "file_path": "test.rs",
+                "old_text": "    println!(\"world\");",
+                "new_text": "    println!(\"hello world\");"
+            }),
+            &mut ctx,
+        );
+        assert!(result.contains("edit_id:"));
         let content = fs::read_to_string(dir.path().join("test.rs")).unwrap();
         assert!(content.contains("hello world"));
     }
@@ -230,17 +237,15 @@ mod tests {
         .unwrap();
         let tool = EditTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool
-            .execute(
-                &serde_json::json!({
-                    "file_path": "test.rs",
-                    "old_text": "println!(\"hello\");",
-                    "new_text": "println!(\"world\");"
-                }),
-                &mut ctx,
-            )
-            .unwrap();
-        assert!(!result.truncated);
+        let result = run_ok(
+            &tool,
+            serde_json::json!({
+                "file_path": "test.rs",
+                "old_text": "println!(\"hello\");",
+                "new_text": "println!(\"world\");"
+            }),
+            &mut ctx,
+        );
         let content = fs::read_to_string(dir.path().join("test.rs")).unwrap();
         assert!(content.contains("world"));
     }
@@ -255,17 +260,15 @@ mod tests {
         .unwrap();
         let tool = EditTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool
-            .execute(
-                &serde_json::json!({
-                    "file_path": "test.rs",
-                    "old_text": "fn hello() {\n    x = 1;\n}",
-                    "new_text": "fn hello() {\n    x = 2;\n}"
-                }),
-                &mut ctx,
-            )
-            .unwrap();
-        assert!(!result.truncated);
+        let result = run_ok(
+            &tool,
+            serde_json::json!({
+                "file_path": "test.rs",
+                "old_text": "fn hello() {\n    x = 1;\n}",
+                "new_text": "fn hello() {\n    x = 2;\n}"
+            }),
+            &mut ctx,
+        );
         let content = fs::read_to_string(dir.path().join("test.rs")).unwrap();
         assert!(content.contains("x = 2"));
     }
@@ -280,19 +283,17 @@ mod tests {
         .unwrap();
         let tool = EditTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool
-            .execute(
-                &serde_json::json!({
-                    "file_path": "test.rs",
-                    "edits": [
-                        {"oldText": "line A", "newText": "line X"},
-                        {"oldText": "line C", "newText": "line Z"}
-                    ]
-                }),
-                &mut ctx,
-            )
-            .unwrap();
-        assert!(!result.truncated);
+        let result = run_ok(
+            &tool,
+            serde_json::json!({
+                "file_path": "test.rs",
+                "edits": [
+                    {"oldText": "line A", "newText": "line X"},
+                    {"oldText": "line C", "newText": "line Z"}
+                ]
+            }),
+            &mut ctx,
+        );
         let content = fs::read_to_string(dir.path().join("test.rs")).unwrap();
         assert!(content.contains("line X"));
         assert!(content.contains("line Z"));
@@ -313,7 +314,7 @@ mod tests {
             }),
             &mut ctx,
         );
-        assert!(result.is_err());
+        assert!(matches!(result, ToolOutput::Done(Err(_))));
     }
 
     #[test]
@@ -329,7 +330,7 @@ mod tests {
             }),
             &mut ctx,
         );
-        assert!(result.is_err());
+        assert!(matches!(result, ToolOutput::Done(Err(_))));
     }
 
     #[test]
@@ -353,6 +354,6 @@ mod tests {
             }),
             &mut ctx,
         );
-        assert!(result.is_err());
+        assert!(matches!(result, ToolOutput::Done(Err(_))));
     }
 }

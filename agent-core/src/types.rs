@@ -90,6 +90,49 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
+// ── LSP types ──
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct LspConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub servers: Vec<LspServerConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LspServerConfig {
+    pub language: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_lsp_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_lsp_silence")]
+    pub silence_ms: u64,
+}
+
+fn default_lsp_timeout() -> u64 { 5000 }
+fn default_lsp_silence() -> u64 { 500 }
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Position { pub line: u32, pub character: u32 }
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Range { pub start: Position, pub end: Position }
+
+#[derive(Serialize, Deserialize, Clone, Debug, Copy, PartialEq)]
+#[repr(u8)]
+pub enum DiagnosticSeverity { Error = 1, Warning = 2, Information = 3, Hint = 4 }
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Diagnostic {
+    pub range: Range,
+    pub severity: Option<DiagnosticSeverity>,
+    pub message: String,
+    pub code: Option<String>,
+}
+
 pub fn expand_tilde(p: &PathBuf) -> PathBuf {
     if p.starts_with("~") {
         let home = dirs_home();

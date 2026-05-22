@@ -20,16 +20,24 @@ pub mod search;
 pub mod util;
 pub mod write;
 
-use agent_core::types::{ToolDefinition, ToolOutput};
+use agent_core::types::ToolDefinition;
 
 /// Result type for tool execution.
-pub type ToolResult = Result<ToolOutput, Box<dyn std::error::Error + Send + Sync>>;
+pub type ToolResult = Result<agent_core::types::ToolOutput, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Tool execution output: either a completed result or a pending LSP request.
+pub enum ToolOutput {
+    Done(Result<String, String>),
+    PendingLsp { request_id: u64, lang_id: String },
+}
 
 /// Shared context passed to every tool execution.
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub edit_store: EditStore,
     pub stop: Arc<AtomicBool>,
+    pub lsp_dirty: Vec<PathBuf>,
+    pub lsp_clients: HashMap<String, crate::lsp_client::LspClient>,
 }
 
 impl ToolContext {
@@ -38,6 +46,8 @@ impl ToolContext {
             cwd,
             edit_store: EditStore::new(),
             stop: Arc::new(AtomicBool::new(false)),
+            lsp_dirty: Vec::new(),
+            lsp_clients: HashMap::new(),
         }
     }
 }
@@ -88,7 +98,21 @@ pub trait Tool: Send {
     fn definition(&self) -> ToolDefinition;
 
     /// Execute the tool with the given JSON parameters and shared context.
-    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolResult;
+    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput;
+
+    /// Resume a tool that was paused for an LSP response.
+    fn resume(
+        &self,
+        _response: serde_json::Value,
+        _ctx: &mut ToolContext,
+    ) -> Result<String, String> {
+        unreachable!("tool '{}' does not implement resume", self.name())
+    }
+
+    /// Tool name, defaults to definition().name.
+    fn name(&self) -> String {
+        self.definition().name
+    }
 }
 
 /// Register all available tools.
@@ -156,7 +180,7 @@ fn normalize_path_lexical(path: &Path) -> std::path::PathBuf {
 }
 
 /// Truncate output to the given limits, setting `truncated` if exceeded.
-pub fn truncate_output(content: &str, max_lines: usize, max_bytes: usize) -> ToolOutput {
+pub fn truncate_output(content: &str, max_lines: usize, max_bytes: usize) -> agent_core::types::ToolOutput {
     let original_size = content.len();
     let mut truncated = false;
     let result = if content.len() > max_bytes {
@@ -165,7 +189,6 @@ pub fn truncate_output(content: &str, max_lines: usize, max_bytes: usize) -> Too
         s.push_str("\n\n[Output truncated: exceeded max size]");
         s
     } else {
-        // Check line count
         let line_count = content.lines().count();
         if line_count > max_lines {
             truncated = true;
@@ -179,7 +202,7 @@ pub fn truncate_output(content: &str, max_lines: usize, max_bytes: usize) -> Too
             content.to_string()
         }
     };
-    ToolOutput {
+    agent_core::types::ToolOutput {
         content: result,
         truncated,
         original_size,

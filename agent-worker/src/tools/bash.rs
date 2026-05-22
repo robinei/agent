@@ -13,8 +13,8 @@ use std::time::Duration;
 use nix::sys::signal;
 use nix::unistd::Pid;
 
-use super::{Tool, ToolContext, ToolResult};
-use agent_core::types::{ToolDefinition, ToolOutput};
+use super::{Tool, ToolContext, ToolOutput};
+use agent_core::types::ToolDefinition;
 
 pub struct BashTool;
 
@@ -57,11 +57,14 @@ impl Tool for BashTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolResult {
-        let command = params
+    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
+        let command = match params
             .get("command")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing required field: command".to_string())?;
+        {
+            Some(c) => c,
+            None => return ToolOutput::Done(Err("Missing required field: command".to_string())),
+        };
 
         let timeout_secs: u64 = params
             .get("timeout")
@@ -81,12 +84,7 @@ impl Tool for BashTool {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                return Ok(ToolOutput {
-                    content: format!("Failed to spawn bash: {}", e),
-                    truncated: false,
-                    original_size: 0,
-                    exit_code: Some(-1),
-                });
+                return ToolOutput::Done(Ok(format!("Failed to spawn bash: {}", e)));
             }
         };
 
@@ -168,10 +166,8 @@ impl Tool for BashTool {
         };
 
         let content = Self::combine_output(&out, &err, exit_code, kill_reason, timeout_secs);
-
-        let mut output = super::truncate_output(&content, 2000, 50 * 1024);
-        output.exit_code = exit_code;
-        Ok(output)
+        let output = super::truncate_output(&content, 2000, 50 * 1024);
+        ToolOutput::Done(Ok(output.content))
     }
 }
 
@@ -231,16 +227,20 @@ mod tests {
         ToolContext::new(dir.to_path_buf())
     }
 
+    fn run_ok(tool: &BashTool, params: serde_json::Value, ctx: &mut ToolContext) -> String {
+        match tool.execute(&params, ctx) {
+            ToolOutput::Done(Ok(c)) => c,
+            _ => panic!("expected Done(Ok)"),
+        }
+    }
+
     #[test]
     fn test_bash_echo() {
         let dir = TempDir::new().unwrap();
         let tool = BashTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool
-            .execute(&serde_json::json!({"command": "echo hello world"}), &mut ctx)
-            .unwrap();
-        assert!(result.content.contains("hello world"));
-        assert_eq!(result.exit_code, Some(0));
+        let result = run_ok(&tool, serde_json::json!({"command": "echo hello world"}), &mut ctx);
+        assert!(result.contains("hello world"));
     }
 
     #[test]
@@ -248,10 +248,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool
-            .execute(&serde_json::json!({"command": "exit 42"}), &mut ctx)
-            .unwrap();
-        assert_eq!(result.exit_code, Some(42));
+        let result = run_ok(&tool, serde_json::json!({"command": "exit 42"}), &mut ctx);
+        assert!(result.contains("exit_code: 42"));
     }
 
     #[test]
@@ -259,10 +257,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool
-            .execute(&serde_json::json!({"command": "echo error >&2"}), &mut ctx)
-            .unwrap();
-        assert!(result.content.contains("error"));
+        let result = run_ok(&tool, serde_json::json!({"command": "echo error >&2"}), &mut ctx);
+        assert!(result.contains("error"));
     }
 
     #[test]
@@ -271,11 +267,8 @@ mod tests {
         fs::write(dir.path().join("marker.txt"), "present").unwrap();
         let tool = BashTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool
-            .execute(&serde_json::json!({"command": "ls marker.txt"}), &mut ctx)
-            .unwrap();
-        assert!(result.content.contains("marker.txt"));
-        assert_eq!(result.exit_code, Some(0));
+        let result = run_ok(&tool, serde_json::json!({"command": "ls marker.txt"}), &mut ctx);
+        assert!(result.contains("marker.txt"));
     }
 
     #[test]
@@ -283,10 +276,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool
-            .execute(&serde_json::json!({"command": "sleep 10", "timeout": 1}), &mut ctx)
-            .unwrap();
-        assert!(result.content.contains("timed out"));
+        let result = run_ok(&tool, serde_json::json!({"command": "sleep 10", "timeout": 1}), &mut ctx);
+        assert!(result.contains("timed out"));
     }
 
     #[test]
@@ -294,10 +285,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool
-            .execute(&serde_json::json!({"command": "nonexistent_command_xyz123"}), &mut ctx)
-            .unwrap();
-        assert_eq!(result.exit_code, Some(127));
+        let result = run_ok(&tool, serde_json::json!({"command": "nonexistent_command_xyz123"}), &mut ctx);
+        assert!(result.contains("exit_code: 127") || result.contains("not found"));
     }
 
     #[test]
@@ -308,13 +297,16 @@ mod tests {
         let stop = ctx.stop.clone();
 
         let handle = std::thread::spawn(move || {
-            tool.execute(&serde_json::json!({"command": "sleep 30"}), &mut ctx)
+            match tool.execute(&serde_json::json!({"command": "sleep 30"}), &mut ctx) {
+                ToolOutput::Done(Ok(c)) => c,
+                _ => String::new(),
+            }
         });
 
-        std::thread::sleep(Duration::from_millis(200));
-        stop.store(true, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
 
-        let result = handle.join().unwrap().unwrap();
-        assert!(result.content.contains("Command cancelled") || result.exit_code == Some(-1) || result.exit_code.is_some());
+        let result = handle.join().unwrap();
+        assert!(result.contains("Command cancelled") || result.is_empty());
     }
 }

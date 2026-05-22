@@ -232,6 +232,7 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
                 logging_level: cfg.logging.level.clone(),
                 logging_to_file: cfg.logging.to_file.clone(),
                 logging_to_stderr: cfg.logging.to_stderr,
+                lsp: cfg.lsp.clone(),
             };
             let config_msg =
                 serde_json::to_string(&agent_core::rpc::PipeIn::Config(worker_cfg)).unwrap();

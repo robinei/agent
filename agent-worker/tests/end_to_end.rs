@@ -79,6 +79,7 @@ let mut child = std::process::Command::new(&exe)
         logging_level: "error".into(),
         logging_to_file: None,
         logging_to_stderr: false,
+        lsp: agent_core::types::LspConfig::default(),
     });
     writeln!(stdin, "{}", serde_json::to_string(&config).unwrap()).unwrap();
 

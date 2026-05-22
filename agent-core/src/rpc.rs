@@ -3,6 +3,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use crate::types::{Message, ToolDefinition};
+use crate::types::LspConfig;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "method", rename_all = "lowercase")]
@@ -51,6 +52,8 @@ pub struct WorkerConfig {
     pub logging_level: String,
     pub logging_to_file: Option<PathBuf>,
     pub logging_to_stderr: bool,
+    #[serde(default)]
+    pub lsp: LspConfig,
 }
 
 // Envelope for server stdin → worker
@@ -212,12 +215,13 @@ mod tests {
             logging_level: "info".into(),
             logging_to_file: Some("/tmp/agent.log".into()),
             logging_to_stderr: true,
+            lsp: LspConfig::default(),
         };
         let pipe = PipeIn::Config(cfg);
         let json = serde_json::to_string(&pipe).unwrap();
         assert_eq!(
             json,
-            r#"{"ch":"config","msg":{"session_soft_cap_pct":65,"session_hard_cap_pct":85,"max_tool_calls_per_turn":25,"logging_level":"info","logging_to_file":"/tmp/agent.log","logging_to_stderr":true}}"#
+            r#"{"ch":"config","msg":{"session_soft_cap_pct":65,"session_hard_cap_pct":85,"max_tool_calls_per_turn":25,"logging_level":"info","logging_to_file":"/tmp/agent.log","logging_to_stderr":true,"lsp":{"enabled":false,"servers":[]}}}"#
         );
         let parsed: PipeIn = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, PipeIn::Config(_)));

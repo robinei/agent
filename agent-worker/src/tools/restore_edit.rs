@@ -3,8 +3,8 @@
 use std::fs;
 
 use super::util::{apply_edit, count_fuzzy_matches};
-use super::{resolve_path, EditRecord, Tool, ToolContext, ToolResult};
-use agent_core::types::{ToolDefinition, ToolOutput};
+use super::{resolve_path, EditRecord, Tool, ToolContext, ToolOutput};
+use agent_core::types::ToolDefinition;
 use log::warn;
 
 pub struct RestoreEditTool;
@@ -61,34 +61,36 @@ impl Tool for RestoreEditTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolResult {
-        let id = params
+    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
+        let id = match params
             .get("id")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| "Missing or invalid required field: id".to_string())?;
+        {
+            Some(i) => i,
+            None => return ToolOutput::Done(Err("Missing or invalid required field: id".to_string())),
+        };
 
         let mode = params
             .get("mode")
             .and_then(|v| v.as_str())
             .unwrap_or("revert_patch");
 
-        let record = ctx
-            .edit_store
-            .get(id)
-            .ok_or_else(|| format!("No edit with id {} found", id))?
-            .clone();
+        let record = match ctx.edit_store.get(id) {
+            Some(r) => r.clone(),
+            None => return ToolOutput::Done(Err(format!("No edit with id {} found", id))),
+        };
 
-        let resolved = resolve_path(&ctx.cwd, &record.file_path.to_string_lossy())?;
+        let resolved = match resolve_path(&ctx.cwd, &record.file_path.to_string_lossy()) {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::Done(Err(e)),
+        };
 
         match mode {
             "pre_snapshot" => {
-                restore_pre(&resolved, &record)?;
-                Ok(ToolOutput {
-                    content: restore_pre_msg(&record, id),
-                    truncated: false,
-                    original_size: record.pre_snapshot.as_ref().map_or(0, |s| s.len()),
-                    exit_code: None,
-                })
+                if let Err(e) = restore_pre(&resolved, &record) {
+                    return ToolOutput::Done(Err(e.to_string()));
+                }
+                ToolOutput::Done(Ok(restore_pre_msg(&record, id)))
             }
 
             "post_snapshot" => {
@@ -98,18 +100,18 @@ impl Tool for RestoreEditTool {
                         let base = record.pre_snapshot.as_deref().unwrap_or("");
                         let mut c = base.to_string();
                         for (old, new) in &record.edits {
-                            c = apply_edit(&c, old, new, 0)?;
+                            match apply_edit(&c, old, new, 0) {
+                                Ok(r) => c = r,
+                                Err(e) => return ToolOutput::Done(Err(e)),
+                            }
                         }
                         c
                     }
                 };
-                fs::write(&resolved, &content)?;
-                Ok(ToolOutput {
-                    content: format!("Restored file to post-edit snapshot (edit {})", id),
-                    truncated: false,
-                    original_size: content.len(),
-                    exit_code: None,
-                })
+                if let Err(e) = std::fs::write(&resolved, &content) {
+                    return ToolOutput::Done(Err(e.to_string()));
+                }
+                ToolOutput::Done(Ok(format!("Restored file to post-edit snapshot (edit {})", id)))
             }
 
             "apply_patch" => {
@@ -120,61 +122,62 @@ impl Tool for RestoreEditTool {
                             let base = record.pre_snapshot.as_deref().unwrap_or("");
                             let mut c = base.to_string();
                             for (old, new) in &record.edits {
-                                c = apply_edit(&c, old, new, 0)?;
+                                match apply_edit(&c, old, new, 0) {
+                                    Ok(r) => c = r,
+                                    Err(e) => return ToolOutput::Done(Err(e)),
+                                }
                             }
                             c
                         }
                     };
-                    fs::write(&resolved, &content)?;
-                    return Ok(ToolOutput {
-                        content: format!("Re-applied (write) for edit {}", id),
-                        truncated: false,
-                        original_size: content.len(),
-                        exit_code: None,
-                    });
+                    if let Err(e) = std::fs::write(&resolved, &content) {
+                        return ToolOutput::Done(Err(e.to_string()));
+                    }
+                    return ToolOutput::Done(Ok(format!("Re-applied (write) for edit {}", id)));
                 }
 
-                let current = fs::read_to_string(&resolved)?;
+                let current = match std::fs::read_to_string(&resolved) {
+                    Ok(c) => c,
+                    Err(e) => return ToolOutput::Done(Err(e.to_string())),
+                };
                 let mut content = current.clone();
                 for (i, (old, new)) in record.edits.iter().enumerate() {
                     let count = count_fuzzy_matches(&content, old);
                     if count == 0 {
-                        return Err(format!(
+                        return ToolOutput::Done(Err(format!(
                             "apply_patch: oldText not found for sub-edit {} (edit {})",
                             i, id
-                        )
-                        .into());
+                        )));
                     }
                     if count > 1 {
-                        return Err(format!(
+                        return ToolOutput::Done(Err(format!(
                             "apply_patch: oldText matches {} times (ambiguous) for sub-edit {} (edit {})",
                             count, i, id
-                        )
-                        .into());
+                        )));
                     }
-                    content = apply_edit(&content, old, new, i)?;
+                    match apply_edit(&content, old, new, i) {
+                        Ok(r) => content = r,
+                        Err(e) => return ToolOutput::Done(Err(e)),
+                    }
                 }
-                fs::write(&resolved, &content)?;
-                Ok(ToolOutput {
-                    content: format!("Re-applied patch for edit {}", id),
-                    truncated: false,
-                    original_size: content.len(),
-                    exit_code: None,
-                })
+                if let Err(e) = std::fs::write(&resolved, &content) {
+                    return ToolOutput::Done(Err(e.to_string()));
+                }
+                ToolOutput::Done(Ok(format!("Re-applied patch for edit {}", id)))
             }
 
             "revert_patch" => {
                 if record.edits.is_empty() {
-                    restore_pre(&resolved, &record)?;
-                    return Ok(ToolOutput {
-                        content: restore_pre_msg(&record, id),
-                        truncated: false,
-                        original_size: record.pre_snapshot.as_ref().map_or(0, |s| s.len()),
-                        exit_code: None,
-                    });
+                    if let Err(e) = restore_pre(&resolved, &record) {
+                        return ToolOutput::Done(Err(e.to_string()));
+                    }
+                    return ToolOutput::Done(Ok(restore_pre_msg(&record, id)));
                 }
 
-                let current = fs::read_to_string(&resolved)?;
+                let current = match std::fs::read_to_string(&resolved) {
+                    Ok(c) => c,
+                    Err(e) => return ToolOutput::Done(Err(e.to_string())),
+                };
                 let mut content = current.clone();
                 let mut failed = false;
                 for (i, (old, new)) in record.edits.iter().rev().enumerate() {
@@ -187,8 +190,8 @@ impl Tool for RestoreEditTool {
                         failed = true;
                         break;
                     }
-                    match apply_edit(&content, new, old, i) {  // find new_text, replace with old_text
-                        Ok(result) => content = result,
+                    match apply_edit(&content, new, old, i) {
+                        Ok(r) => content = r,
                         Err(e) => {
                             warn!("Patch revert sub-edit {} failed: {}", i, e);
                             failed = true;
@@ -197,30 +200,24 @@ impl Tool for RestoreEditTool {
                     }
                 }
                 if failed {
-                    restore_pre(&resolved, &record)?;
-                    Ok(ToolOutput {
-                        content: format!(
-                            "Patch revert failed (text not found); restored full pre-edit \
-                             snapshot for edit {}. Other changes to this file since edit {} \
-                             were also reverted.",
-                            id, id
-                        ),
-                        truncated: false,
-                        original_size: record.pre_snapshot.as_ref().map_or(0, |s| s.len()),
-                        exit_code: None,
-                    })
+                    if let Err(e) = restore_pre(&resolved, &record) {
+                        return ToolOutput::Done(Err(e.to_string()));
+                    }
+                    ToolOutput::Done(Ok(format!(
+                        "Patch revert failed (text not found); restored full pre-edit \
+                         snapshot for edit {}. Other changes to this file since edit {} \
+                         were also reverted.",
+                        id, id
+                    )))
                 } else {
-                    fs::write(&resolved, &content)?;
-                    Ok(ToolOutput {
-                        content: format!("Reverted patch for edit {}", id),
-                        truncated: false,
-                        original_size: content.len(),
-                        exit_code: None,
-                    })
+                    if let Err(e) = std::fs::write(&resolved, &content) {
+                        return ToolOutput::Done(Err(e.to_string()));
+                    }
+                    ToolOutput::Done(Ok(format!("Reverted patch for edit {}", id)))
                 }
             }
 
-            _ => Err(format!("Unknown mode: {}", mode).into()),
+            _ => ToolOutput::Done(Err(format!("Unknown mode: {}", mode))),
         }
     }
 }

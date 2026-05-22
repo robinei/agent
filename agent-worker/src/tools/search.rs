@@ -2,9 +2,9 @@
 
 use std::fs;
 
-use super::{Tool, ToolContext, ToolResult};
+use super::{Tool, ToolContext, ToolOutput};
 use agent_core::config::agent_dir;
-use agent_core::types::{Entry, MessageContent, ToolDefinition, ToolOutput};
+use agent_core::types::{Entry, MessageContent, ToolDefinition};
 
 pub struct SearchMessagesTool;
 
@@ -169,11 +169,14 @@ impl Tool for SearchMessagesTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, _ctx: &mut ToolContext) -> ToolResult {
-        let query = params
+    fn execute(&self, params: &serde_json::Value, _ctx: &mut ToolContext) -> ToolOutput {
+        let query = match params
             .get("query")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing required field: query".to_string())?;
+        {
+            Some(q) => q,
+            None => return ToolOutput::Done(Err("Missing required field: query".to_string())),
+        };
 
         let tree_id = params.get("tree_id").and_then(|v| v.as_str());
         let limit: usize = params
@@ -182,20 +185,17 @@ impl Tool for SearchMessagesTool {
             .map(|v| (v as usize).clamp(1, 100))
             .unwrap_or(20);
 
-        let results = Self::search_trees(query, tree_id, limit)
-            .map_err(|e| format!("Search failed: {}", e))?;
+        let results = match Self::search_trees(query, tree_id, limit) {
+            Ok(r) => r,
+            Err(e) => return ToolOutput::Done(Err(format!("Search failed: {}", e))),
+        };
 
         if results.is_empty() {
-            return Ok(ToolOutput {
-                content: format!(
-                    "No messages found matching '{}'{}.\n",
-                    query,
-                    tree_id.map(|t| format!(" in tree {}", t)).unwrap_or_default()
-                ),
-                truncated: false,
-                original_size: 0,
-                exit_code: None,
-            });
+            return ToolOutput::Done(Ok(format!(
+                "No messages found matching '{}'{}.\n",
+                query,
+                tree_id.map(|t| format!(" in tree {}", t)).unwrap_or_default()
+            )));
         }
 
         let mut content = format!(
@@ -213,13 +213,7 @@ impl Tool for SearchMessagesTool {
             ));
         }
 
-        let original_size = results.len();
-        Ok(ToolOutput {
-            content,
-            truncated: false,
-            original_size,
-            exit_code: None,
-        })
+        ToolOutput::Done(Ok(content))
     }
 }
 
@@ -240,7 +234,7 @@ struct SearchMatch {
 mod tests {
     use super::*;
     use agent_core::store::Store;
-    use agent_core::types::*;
+    use agent_core::types::{Entry, Message, MessageContent, MessageRole};
     use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -265,15 +259,21 @@ mod tests {
         ToolContext::new(PathBuf::from("/tmp"))
     }
 
+    fn run_ok(tool: &SearchMessagesTool, params: serde_json::Value, ctx: &mut ToolContext) -> String {
+        match tool.execute(&params, ctx) {
+            ToolOutput::Done(Ok(c)) => c,
+            ToolOutput::Done(Err(e)) => panic!("search failed: {}", e),
+            _ => panic!("expected Done"),
+        }
+    }
+
     #[test]
     fn test_search_messages_empty() {
         with_temp_agent_dir("empty", |_path| {
             let tool = SearchMessagesTool;
             let mut ctx = make_ctx();
-            let result = tool
-                .execute(&serde_json::json!({"query": "hello"}), &mut ctx)
-                .unwrap();
-            assert!(result.content.contains("No messages found"));
+            let result = run_ok(&tool, serde_json::json!({"query": "hello"}), &mut ctx);
+            assert!(result.contains("No messages found"));
         });
     }
 
@@ -304,11 +304,9 @@ mod tests {
 
             let tool = SearchMessagesTool;
             let mut ctx = make_ctx();
-            let result = tool
-                .execute(&serde_json::json!({"query": "hello world"}), &mut ctx)
-                .unwrap();
-            assert!(result.content.contains("hello world from search"));
-            assert!(result.content.contains("user"));
+            let result = run_ok(&tool, serde_json::json!({"query": "hello world"}), &mut ctx);
+            assert!(result.contains("hello world from search"));
+            assert!(result.contains("user"));
         });
     }
 
@@ -339,13 +337,11 @@ mod tests {
 
             let tool = SearchMessagesTool;
             let mut ctx = make_ctx();
-            let result = tool
-                .execute(&serde_json::json!({
-                    "query": "secret",
-                    "tree_id": "wrong-tree-id"
-                }), &mut ctx)
-                .unwrap();
-            assert!(result.content.contains("No messages found"));
+            let result = run_ok(&tool, serde_json::json!({
+                "query": "secret",
+                "tree_id": "wrong-tree-id"
+            }), &mut ctx);
+            assert!(result.contains("No messages found"));
         });
     }
 

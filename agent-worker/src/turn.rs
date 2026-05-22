@@ -6,9 +6,14 @@ use agent_core::store::Store;
 use agent_core::types::*;
 use log::{error, info, warn};
 
+use crate::lsp_client::{
+    default_server, detect_language, format_diagnostics, binary_exists,
+    LspClient, LspFileResult, LspWaitState, PendingLspTool,
+};
 use crate::thinking::{split_thinking_chunks, ThinkingSegment};
 use crate::util::{emit_error, emit_event, send_llm_request, write_message_entry, write_session_end};
 use crate::AgentState;
+use crate::tools::ToolOutput;
 
 fn make_assistant_message(text: String, tool_calls: Option<Vec<ToolCall>>) -> Message {
     Message {
@@ -36,20 +41,20 @@ fn make_user_message(text: String) -> Message {
     }
 }
 
-fn make_tool_result_message(output: &ToolOutput, call: &ToolCall) -> Message {
+pub fn make_tool_result_message(tool_call_id: &str, tool_name: &str, result: &Result<String, String>) -> Message {
+    let (content, is_error) = match result {
+        Ok(c) => (c.clone(), None),
+        Err(e) => (format!("Error: {}", e), Some(true)),
+    };
     Message {
         role: MessageRole::Tool,
-        content: MessageContent::Text(format_tool_output(output)),
+        content: MessageContent::Text(content),
         tool_calls: None,
-        tool_call_id: Some(call.id.clone()),
-        tool_name: Some(call.name.clone()),
+        tool_call_id: Some(tool_call_id.to_string()),
+        tool_name: Some(tool_name.to_string()),
         usage: None,
         stop_reason: None,
-        is_error: if output.exit_code.unwrap_or(0) != 0 {
-            Some(true)
-        } else {
-            None
-        },
+        is_error,
     }
 }
 
@@ -109,6 +114,17 @@ fn check_context_cap(
         }
     }
     Ok(())
+}
+
+fn parse_exit_code(content: &str) -> i32 {
+    for line in content.lines().rev() {
+        if let Some(rest) = line.strip_prefix("exit_code: ") {
+            if let Ok(code) = rest.trim().parse::<i32>() {
+                return code;
+            }
+        }
+    }
+    0
 }
 
 pub fn begin_turn(
@@ -192,58 +208,101 @@ fn execute_tool(
     name: &str,
     args: &serde_json::Value,
     ctx: &mut crate::tools::ToolContext,
-) -> ToolOutput {
+) -> Result<String, String> {
     let tool = match tools.iter().find(|t| t.definition().name == name) {
         Some(t) => t,
-        None => {
-            return ToolOutput {
-                content: format!("Error: Unknown tool '{}'", name),
-                truncated: false,
-                original_size: 0,
-                exit_code: Some(1),
-            };
-        }
+        None => return Err(format!("Unknown tool '{}'", name)),
     };
 
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.execute(args, ctx))) {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => ToolOutput {
-            content: format!("Error: {}", e),
-            truncated: false,
-            original_size: 0,
-            exit_code: Some(1),
-        },
-        Err(_) => ToolOutput {
-            content: format!("Error: Tool '{}' panicked", name),
-            truncated: false,
-            original_size: 0,
-            exit_code: Some(1),
-        },
+        Ok(ToolOutput::Done(result)) => result,
+        Ok(ToolOutput::PendingLsp { .. }) => {
+            Err("unexpected PendingLsp from tool that doesn't implement LSP".into())
+        }
+        Err(_) => Err(format!("Tool '{}' panicked", name)),
     }
 }
 
-fn format_tool_output(output: &ToolOutput) -> String {
-    if output.truncated {
-        let preview: String = output.content.chars().take(2000).collect();
-        format!(
-            "{}\n\n(Output truncated: was {} bytes)",
-            preview, output.original_size
-        )
-    } else {
-        output.content.clone()
-    }
-}
+fn notify_lsp_saves(
+    ctx: &mut crate::tools::ToolContext,
+    lsp_cfg: &LspConfig,
+    dirty: &[std::path::PathBuf],
+    pending_tools: &[PendingLspTool],
+) -> (u64, u64) {
+    let mut max_timeout = 5000u64;
+    let mut max_silence = 500u64;
+    let mut resolved_lang_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-fn preview_tool_output(output: &ToolOutput) -> String {
-    if output.truncated {
-        let preview: String = output.content.chars().take(2000).collect();
-        format!(
-            "{}... (truncated, was {} bytes)",
-            preview, output.original_size
-        )
-    } else {
-        output.content.clone()
+    for lang_id in pending_tools.iter().map(|p| p.lang_id.clone()) {
+        resolved_lang_ids.insert(lang_id);
     }
+
+    let mut lang_groups: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
+        std::collections::HashMap::new();
+    for path in dirty {
+        if let Some(lang_id) = detect_language(path) {
+            lang_groups.entry(lang_id.to_string()).or_default().push(path.clone());
+        }
+    }
+
+    for (lang_id, paths) in lang_groups {
+        resolved_lang_ids.insert(lang_id.clone());
+
+        if ctx.lsp_clients.contains_key(&lang_id) {
+            if let Some(client) = ctx.lsp_clients.get_mut(&lang_id) {
+                for p in &paths {
+                    client.notify_saved(p);
+                }
+            }
+            continue;
+        }
+
+        let server_cfg = lsp_cfg.servers.iter()
+            .find(|s| s.language == lang_id)
+            .cloned()
+            .or_else(|| default_server(&lang_id));
+
+        let Some(ref cfg) = server_cfg else {
+            warn!("No LSP server config for language '{}'", lang_id);
+            continue;
+        };
+
+        if !binary_exists(&cfg.command) {
+            warn!("LSP binary '{}' not found for language '{}'", cfg.command, lang_id);
+            continue;
+        }
+
+        let root_uri = format!("file://{}", ctx.cwd.display());
+        match LspClient::spawn(&lang_id, &cfg.command, &cfg.args, &root_uri, cfg.timeout_ms) {
+            Ok(client) => {
+                info!("Started LSP client for language '{}'", lang_id);
+                max_timeout = max_timeout.max(cfg.timeout_ms);
+                max_silence = max_silence.max(cfg.silence_ms);
+                ctx.lsp_clients.insert(lang_id.clone(), client);
+                if let Some(client) = ctx.lsp_clients.get_mut(&lang_id) {
+                    for p in &paths {
+                        client.notify_saved(p);
+                    }
+                }
+            }
+            Err(e) => warn!("Failed to start LSP client for '{}': {}", lang_id, e),
+        }
+    }
+
+    for lang_id in &resolved_lang_ids {
+        if ctx.lsp_clients.contains_key(lang_id) {
+            let cfg = lsp_cfg.servers.iter()
+                .find(|s| s.language == *lang_id)
+                .cloned()
+                .or_else(|| default_server(lang_id));
+            if let Some(c) = &cfg {
+                max_timeout = max_timeout.max(c.timeout_ms);
+                max_silence = max_silence.max(c.silence_ms);
+            }
+        }
+    }
+
+    (max_timeout, max_silence)
 }
 
 pub fn process_chunk(
@@ -308,7 +367,7 @@ pub fn process_chunk(
         for tc_delta in &chunk.tool_call_delta {
             let idx = tc_delta.index.unwrap_or(0) as usize;
             while tool_calls_buf.len() <= idx {
-                tool_calls_buf.push(ToolCallBuilder::default());
+                tool_calls_buf.push(agent_core::types::ToolCallBuilder::default());
             }
             let builder = &mut tool_calls_buf[idx];
             if let Some(id) = &tc_delta.id {
@@ -336,6 +395,7 @@ pub fn finish_response(
     tools: &[Box<dyn crate::tools::Tool>],
     ctx: &mut crate::tools::ToolContext,
     out: &mut BufWriter<std::io::Stdout>,
+    lsp_cfg: &LspConfig,
 ) -> AgentState {
     let AgentState::Streaming {
         mut messages,
@@ -347,6 +407,7 @@ pub fn finish_response(
         mut tool_call_round,
         mut tool_calls_this_turn,
         mut consecutive_failures,
+        lsp_wait: _,
     } = state
     else {
         return AgentState::Idle;
@@ -374,6 +435,7 @@ pub fn finish_response(
 
             tool_call_round += 1;
             let max_per_turn = session_cfg.max_tool_calls_per_turn;
+            let mut pending_lsp_tools: Vec<PendingLspTool> = Vec::new();
 
             for call in &completed_calls {
                 tool_calls_this_turn += 1;
@@ -392,57 +454,127 @@ pub fn finish_response(
                     },
                 );
 
-                let result = execute_tool(tools, &call.name, &call.arguments, ctx);
-
-                if result.exit_code.unwrap_or(0) != 0 {
-                    consecutive_failures += 1;
-                    if consecutive_failures >= 3 {
-                        warn!("3 consecutive tool failures for tree {}", tree_id);
-                        emit_error(out, "3 consecutive tool failures, aborting turn".into(), false);
-                        emit_event(out, ServerEvent::Done { status: "error".into() });
-                        return AgentState::Idle;
+                let tool = tools.iter().find(|t| t.definition().name == call.name);
+                let tool = match tool {
+                    Some(t) => t,
+                    None => {
+                        emit_event(out, ServerEvent::ToolResult {
+                            tool: call.name.clone(), exit: 1,
+                            output: format!("Unknown tool '{}'", call.name),
+                        });
+                        let err_msg = make_tool_result_message(&call.id, &call.name, &Err(format!("Unknown tool '{}'", call.name)));
+                        let result_msg_id = agent_core::util::generate_entry_id();
+                        write_message_entry(store, tree_id, out, &result_msg_id, leaf_id.as_deref(), &err_msg);
+                        leaf_id = Some(result_msg_id);
+                        messages.push(err_msg);
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 3 {
+                            warn!("3 consecutive tool failures for tree {}", tree_id);
+                            emit_error(out, "3 consecutive tool failures, aborting turn".into(), false);
+                            emit_event(out, ServerEvent::Done { status: "error".into() });
+                            return AgentState::Idle;
+                        }
+                        continue;
                     }
-                } else {
-                    consecutive_failures = 0;
-                }
+                };
 
-                emit_event(
-                    out,
-                    ServerEvent::ToolResult {
-                        tool: call.name.clone(),
-                        exit: result.exit_code.unwrap_or(0),
-                        output: preview_tool_output(&result),
-                    },
-                );
-
-                if call.name == "bash" {
-                    let exit_code = result.exit_code.unwrap_or(0);
-                    let bash_entry = Entry::BashExec {
-                        id: agent_core::util::generate_entry_id(),
-                        parent_id: leaf_id.clone(),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        command: call
-                            .arguments
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        output: result.content.clone(),
-                        exit_code,
-                        truncated: result.truncated,
-                        duration_ms: None,
-                    };
-                    if let Err(e) = store.append_entry(tree_id, &bash_entry) {
-                        error!("Failed to append bash_exec: {}", e);
+                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.execute(&call.arguments, ctx))) {
+                    Ok(output) => output,
+                    Err(_) => {
+                        emit_event(out, ServerEvent::ToolResult {
+                            tool: call.name.clone(), exit: 1,
+                            output: format!("Tool '{}' panicked", call.name),
+                        });
+                        let err_msg = make_tool_result_message(&call.id, &call.name, &Err(format!("Tool '{}' panicked", call.name)));
+                        let result_msg_id = agent_core::util::generate_entry_id();
+                        write_message_entry(store, tree_id, out, &result_msg_id, leaf_id.as_deref(), &err_msg);
+                        leaf_id = Some(result_msg_id);
+                        messages.push(err_msg);
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 3 {
+                            warn!("3 consecutive tool failures for tree {}", tree_id);
+                            emit_error(out, "3 consecutive tool failures, aborting turn".into(), false);
+                            emit_event(out, ServerEvent::Done { status: "error".into() });
+                            return AgentState::Idle;
+                        }
+                        continue;
                     }
-                    emit_event(out, ServerEvent::Entry(bash_entry));
-                }
+                };
 
-                let tool_result_msg = make_tool_result_message(&result, call);
-                let result_msg_id = agent_core::util::generate_entry_id();
-                write_message_entry(store, tree_id, out, &result_msg_id, leaf_id.as_deref(), &tool_result_msg);
-                leaf_id = Some(result_msg_id);
-                messages.push(tool_result_msg);
+                match result {
+                    ToolOutput::Done(res) => {
+                        let is_error = res.is_err();
+                        if is_error {
+                            consecutive_failures += 1;
+                            if consecutive_failures >= 3 {
+                                warn!("3 consecutive tool failures for tree {}", tree_id);
+                                emit_error(out, "3 consecutive tool failures, aborting turn".into(), false);
+                                emit_event(out, ServerEvent::Done { status: "error".into() });
+                                return AgentState::Idle;
+                            }
+                        } else {
+                            consecutive_failures = 0;
+                        }
+
+                        let content = match &res {
+                            Ok(c) => c.clone(),
+                            Err(e) => e.clone(),
+                        };
+
+                        emit_event(
+                            out,
+                            ServerEvent::ToolResult {
+                                tool: call.name.clone(),
+                                exit: if is_error { 1 } else { 0 },
+                                output: {
+                                    let preview: String = content.chars().take(2000).collect();
+                                    if content.len() > 2000 {
+                                        format!("{}... (truncated, was {} bytes)", preview, content.len())
+                                    } else {
+                                        content.clone()
+                                    }
+                                },
+                            },
+                        );
+
+                        if call.name == "bash" {
+                            let exit_code = if is_error { 1 } else { parse_exit_code(&content) };
+                            let bash_entry = Entry::BashExec {
+                                id: agent_core::util::generate_entry_id(),
+                                parent_id: leaf_id.clone(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                command: call
+                                    .arguments
+                                    .get("command")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                output: content.clone(),
+                                exit_code,
+                                truncated: content.contains("Output truncated"),
+                                duration_ms: None,
+                            };
+                            if let Err(e) = store.append_entry(tree_id, &bash_entry) {
+                                error!("Failed to append bash_exec: {}", e);
+                            }
+                            emit_event(out, ServerEvent::Entry(bash_entry));
+                        }
+
+                        let tool_result_msg = make_tool_result_message(&call.id, &call.name, &res);
+                        let result_msg_id = agent_core::util::generate_entry_id();
+                        write_message_entry(store, tree_id, out, &result_msg_id, leaf_id.as_deref(), &tool_result_msg);
+                        leaf_id = Some(result_msg_id);
+                        messages.push(tool_result_msg);
+                    }
+                    ToolOutput::PendingLsp { request_id, lang_id } => {
+                        pending_lsp_tools.push(PendingLspTool {
+                            request_id,
+                            lang_id,
+                            tool_name: call.name.clone(),
+                            tool_call_id: call.id.clone(),
+                        });
+                    }
+                }
             }
 
             if consecutive_failures >= 3 || tool_call_round >= max_per_turn {
@@ -459,6 +591,25 @@ pub fn finish_response(
                     emit_event(out, ServerEvent::Done { status: "error".into() });
                 }
                 return AgentState::Idle;
+            }
+
+            // Check if we need LSP wait
+            let dirty = std::mem::take(&mut ctx.lsp_dirty);
+            let needs_lsp_wait = lsp_cfg.enabled && (!dirty.is_empty() || !pending_lsp_tools.is_empty());
+            if needs_lsp_wait {
+                let (timeout_ms, silence_ms) = notify_lsp_saves(ctx, lsp_cfg, &dirty, &pending_lsp_tools);
+                return AgentState::Streaming {
+                    messages, leaf_id,
+                    response_text: String::new(), in_thinking: false,
+                    tool_calls_buf: vec![], finish_reason: None,
+                    tool_call_round, tool_calls_this_turn, consecutive_failures,
+                    lsp_wait: Some(LspWaitState {
+                        deadline: std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms),
+                        silence_until: std::time::Instant::now() + std::time::Duration::from_millis(silence_ms),
+                        silence_ms,
+                        pending_tool_requests: pending_lsp_tools,
+                    }),
+                };
             }
 
             let definitions = collect_tool_definitions(tools);
@@ -491,6 +642,68 @@ pub fn finish_response(
             AgentState::Idle
         }
     }
+}
+
+pub fn resolve_lsp_wait_into(
+    state: AgentState,
+    lsp_clients: &std::collections::HashMap<String, LspClient>,
+    out: &mut BufWriter<std::io::Stdout>,
+    tools: &[Box<dyn crate::tools::Tool>],
+) -> AgentState {
+    let AgentState::Streaming {
+        mut messages, leaf_id, tool_call_round,
+        tool_calls_this_turn, consecutive_failures, ..
+    } = state else { return state };
+
+    let results: Vec<LspFileResult> = lsp_clients.values()
+        .flat_map(|c| c.all_diagnostics())
+        .collect();
+    if !results.is_empty() {
+        messages.push(Message {
+            role: MessageRole::Tool,
+            content: MessageContent::Text(format_diagnostics(&results)),
+            tool_call_id: Some("lsp_diagnostics".to_string()),
+            tool_name: Some("lsp_diagnostics".to_string()),
+            tool_calls: None,
+            usage: None,
+            stop_reason: None,
+            is_error: None,
+        });
+    }
+    let definitions = tools.iter().map(|t| t.definition()).collect();
+    send_llm_request(out, messages.clone(), definitions);
+    AgentState::new_streaming(messages, leaf_id, tool_call_round, tool_calls_this_turn, consecutive_failures)
+}
+
+pub fn resolve_lsp_wait_with_timeout(
+    state: AgentState,
+    ctx: &mut crate::tools::ToolContext,
+    out: &mut BufWriter<std::io::Stdout>,
+    tools: &[Box<dyn crate::tools::Tool>],
+) -> AgentState {
+    let AgentState::Streaming {
+        mut messages, leaf_id, tool_call_round,
+        tool_calls_this_turn, consecutive_failures, lsp_wait: Some(ref wait), ..
+    } = state else { return state };
+
+    for pending in &wait.pending_tool_requests {
+        let err_msg = make_tool_result_message(
+            &pending.tool_call_id, &pending.tool_name,
+            &Err("LSP request timed out".into()),
+        );
+        messages.push(err_msg);
+    }
+
+    resolve_lsp_wait_into(
+        AgentState::Streaming {
+            messages, leaf_id, tool_call_round,
+            tool_calls_this_turn, consecutive_failures,
+            response_text: String::new(), in_thinking: false,
+            tool_calls_buf: vec![], finish_reason: None,
+            lsp_wait: None,
+        },
+        &ctx.lsp_clients, out, tools,
+    )
 }
 
 pub fn cancel_turn(

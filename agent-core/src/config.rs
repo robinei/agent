@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use crate::types::LspConfig;
 
 /// Full server configuration, loaded from `~/.agent/config.toml` and env vars.
 #[derive(Clone, Debug)]
@@ -9,6 +10,7 @@ pub struct Config {
     pub session: SessionConfig,
     pub logging: LoggingConfig,
     pub sandbox: SandboxConfig,
+    pub lsp: LspConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +144,7 @@ impl Default for Config {
                     ],
                 },
             },
+            lsp: LspConfig::default(),
         }
     }
 }
@@ -303,9 +306,37 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
                     .collect();
                 if !paths.is_empty() {
                     cfg.sandbox.defaults.hide = paths;
-                }
+}
+    }
+
+    // [lsp]
+    if let Some(Value::Table(section)) = table.get("lsp") {
+        if let Some(v) = section.get("enabled").and_then(|v| v.as_bool()) {
+            cfg.lsp.enabled = v;
+        }
+        if let Some(Value::Array(servers)) = section.get("servers") {
+            let parsed: Vec<crate::types::LspServerConfig> = servers
+                .iter()
+                .filter_map(|v| {
+                    let t = v.as_table()?;
+                    Some(crate::types::LspServerConfig {
+                        language: t.get("language")?.as_str()?.to_string(),
+                        command: t.get("command")?.as_str()?.to_string(),
+                        args: t.get("args")
+                            .and_then(|a| a.as_array())
+                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .unwrap_or_default(),
+                        timeout_ms: t.get("timeout_ms").and_then(|v| v.as_integer()).map(|v| v as u64).unwrap_or(5000),
+                        silence_ms: t.get("silence_ms").and_then(|v| v.as_integer()).map(|v| v as u64).unwrap_or(500),
+                    })
+                })
+                .collect();
+            if !parsed.is_empty() {
+                cfg.lsp.servers = parsed;
             }
         }
+    }
+}
     }
 }
 
