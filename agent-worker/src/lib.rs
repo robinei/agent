@@ -59,11 +59,12 @@ impl AgentState {
     }
 }
 
-fn drain_stdin_pipe(fd: std::os::fd::RawFd, buf: &mut Vec<u8>) -> Vec<PipeIn> {
+/// Read from stdin fd into buf. Returns false on EOF.
+fn read_stdin_into_buf(fd: std::os::fd::RawFd, buf: &mut Vec<u8>) -> bool {
     let mut tmp = [0u8; 65536];
     loop {
         match nix::unistd::read(fd, &mut tmp) {
-            Ok(0) => break,
+            Ok(0) => return false,
             Ok(n) => buf.extend(&tmp[..n]),
             Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => break,
             Err(e) => {
@@ -72,20 +73,15 @@ fn drain_stdin_pipe(fd: std::os::fd::RawFd, buf: &mut Vec<u8>) -> Vec<PipeIn> {
             }
         }
     }
+    true
+}
 
+/// Parse complete newline-delimited messages from buf without reading from fd.
+fn parse_pipe_messages(buf: &mut Vec<u8>) -> Vec<PipeIn> {
     let mut msgs = Vec::new();
-    loop {
-        let mut newline_pos = None;
-        for (i, &b) in buf.iter().enumerate() {
-            if b == b'\n' {
-                newline_pos = Some(i);
-                break;
-            }
-        }
-        let Some(pos) = newline_pos else { break };
+    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
         let line = String::from_utf8_lossy(&buf[..pos]).to_string();
-        let rest: Vec<u8> = buf[pos + 1..].to_vec();
-        *buf = rest;
+        buf.drain(..=pos);
         if !line.is_empty() {
             match serde_json::from_str(line.trim_end()) {
                 Ok(msg) => msgs.push(msg),
@@ -160,6 +156,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut line = String::new();
     let config = read_config(&mut reader, &mut line)?;
 
+    // BufReader may have pre-fetched bytes beyond the config line; save them before dropping.
+    let mut stdin_buf: Vec<u8> = Vec::new();
+    stdin_buf.extend_from_slice(reader.buffer());
+    drop(reader);
+
     let log_file = config.logging_to_file.as_ref().and_then(|p| p.to_str());
     agent_core::logging::init_logging(log_file, &config.logging_level, config.logging_to_stderr);
     let store = Store::default();
@@ -183,9 +184,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
     ).map_err(|e| format!("stdin set_nonblock: {e}"))?;
 
-    let mut stdin_buf: Vec<u8> = Vec::new();
-
     loop {
+        // Always process any buffered stdin data before polling — this handles
+        // bytes the BufReader pre-fetched as well as data read in previous iterations.
+        let msgs = parse_pipe_messages(&mut stdin_buf);
+        for msg in msgs {
+            dispatch_pipe_in(
+                msg, &mut state, &tree_id, &store,
+                &session_cfg, &tools, &mut ctx, &mut out,
+                &config.lsp,
+            );
+        }
+
         let timeout = match &state {
             AgentState::Streaming { lsp_wait: Some(wait), .. } => {
                 let until = wait.silence_until.min(wait.deadline);
@@ -211,15 +221,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         nix::poll::poll(&mut pollfds, timeout).ok();
 
-        // Drain stdin
-        if pollfds.first().map_or(false, |p| p.revents().map_or(false, |r| r.contains(nix::poll::PollFlags::POLLIN))) {
-            let msgs = drain_stdin_pipe(stdin_fd, &mut stdin_buf);
-            for msg in msgs {
-                dispatch_pipe_in(
-                    msg, &mut state, &tree_id, &store,
-                    &session_cfg, &tools, &mut ctx, &mut out,
-                    &config.lsp,
-                );
+        // Read more stdin data if available; break on EOF.
+        let stdin_flags = pollfds.first()
+            .and_then(|p| p.revents())
+            .unwrap_or(nix::poll::PollFlags::empty());
+        if stdin_flags.intersects(nix::poll::PollFlags::POLLIN | nix::poll::PollFlags::POLLHUP) {
+            let alive = read_stdin_into_buf(stdin_fd, &mut stdin_buf);
+            if !alive {
+                // Drain any remaining complete messages before exiting.
+                let msgs = parse_pipe_messages(&mut stdin_buf);
+                for msg in msgs {
+                    dispatch_pipe_in(
+                        msg, &mut state, &tree_id, &store,
+                        &session_cfg, &tools, &mut ctx, &mut out,
+                        &config.lsp,
+                    );
+                }
+                break;
             }
         }
 
@@ -278,20 +296,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Check stdin EOF (only when idle and no LSP clients/activity)
-        if matches!(state, AgentState::Idle) {
-            let mut tmp = [0u8; 1];
-            match nix::unistd::read(stdin_fd, &mut tmp) {
-                Ok(0) => break,
-                Ok(_) => {
-                    stdin_buf.extend(&tmp);
-                }
-                Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => {}
-                Err(_) => {}
-            }
-        }
-
-        // Re-poll if we had lsp_wait and resolved it, otherwise go to next iteration
+        // Re-poll immediately if lsp_wait was just resolved to a new Streaming state.
         if matches!(state, AgentState::Streaming { lsp_wait: Some(_), .. }) {
             continue;
         }
