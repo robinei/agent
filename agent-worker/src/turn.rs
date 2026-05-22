@@ -656,11 +656,19 @@ pub fn resolve_lsp_wait_into(
         .flat_map(|c| c.all_diagnostics())
         .collect();
     if !results.is_empty() {
+        let diag_text = format_diagnostics(&results);
+        emit_event(out, ServerEvent::ToolResult {
+            tool: "lsp_diagnostics".to_string(),
+            exit: 0,
+            output: diag_text.clone(),
+        });
+        // Inject as a user message — a tool result without a matching tool_use
+        // call would be rejected by the API.
         messages.push(Message {
-            role: MessageRole::Tool,
-            content: MessageContent::Text(format_diagnostics(&results)),
-            tool_call_id: Some("lsp_diagnostics".to_string()),
-            tool_name: Some("lsp_diagnostics".to_string()),
+            role: MessageRole::User,
+            content: MessageContent::Text(format!("[LSP diagnostics]\n{}", diag_text)),
+            tool_call_id: None,
+            tool_name: None,
             tool_calls: None,
             usage: None,
             stop_reason: None,
