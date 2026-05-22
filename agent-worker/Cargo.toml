@@ -13,6 +13,7 @@ regex                  = "1"
 walkdir                = "2"
 unicode-normalization  = "0.1"
 nix                    = { version = "0.29", features = ["signal", "process", "poll", "fs"] }
+ctrlc                  = { version = "3.4", features = ["termination"] }
 lsp-types              = "0.95"
 
 [dev-dependencies]

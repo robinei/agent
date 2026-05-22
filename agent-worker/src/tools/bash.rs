@@ -104,7 +104,7 @@ impl Tool for BashTool {
                 if done_clone.load(Ordering::Relaxed) {
                     return;
                 }
-                if stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) || crate::SIGTERM_RECEIVED.load(Ordering::Relaxed) {
                     cancelled_clone.store(true, Ordering::Relaxed);
                     let pgid = Pid::from_raw(pid);
                     let _ = signal::killpg(pgid, signal::Signal::SIGTERM);

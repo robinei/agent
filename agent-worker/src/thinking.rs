@@ -26,8 +26,15 @@ pub fn split_thinking_chunks(text: &str, in_thinking: &mut bool) -> Vec<Thinking
         } else {
             match rest.find("<think>") {
                 Some(pos) => {
+                    let before = &rest[..pos];
+                    if before.chars().any(|c| !c.is_whitespace()) {
+                        // Non-whitespace text precedes the tag — it's a literal string,
+                        // not a thinking marker. Treat the entire remainder as text.
+                        result.push(ThinkingSegment::Text(rest.to_string()));
+                        break;
+                    }
                     if pos > 0 {
-                        result.push(ThinkingSegment::Text(rest[..pos].to_string()));
+                        result.push(ThinkingSegment::Text(before.to_string()));
                     }
                     *in_thinking = true;
                     rest = &rest[pos + "<think>".len()..];
@@ -92,6 +99,28 @@ mod tests {
         let result = split_thinking_chunks("<think></think>after", &mut in_thinking);
         assert_eq!(result.len(), 1);
         assert!(matches!(&result[0], ThinkingSegment::Text(t) if t == "after"));
+        assert!(!in_thinking);
+    }
+
+    #[test]
+    fn test_split_literal_tag_after_text() {
+        // <think> preceded by non-whitespace is a literal string, not a marker
+        let mut in_thinking = false;
+        let result = split_thinking_chunks("uses `<think>` and `</think>`", &mut in_thinking);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], ThinkingSegment::Text(t) if t == "uses `<think>` and `</think>`"));
+        assert!(!in_thinking);
+    }
+
+    #[test]
+    fn test_split_whitespace_before_tag_is_real() {
+        // Whitespace-only before <think> is still a real thinking marker
+        let mut in_thinking = false;
+        let result = split_thinking_chunks("\n<think>reason</think>answer", &mut in_thinking);
+        assert_eq!(result.len(), 3);
+        assert!(matches!(&result[0], ThinkingSegment::Text(t) if t == "\n"));
+        assert!(matches!(&result[1], ThinkingSegment::Thinking(t) if t == "reason"));
+        assert!(matches!(&result[2], ThinkingSegment::Text(t) if t == "answer"));
         assert!(!in_thinking);
     }
 }

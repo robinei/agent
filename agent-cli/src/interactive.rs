@@ -7,7 +7,6 @@
 //! Ctrl-C is handled via termion raw mode: `Key::Ctrl('c')` is detected directly from key events.
 //! The main input loop and tree-selection prompts all use character-by-character raw input.
 
-use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -183,7 +182,6 @@ fn print_tree_meta(out: &mut impl Write, meta: &TreeMeta, index: usize) {
 fn replay_entries(out: &mut impl Write, entries: &[Entry]) {
     write!(out, "\x1b[?25l").ok();
     let mut in_turn = false;
-    let mut state = RenderState::default();
 
     for entry in entries {
         match entry {
@@ -223,7 +221,7 @@ fn replay_entries(out: &mut impl Write, entries: &[Entry]) {
                     .ok();
                     in_turn = true;
                 }
-                render_event(out, &ServerEvent::Entry(entry.clone()), &mut state);
+                print_entry_summary(out, entry);
             }
         }
     }
@@ -316,40 +314,388 @@ fn print_entry_summary(out: &mut impl Write, entry: &Entry) {
 
 // ── Event rendering ──
 
-#[derive(Default)]
-struct RenderState {
-    _rendered: HashSet<String>,
+// ── Terminal renderer ──
+
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPINNER_INTERVAL_MS: u64 = 80;
+
+struct TerminalRenderer<'a> {
+    out: &'a mut dyn Write,
+    trailing_newlines: u8,
+    in_thinking: bool,
     assistant_header_shown: bool,
     last_tool_args: Option<(String, serde_json::Value)>,
-    in_thinking: bool,
-    /// Consecutive \r\n pairs at the end of the most recent content write.
-    /// Capped at 2. Used to avoid double blank lines when events each add
-    /// a leading separator.
-    trailing_newlines: u8,
-    /// Current column position (chars since the last \n in output).
-    /// Only TextChunk and ThinkingChunk update this; all other events end
-    /// with \r\n so col is reset to 0 by the caller after those events.
+    spinner_active: bool,
     col: usize,
-    spinner_shown: bool,
-    spinner_added_newline: bool, // true when we injected \r\n before the spinner
-    spinner_saved_col: usize,    // col at the time the spinner was drawn
+    spinner_col: usize,
 }
 
-/// Count trailing \r\n pairs in a string (max 2).
-fn count_trailing_crlf(s: &str) -> u8 {
-    let trimmed = s.trim_end_matches("\r\n");
-    (s.len().saturating_sub(trimmed.len()) / 2).min(2) as u8
-}
-
-/// Write a blank-line separator, adding only as many \r\n as needed to reach
-/// exactly one blank line (== 2 consecutive \r\n), given how many are already
-/// at the end of the previous write.
-fn write_blank_line(out: &mut impl Write, trailing: &mut u8) {
-    let needed = 2u8.saturating_sub(*trailing);
-    for _ in 0..needed {
-        write!(out, "\r\n").ok();
+impl<'a> TerminalRenderer<'a> {
+    fn new(out: &'a mut dyn Write) -> Self {
+        Self {
+            out,
+            trailing_newlines: 0,
+            in_thinking: false,
+            assistant_header_shown: false,
+            last_tool_args: None,
+            spinner_active: false,
+            col: 0,
+            spinner_col: 0,
+        }
     }
-    *trailing = 2;
+
+    // ── Text output ──
+
+    fn write_text(&mut self, content: &str) {
+        self.hide_spinner();
+        if self.in_thinking {
+            self.in_thinking = false;
+            let _ = write!(self.out, "{}", style::Reset);
+            self.blank_line_sep();
+            self.assistant_header_shown = true;
+        }
+        if !self.assistant_header_shown {
+            self.assistant_header_shown = true;
+            let _ = write!(self.out, "\r\n");
+            self.trailing_newlines = 1;
+            self.col = 0;
+        }
+        let normalized = normalize_for_raw(content);
+        let _ = write!(self.out, "{}", normalized);
+        let _ = self.out.flush();
+        self.track_newlines(&normalized, content);
+    }
+
+    fn write_thinking(&mut self, content: &str) {
+        self.hide_spinner();
+        if !self.in_thinking {
+            self.in_thinking = true;
+            let _ = write!(self.out, "\r\n{}\x1b[2m", color::Fg(color::LightBlack));
+            self.trailing_newlines = 0;
+            self.col = 0;
+        }
+        let normalized = normalize_for_raw(content);
+        let _ = write!(self.out, "{}", normalized);
+        let _ = self.out.flush();
+        self.track_newlines(&normalized, content);
+    }
+
+    /// Ensure at least one blank line before the next content.
+    fn blank_line_sep(&mut self) {
+        let needed = 2u8.saturating_sub(self.trailing_newlines);
+        for _ in 0..needed {
+            let _ = write!(self.out, "\r\n");
+        }
+        self.trailing_newlines = 2;
+        self.col = 0;
+    }
+
+    // ── Spinner ──
+
+    fn show_spinner(&mut self, frame: char) {
+        self.spinner_col = self.col;
+        let _ = write!(self.out, "\r\n{}{}", style::Reset, frame);
+        let _ = self.out.flush();
+        self.spinner_active = true;
+    }
+
+    fn hide_spinner(&mut self) {
+        if !self.spinner_active {
+            return;
+        }
+        let _ = write!(self.out, "\r\x1b[2K\x1b[1A");
+        if self.spinner_col > 0 {
+            let _ = write!(self.out, "\x1b[{}C", self.spinner_col);
+        }
+        self.col = self.spinner_col;
+        if self.in_thinking {
+            let _ = write!(self.out, "{}\x1b[2m", color::Fg(color::LightBlack));
+        }
+        let _ = self.out.flush();
+        self.spinner_active = false;
+    }
+
+    fn tick_spinner(&mut self, frame: char) {
+        if !self.spinner_active {
+            return;
+        }
+        let _ = write!(self.out, "\r{}{}", style::Reset, frame);
+        let _ = self.out.flush();
+    }
+
+    // ── Internal helpers ──
+
+    fn track_newlines(&mut self, normalized: &str, original: &str) {
+        self.update_col(original);
+        let non_nl = !normalized.trim_end_matches("\r\n").is_empty();
+        if non_nl {
+            self.trailing_newlines = count_trailing_crlf(normalized);
+        } else {
+            self.trailing_newlines =
+                self.trailing_newlines.saturating_add(count_trailing_crlf(normalized)).min(2);
+        }
+    }
+
+    fn update_col(&mut self, text: &str) {
+        let tw = termion::terminal_size().map(|(w, _)| w as usize).unwrap_or(80).max(1);
+        match text.rfind('\n') {
+            Some(pos) => self.col = text[pos + 1..].chars().count() % tw,
+            None => self.col = (self.col + text.chars().count()) % tw,
+        }
+    }
+
+    // ── Event rendering ──
+
+    fn render_event(&mut self, event: &ServerEvent) {
+        match event {
+            ServerEvent::TextChunk { content } => {
+                self.write_text(content);
+            }
+            ServerEvent::ThinkingChunk { content } => {
+                self.write_thinking(content);
+            }
+            ServerEvent::ToolStart { tool, input } => {
+                self.last_tool_args = Some((tool.clone(), input.clone()));
+            }
+            ServerEvent::ToolResult { tool, exit, output } => {
+                self.hide_spinner();
+                if self.in_thinking {
+                    self.in_thinking = false;
+                    let _ = write!(self.out, "{}", style::Reset);
+                }
+                let args_str = self
+                    .last_tool_args
+                    .take()
+                    .map(|(_, input)| format_tool_args(tool, &input))
+                    .unwrap_or_default();
+                self.blank_line_sep();
+                let _ = write!(self.out, "  ⚙ {}{}{}", style::Bold, tool, style::Reset);
+                if !args_str.is_empty() {
+                    let args_display = args_str.replace('\n', "\r\n");
+                    let _ = write!(self.out, "  {}", args_display);
+                }
+                let c = if *exit == 0 {
+                    color::Fg(color::LightBlack).to_string()
+                } else {
+                    color::Fg(color::Red).to_string()
+                };
+                let _ = write!(self.out, "  (exit: {}{}{})\r\n", c, exit, style::Reset);
+                if !output.is_empty() {
+                    let _ = write!(self.out, "{}", color::Fg(color::LightBlack));
+                    print_indented(&mut self.out, output, "│");
+                    let _ = write!(self.out, "{}", style::Reset);
+                }
+                self.trailing_newlines = 1;
+            }
+            ServerEvent::Entry(entry) => {
+                self.hide_spinner();
+                match entry {
+                    Entry::Message { message, .. }
+                        if message.role == agent_core::types::MessageRole::User =>
+                    {
+                        let t = match &message.content {
+                            agent_core::types::MessageContent::Text(t) => t.clone(),
+                            _ => "[content blocks]".into(),
+                        };
+                        let _ = write!(self.out, "\r\n{}▸{} {}\r\n",
+                            color::Fg(color::Green), style::Reset, t);
+                        self.trailing_newlines = 0;
+                    }
+                    Entry::GoalSet { goal, .. } => {
+                        let _ = write!(self.out, "\r\n🎯  {}\r\n", goal);
+                        self.trailing_newlines = 0;
+                    }
+                    Entry::ModelSet { model, .. } => {
+                        let _ = write!(self.out, "\r\n🤖  Model: {}\r\n", model);
+                        self.trailing_newlines = 0;
+                    }
+                    Entry::SessionEnd { summary, status, .. } => {
+                        let s = summary.as_deref().unwrap_or("");
+                        let _ = write!(self.out,
+                            "\r\n📝 {}Session ended ({:?}){}{}\r\n",
+                            style::Bold, status,
+                            if s.is_empty() { String::new() } else { format!(": {}", s) },
+                            style::Reset);
+                        self.trailing_newlines = 0;
+                    }
+                    Entry::Message { message, .. } => {
+                        let t = match &message.content {
+                            agent_core::types::MessageContent::Text(t) => t.clone(),
+                            _ => "[content blocks]".into(),
+                        };
+                        if !t.is_empty() {
+                            let role_label = match message.role {
+                                agent_core::types::MessageRole::Assistant => "Assistant",
+                                agent_core::types::MessageRole::System => "System",
+                                agent_core::types::MessageRole::Tool => "Tool",
+                                _ => "",
+                            };
+                            let _ = write!(self.out, "\r\n");
+                            if !role_label.is_empty() {
+                                let _ = write!(self.out,
+                                    "{}  {}:{}\r\n",
+                                    color::Fg(color::Cyan), role_label, style::Reset);
+                            }
+                            let _ = write!(self.out, "{}\r\n", t);
+                            self.trailing_newlines = 0;
+                        }
+                    }
+                    Entry::BashExec { command, output, exit_code, .. } => {
+                        let _ = write!(self.out, "\r\n{}  🛠  {}bash: {}{}\r\n",
+                            color::Fg(color::Yellow), style::Bold, command, style::Reset);
+                        let c = if *exit_code == 0 {
+                            color::Fg(color::Green).to_string()
+                        } else {
+                            color::Fg(color::Red).to_string()
+                        };
+                        let _ = write!(self.out, "{}  bash (exit: {}){}\r\n", c, exit_code, style::Reset);
+                        if !output.is_empty() {
+                            print_indented(&mut self.out, output, "│");
+                        }
+                        self.trailing_newlines = 0;
+                    }
+                    _ => {}
+                }
+            }
+            ServerEvent::CapWarning { level, pct } => {
+                self.hide_spinner();
+                print_warning(&mut self.out, &format!("Context at {}% ({})", pct, level));
+                self.trailing_newlines = 1;
+            }
+            ServerEvent::Notification { level, message } => {
+                self.hide_spinner();
+                if self.in_thinking {
+                    self.in_thinking = false;
+                    let _ = write!(self.out, "{}\r\n", style::Reset);
+                }
+                let text = normalize_for_raw(message);
+                match level {
+                    NotificationLevel::Info => {
+                        let _ = write!(self.out, "{}  {}{}\r\n", color::Fg(color::Yellow), text, style::Reset);
+                    }
+                    NotificationLevel::Warning => {
+                        let _ = write!(self.out, "{}  {}{}\r\n", color::Fg(color::Rgb(190, 90, 90)), text, style::Reset);
+                    }
+                    NotificationLevel::Error => {
+                        let _ = write!(self.out, "{}{}  Error: {}{}\r\n", color::Fg(color::Red), style::Bold, text, style::Reset);
+                    }
+                    NotificationLevel::Fatal => {
+                        let _ = write!(self.out, "{}{}  Fatal: {}{}\r\n", color::Fg(color::Red), style::Bold, text, style::Reset);
+                    }
+                }
+                self.trailing_newlines = 0;
+            }
+            ServerEvent::Diagnostics { source, files } => {
+                self.hide_spinner();
+                if self.in_thinking {
+                    self.in_thinking = false;
+                    let _ = write!(self.out, "{}", style::Reset);
+                }
+                use agent_core::types::DiagnosticSeverity;
+
+                fn sev_color_label(sev: Option<DiagnosticSeverity>) -> (&'static str, &'static str) {
+                    match sev {
+                        Some(DiagnosticSeverity::Error)       => ("\x1b[31m",    "error  "),
+                        Some(DiagnosticSeverity::Warning)     => ("\x1b[33m",    "warning"),
+                        Some(DiagnosticSeverity::Information) => ("\x1b[36m",    "info   "),
+                        _                                     => ("\x1b[90m",    "hint   "),
+                    }
+                }
+
+                fn seen_summary(errors: u32, warnings: u32) -> String {
+                    match (errors, warnings) {
+                        (0, 0) => String::new(),
+                        (e, 0) => format!("{} seen error{}", e, if e == 1 { "" } else { "s" }),
+                        (0, w) => format!("{} seen warning{}", w, if w == 1 { "" } else { "s" }),
+                        (e, w) => format!("{} seen error{}, {} seen warning{}", e, if e == 1 { "" } else { "s" }, w, if w == 1 { "" } else { "s" }),
+                    }
+                }
+
+                let new_errors: usize = files.iter().flat_map(|f| &f.diagnostics)
+                    .filter(|d| matches!(d.severity, Some(DiagnosticSeverity::Error))).count();
+                let new_warnings: usize = files.iter().flat_map(|f| &f.diagnostics)
+                    .filter(|d| matches!(d.severity, Some(DiagnosticSeverity::Warning))).count();
+
+                let header_color = if new_errors > 0 { "\x1b[31m" }
+                    else if new_warnings > 0 { "\x1b[33m" }
+                    else { "\x1b[90m" };
+
+                self.blank_line_sep();
+                let _ = write!(self.out, "  {}◈\x1b[m {}\r\n", header_color, lang_display(source));
+
+                for file in files {
+                    let display_path = std::path::Path::new(&file.path)
+                        .file_name().and_then(|n| n.to_str()).unwrap_or(&file.path);
+                    let _ = write!(self.out, "    \x1b[1m{}\x1b[m\r\n", display_path);
+
+                    let line_width = file.diagnostics.iter()
+                        .map(|d| (d.range.start.line + 1).to_string().len())
+                        .max().unwrap_or(1);
+                    for diag in &file.diagnostics {
+                        let (col, label) = sev_color_label(diag.severity);
+                        let first_line = diag.message.lines().next().unwrap_or("");
+                        let msg: String = if first_line.chars().count() > 72 {
+                            format!("{}…", first_line.chars().take(71).collect::<String>())
+                        } else {
+                            first_line.to_string()
+                        };
+                        let _ = write!(self.out, "      {}{}\x1b[m \x1b[90m{:>width$}\x1b[m  {}\r\n",
+                            col, label, diag.range.start.line + 1, msg, width = line_width);
+                    }
+
+                    let summary = seen_summary(file.seen_errors, file.seen_warnings);
+                    if !summary.is_empty() {
+                        let _ = write!(self.out, "      \x1b[90m({})\x1b[m\r\n", summary);
+                    }
+                }
+                self.trailing_newlines = 1;
+            }
+            ServerEvent::Done { status } => {
+                self.hide_spinner();
+                if self.in_thinking {
+                    self.in_thinking = false;
+                    let _ = write!(self.out, "{}", style::Reset);
+                }
+                if self.trailing_newlines == 0 {
+                    let _ = write!(self.out, "\r\n");
+                }
+                self.render_done(status);
+            }
+            ServerEvent::FileChanged { path, kind } => {
+                self.hide_spinner();
+                let _ = write!(self.out, "\r\n  📄 {} ({})\r\n", path, kind);
+                self.trailing_newlines = 0;
+            }
+            ServerEvent::MetaUpdate { title } => {
+                self.hide_spinner();
+                if let Some(t) = title {
+                    let _ = write!(self.out, "\r\n  {}Title: {}{}\r\n", style::Bold, t, style::Reset);
+                    self.trailing_newlines = 0;
+                }
+            }
+        }
+    }
+
+    fn render_done(&mut self, status: &str) {
+        match status {
+            "stop" | "complete" | "error" => {}
+            "length" => {
+                let _ = write!(self.out, "\r\n  {}⚠{} Stopped at length limit\r\n",
+                    color::Fg(color::Yellow), style::Reset);
+            }
+            "aborted" => {
+                let _ = write!(self.out, "\r\n  {}✖{} Aborted\r\n",
+                    color::Fg(color::Red), style::Reset);
+            }
+            "cancelled" => {
+                let _ = write!(self.out, "\r\n  {}✋{} Cancelled\r\n",
+                    color::Fg(color::Yellow), style::Reset);
+            }
+            other => {
+                print_warning(&mut self.out, &format!("unknown completion status: {}", other));
+            }
+        }
+    }
 }
 
 /// Normalize bare `\n` to `\r\n` for raw-mode terminal output.
@@ -357,63 +703,10 @@ fn normalize_for_raw(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
-// ── Spinner ──
-
-const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const SPINNER_INTERVAL_MS: u64 = 80;
-
-/// Update col after writing `text` (original content, not yet normalized).
-fn update_col(col: &mut usize, text: &str) {
-    match text.rfind('\n') {
-        Some(pos) => *col = text[pos + 1..].chars().count(),
-        None => *col += text.chars().count(),
-    }
-}
-
-/// Draw the spinner on its own line.  If the cursor is mid-line (col > 0) we
-/// emit a \r\n first so the spinner never shares a line with content.
-fn draw_spinner(out: &mut impl Write, state: &mut RenderState, frame: char) {
-    state.spinner_saved_col = state.col;
-    if state.col > 0 {
-        write!(out, "\r\n").ok();
-        state.spinner_added_newline = true;
-    } else {
-        state.spinner_added_newline = false;
-    }
-    write!(out, "{}{}", style::Reset, frame).ok();
-    state.spinner_shown = true;
-    out.flush().ok();
-}
-
-/// Erase the spinner and reposition the cursor back to where content left off.
-fn erase_spinner(out: &mut impl Write, state: &mut RenderState) {
-    if !state.spinner_shown {
-        return;
-    }
-    write!(out, "\r\x1b[2K").ok(); // clear spinner line, cursor at col 0
-    if state.spinner_added_newline {
-        write!(out, "\x1b[1A").ok(); // up to content line
-        if state.spinner_saved_col > 0 {
-            write!(out, "\x1b[{}C", state.spinner_saved_col).ok(); // right to saved col
-        }
-        state.col = state.spinner_saved_col;
-    } else {
-        state.col = 0;
-    }
-    if state.in_thinking {
-        write!(out, "{}\x1b[2m", color::Fg(color::LightBlack)).ok();
-    }
-    state.spinner_shown = false;
-    out.flush().ok();
-}
-
-/// Advance the spinner frame in place without touching the cursor row above.
-fn tick_spinner(out: &mut impl Write, state: &mut RenderState, frame: char) {
-    if !state.spinner_shown {
-        return;
-    }
-    write!(out, "\r\x1b[2K{}{}", style::Reset, frame).ok();
-    out.flush().ok();
+/// Count trailing \r\n pairs in a string (max 2).
+fn count_trailing_crlf(s: &str) -> u8 {
+    let trimmed = s.trim_end_matches("\r\n");
+    (s.len().saturating_sub(trimmed.len()) / 2).min(2) as u8
 }
 
 fn format_tool_args(tool: &str, input: &serde_json::Value) -> String {
@@ -461,302 +754,6 @@ fn format_tool_args(tool: &str, input: &serde_json::Value) -> String {
                 format!("{}…", &raw[..80])
             } else {
                 raw
-            }
-        }
-    }
-}
-
-fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderState) {
-    match event {
-        ServerEvent::TextChunk { content } => {
-            if state.in_thinking {
-                state.in_thinking = false;
-                write!(out, "{}", style::Reset).ok();
-                // Blank line between thinking and response; also suppress the
-                // assistant_header \r\n below so we don't double-count.
-                write_blank_line(out, &mut state.trailing_newlines);
-                state.assistant_header_shown = true;
-                state.col = 0;
-            }
-            if !state.assistant_header_shown {
-                state.assistant_header_shown = true;
-                write!(out, "\r\n").ok();
-                state.trailing_newlines = 1;
-                state.col = 0;
-            }
-            // Raw mode: `\n` alone leaves the cursor at the same column.
-            // Normalize existing `\r\n` first (so we don't write `\r\r\n`), then
-            // translate bare `\n` to `\r\n`.
-            let normalized = normalize_for_raw(content);
-            write!(out, "{}", normalized).ok();
-            out.flush().ok();
-            update_col(&mut state.col, content);
-            let non_nl = !normalized.trim_end_matches("\r\n").is_empty();
-            if non_nl {
-                state.trailing_newlines = count_trailing_crlf(&normalized);
-            } else {
-                state.trailing_newlines =
-                    state.trailing_newlines.saturating_add(count_trailing_crlf(&normalized)).min(2);
-            }
-        }
-        ServerEvent::ToolStart { tool, input } => {
-            state.last_tool_args = Some((tool.clone(), input.clone()));
-        }
-        ServerEvent::ToolResult { tool, exit, output } => {
-            if state.in_thinking {
-                state.in_thinking = false;
-                write!(out, "{}", style::Reset).ok();
-            }
-            let args_str = state
-                .last_tool_args
-                .take()
-                .map(|(_, input)| format_tool_args(tool, &input))
-                .unwrap_or_default();
-            write_blank_line(out, &mut state.trailing_newlines);
-            write!(out, "  ⚙ {}{}{}", style::Bold, tool, style::Reset).ok();
-            if !args_str.is_empty() {
-                let args_display = args_str.replace('\n', "\r\n");
-                write!(out, "  {}", args_display).ok();
-            }
-            let c = if *exit == 0 {
-                color::Fg(color::LightBlack).to_string()
-            } else {
-                color::Fg(color::Red).to_string()
-            };
-            write!(out, "  (exit: {}{}{})\r\n", c, *exit, style::Reset).ok();
-            if !output.is_empty() {
-                write!(out, "{}", color::Fg(color::LightBlack)).ok();
-                print_indented(out, output, "│");
-                write!(out, "{}", style::Reset).ok();
-            }
-            state.trailing_newlines = 1; // print_indented / exit line ends with \r\n
-        }
-        ServerEvent::Entry(entry) => match entry {
-            Entry::Message { message, .. }
-                if message.role == agent_core::types::MessageRole::User =>
-            {
-                let t = match &message.content {
-                    agent_core::types::MessageContent::Text(t) => t.clone(),
-                    _ => "[content blocks]".into(),
-                };
-                write!(out, "\r\n").ok();
-                write!(
-                    out,
-                    "{}▸{} {}\r\n",
-                    color::Fg(color::Green),
-                    style::Reset,
-                    t
-                )
-                .ok();
-            }
-            Entry::GoalSet { goal, .. } => {
-                write!(out, "\r\n").ok();
-                write!(out, "🎯  {}\r\n", goal).ok();
-            }
-            Entry::ModelSet { model, .. } => {
-                write!(out, "\r\n").ok();
-                write!(out, "🤖  Model: {}\r\n", model).ok();
-            }
-            Entry::SessionEnd {
-                summary, status, ..
-            } => {
-                write!(out, "\r\n").ok();
-                let s = summary.as_deref().unwrap_or("");
-                write!(
-                    out,
-                    "📝 {}Session ended ({:?}){}{}\r\n",
-                    style::Bold,
-                    status,
-                    if s.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {}", s)
-                    },
-                    style::Reset
-                )
-                .ok();
-            }
-            Entry::Message { message, .. } => {
-                let t = match &message.content {
-                    agent_core::types::MessageContent::Text(t) => t.clone(),
-                    _ => "[content blocks]".into(),
-                };
-                if !t.is_empty() {
-                    let role_label = match message.role {
-                        agent_core::types::MessageRole::Assistant => "Assistant",
-                        agent_core::types::MessageRole::System => "System",
-                        agent_core::types::MessageRole::Tool => "Tool",
-                        _ => "",
-                    };
-                    write!(out, "\r\n").ok();
-                    if !role_label.is_empty() {
-                        write!(
-                            out,
-                            "{}  {}:{}\r\n",
-                            color::Fg(color::Cyan),
-                            role_label,
-                            style::Reset
-                        )
-                        .ok();
-                    }
-                    write!(out, "{}\r\n", t).ok();
-                }
-            }
-            Entry::BashExec {
-                command,
-                output,
-                exit_code,
-                ..
-            } => {
-                write!(out, "\r\n").ok();
-                write!(
-                    out,
-                    "{}  🛠  {}bash: {}{}\r\n",
-                    color::Fg(color::Yellow),
-                    style::Bold,
-                    command,
-                    style::Reset
-                )
-                .ok();
-                let c = if *exit_code == 0 {
-                    color::Fg(color::Green).to_string()
-                } else {
-                    color::Fg(color::Red).to_string()
-                };
-                write!(out, "{}  bash (exit: {}){}\r\n", c, exit_code, style::Reset).ok();
-                if !output.is_empty() {
-                    print_indented(out, output, "│");
-                }
-            }
-            _ => {}
-        },
-        ServerEvent::CapWarning { level, pct } => {
-            print_warning(out, &format!("Context at {}% ({})", pct, level));
-        }
-        ServerEvent::Notification { level, message } => {
-            if state.in_thinking {
-                state.in_thinking = false;
-                write!(out, "{}\r\n", style::Reset).ok();
-                state.col = 0;
-            }
-            let text = normalize_for_raw(message);
-            match level {
-                NotificationLevel::Info => {
-                    write!(out, "{}  {}{}\r\n", color::Fg(color::Yellow), text, style::Reset).ok();
-                }
-                NotificationLevel::Warning => {
-                    write!(out, "{}  {}{}\r\n", color::Fg(color::Rgb(190, 90, 90)), text, style::Reset).ok();
-                }
-                NotificationLevel::Error => {
-                    write!(out, "{}{}  Error: {}{}\r\n", color::Fg(color::Red), style::Bold, text, style::Reset).ok();
-                }
-                NotificationLevel::Fatal => {
-                    write!(out, "{}{}  Fatal: {}{}\r\n", color::Fg(color::Red), style::Bold, text, style::Reset).ok();
-                }
-            }
-        }
-        ServerEvent::Diagnostics { source, files } => {
-            if state.in_thinking {
-                state.in_thinking = false;
-                write!(out, "{}", style::Reset).ok();
-            }
-            use agent_core::types::DiagnosticSeverity;
-
-            fn sev_color_label(sev: Option<DiagnosticSeverity>) -> (&'static str, &'static str) {
-                match sev {
-                    Some(DiagnosticSeverity::Error)       => ("\x1b[31m",    "error  "),
-                    Some(DiagnosticSeverity::Warning)     => ("\x1b[33m",    "warning"),
-                    Some(DiagnosticSeverity::Information) => ("\x1b[36m",    "info   "),
-                    _                                     => ("\x1b[90m",    "hint   "),
-                }
-            }
-
-            fn seen_summary(errors: u32, warnings: u32) -> String {
-                match (errors, warnings) {
-                    (0, 0) => String::new(),
-                    (e, 0) => format!("{} seen error{}", e, if e == 1 { "" } else { "s" }),
-                    (0, w) => format!("{} seen warning{}", w, if w == 1 { "" } else { "s" }),
-                    (e, w) => format!("{} seen error{}, {} seen warning{}", e, if e == 1 { "" } else { "s" }, w, if w == 1 { "" } else { "s" }),
-                }
-            }
-
-            let new_errors: usize = files.iter().flat_map(|f| &f.diagnostics)
-                .filter(|d| matches!(d.severity, Some(DiagnosticSeverity::Error))).count();
-            let new_warnings: usize = files.iter().flat_map(|f| &f.diagnostics)
-                .filter(|d| matches!(d.severity, Some(DiagnosticSeverity::Warning))).count();
-
-            let header_color = if new_errors > 0 { "\x1b[31m" }
-                else if new_warnings > 0 { "\x1b[33m" }
-                else { "\x1b[90m" };
-
-            write_blank_line(out, &mut state.trailing_newlines);
-            write!(out, "  {}◈\x1b[m {}\r\n", header_color, lang_display(source)).ok();
-
-            for file in files {
-                let display_path = std::path::Path::new(&file.path)
-                    .file_name().and_then(|n| n.to_str()).unwrap_or(&file.path);
-
-                write!(out, "    \x1b[1m{}\x1b[m\r\n", display_path).ok();
-
-                let line_width = file.diagnostics.iter()
-                    .map(|d| (d.range.start.line + 1).to_string().len())
-                    .max().unwrap_or(1);
-                for diag in &file.diagnostics {
-                    let (col, label) = sev_color_label(diag.severity);
-                    let first_line = diag.message.lines().next().unwrap_or("");
-                    let msg: String = if first_line.chars().count() > 72 {
-                        format!("{}…", first_line.chars().take(71).collect::<String>())
-                    } else {
-                        first_line.to_string()
-                    };
-                    write!(out, "      {}{}\x1b[m \x1b[90m{:>width$}\x1b[m  {}\r\n",
-                        col, label, diag.range.start.line + 1, msg, width = line_width).ok();
-                }
-
-                let summary = seen_summary(file.seen_errors, file.seen_warnings);
-                if !summary.is_empty() {
-                    write!(out, "      \x1b[90m({})\x1b[m\r\n", summary).ok();
-                }
-            }
-            state.trailing_newlines = 1;
-        }
-        ServerEvent::Done { status } => {
-            if state.in_thinking {
-                state.in_thinking = false;
-                write!(out, "{}", style::Reset).ok();
-            }
-            if state.trailing_newlines == 0 {
-                write!(out, "\r\n").ok();
-            }
-            render_done(out, status);
-        }
-        ServerEvent::FileChanged { path, kind } => {
-            write!(out, "\r\n").ok();
-            write!(out, "  📄 {} ({})\r\n", path, kind).ok();
-        }
-        ServerEvent::MetaUpdate { title } => {
-            if let Some(t) = title {
-                write!(out, "\r\n").ok();
-                write!(out, "  {}Title: {}{}\r\n", style::Bold, t, style::Reset).ok();
-            }
-        }
-        ServerEvent::ThinkingChunk { content } => {
-            if !state.in_thinking {
-                state.in_thinking = true;
-                write!(out, "\r\n{}\x1b[2m", color::Fg(color::LightBlack)).ok();
-                state.trailing_newlines = 0;
-                state.col = 0;
-            }
-            let normalized = normalize_for_raw(content);
-            write!(out, "{}", normalized).ok();
-            out.flush().ok();
-            update_col(&mut state.col, content);
-            let non_nl = !normalized.trim_end_matches("\r\n").is_empty();
-            if non_nl {
-                state.trailing_newlines = count_trailing_crlf(&normalized);
-            } else {
-                state.trailing_newlines =
-                    state.trailing_newlines.saturating_add(count_trailing_crlf(&normalized)).min(2);
             }
         }
     }
@@ -1329,7 +1326,7 @@ fn process_message(
     backend: &Backend,
     tree_id: &str,
     text: &str,
-    out: &mut impl Write,
+    out: &mut dyn Write,
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let mut session = backend.connect_session(tree_id)?;
@@ -1340,12 +1337,12 @@ fn process_message(
 
     write!(out, "\x1b[?25l").ok();
 
-    let mut state = RenderState::default();
+    let mut renderer = TerminalRenderer::new(out);
     let mut cancel_signalled = false;
     let mut spin_frame = 0usize;
     let mut last_spin = Instant::now();
 
-    draw_spinner(out, &mut state, SPINNER_FRAMES[spin_frame]);
+    renderer.show_spinner(SPINNER_FRAMES[spin_frame]);
 
     loop {
         // 1. Drain WS events
@@ -1355,36 +1352,26 @@ fn process_message(
                     if matches!(&ev, ServerEvent::Entry(_)) {
                         continue;
                     }
-                    erase_spinner(out, &mut state);
+                    renderer.hide_spinner();
                     let done = matches!(&ev, ServerEvent::Done { .. });
-                    // INTENTIONAL: fatal errors must exit the loop just like Done.
-                    // Without this the dead worker never sends Done and the loop
-                    // spins forever, leaving the terminal frozen with no exit.
                     let fatal = matches!(&ev, ServerEvent::Notification { level: NotificationLevel::Fatal, .. });
-                    render_event(out, &ev, &mut state);
-                    // All events except streaming chunks always end with \r\n.
-                    // ToolStart writes nothing so col is unchanged.
-                    if !matches!(
-                        &ev,
-                        ServerEvent::TextChunk { .. }
-                            | ServerEvent::ThinkingChunk { .. }
-                            | ServerEvent::ToolStart { .. }
-                    ) {
-                        state.col = 0;
+                    renderer.render_event(&ev);
+                    if !matches!(&ev, ServerEvent::TextChunk { .. } | ServerEvent::ThinkingChunk { .. } | ServerEvent::ToolStart { .. }) {
+                        renderer.col = 0;
                     }
                     if done || fatal {
                         return Ok(());
                     }
-                    draw_spinner(out, &mut state, SPINNER_FRAMES[spin_frame]);
+                    renderer.show_spinner(SPINNER_FRAMES[spin_frame]);
                     continue;
                 }
                 TryEvent::Closed => {
-                    erase_spinner(out, &mut state);
+                    renderer.hide_spinner();
                     return Ok(());
                 }
                 TryEvent::Err(e) => {
-                    erase_spinner(out, &mut state);
-                    write!(out, "\r\nws error: {}\r\n", e).ok();
+                    renderer.hide_spinner();
+                    write!(renderer.out, "\r\nws error: {}\r\n", e).ok();
                     return Ok(());
                 }
                 TryEvent::WouldBlock => break,
@@ -1393,8 +1380,8 @@ fn process_message(
 
         // 2. Check Ctrl-C from the outer signal handler
         if stop.load(Ordering::Relaxed) {
-            erase_spinner(out, &mut state);
-            write!(out, "\r\nInterrupted\r\n").ok();
+            renderer.hide_spinner();
+            write!(renderer.out, "\r\nInterrupted\r\n").ok();
             break;
         }
 
@@ -1402,19 +1389,18 @@ fn process_message(
         if !cancel_signalled {
             if let Some(key) = poll_key() {
                 if matches!(key, Key::Esc | Key::Ctrl('c')) {
-                    erase_spinner(out, &mut state);
+                    renderer.hide_spinner();
                     write!(
-                        out,
+                        renderer.out,
                         "\r\n  {}⏸ Cancelling…{}\r\n",
                         color::Fg(color::Yellow),
                         style::Reset
                     )
                     .ok();
-                    out.flush().ok();
+                    renderer.out.flush().ok();
                     let _ = session.send_stop();
                     cancel_signalled = true;
-                    state.col = 0;
-                    draw_spinner(out, &mut state, SPINNER_FRAMES[spin_frame]);
+                    renderer.show_spinner(SPINNER_FRAMES[spin_frame]);
                 }
             }
         }
@@ -1422,15 +1408,12 @@ fn process_message(
         // 4. Animate spinner
         if last_spin.elapsed() >= Duration::from_millis(SPINNER_INTERVAL_MS) {
             spin_frame = (spin_frame + 1) % SPINNER_FRAMES.len();
-            tick_spinner(out, &mut state, SPINNER_FRAMES[spin_frame]);
+            renderer.tick_spinner(SPINNER_FRAMES[spin_frame]);
             last_spin = Instant::now();
         }
 
         // Block until WS data arrives or stdin is ready, waking at least once per
-        // spinner frame so the spinner stays smooth. This replaces the former 20ms
-        // sleep; the socket becoming readable is what actually wakes us up when a
-        // token arrives, so display latency drops from up to 20ms to near-zero.
-        // INTENTIONAL: do not remove this poll or replace it with a bare sleep.
+        // spinner frame so the spinner stays smooth.
         let elapsed = last_spin.elapsed().as_millis() as u64;
         let wait_ms = SPINNER_INTERVAL_MS.saturating_sub(elapsed);
         let timeout = PollTimeout::try_from(wait_ms).unwrap_or(PollTimeout::ZERO);
@@ -1444,6 +1427,7 @@ fn process_message(
     }
     Ok(())
 }
+
 
 // ── Prompt loop ──
 
@@ -2072,24 +2056,17 @@ mod tests {
     #[test]
     fn test_render_tool_suppresses_start() {
         let mut buf = Vec::new();
-        let mut state = RenderState::default();
-        render_event(
-            &mut buf,
-            &ServerEvent::ToolStart {
-                tool: "bash".into(),
-                input: serde_json::json!({"command":"echo hi","description":"test"}),
-            },
-            &mut state,
-        );
-        render_event(
-            &mut buf,
-            &ServerEvent::ToolResult {
-                tool: "bash".into(),
-                exit: 0,
-                output: "hi".into(),
-            },
-            &mut state,
-        );
+        let mut renderer = TerminalRenderer::new(&mut buf as &mut dyn Write);
+        renderer.render_event(&ServerEvent::ToolStart {
+            tool: "bash".into(),
+            input: serde_json::json!({"command":"echo hi","description":"test"}),
+        });
+        renderer.render_event(&ServerEvent::ToolResult {
+            tool: "bash".into(),
+            exit: 0,
+            output: "hi".into(),
+        });
+        drop(renderer);
         let output = String::from_utf8(buf).unwrap();
         assert!(
             output.contains("hi"),
@@ -2104,14 +2081,11 @@ mod tests {
     #[test]
     fn test_render_no_assistant_header() {
         let mut buf = Vec::new();
-        let mut state = RenderState::default();
-        render_event(
-            &mut buf,
-            &ServerEvent::TextChunk {
-                content: "hello world".into(),
-            },
-            &mut state,
-        );
+        let mut renderer = TerminalRenderer::new(&mut buf as &mut dyn Write);
+        renderer.render_event(&ServerEvent::TextChunk {
+            content: "hello world".into(),
+        });
+        drop(renderer);
         let output = String::from_utf8(buf).unwrap();
         assert!(
             output.contains("hello world"),
@@ -2141,42 +2115,32 @@ mod tests {
     #[test]
     fn test_render_thinking_chunk_faint() {
         let mut buf = Vec::new();
-        let mut state = RenderState::default();
-        render_event(
-            &mut buf,
-            &ServerEvent::ThinkingChunk {
-                content: "think".into(),
-            },
-            &mut state,
-        );
+        let mut renderer = TerminalRenderer::new(&mut buf as &mut dyn Write);
+        renderer.render_event(&ServerEvent::ThinkingChunk {
+            content: "think".into(),
+        });
+        assert!(renderer.in_thinking);
+        drop(renderer);
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("\x1b[2m"), "output should contain faint marker");
         assert!(output.contains("think"), "output should contain 'think'");
-        assert!(state.in_thinking);
     }
 
     #[test]
     fn test_render_thinking_resets_on_text() {
         let mut buf = Vec::new();
-        let mut state = RenderState::default();
-        render_event(
-            &mut buf,
-            &ServerEvent::ThinkingChunk {
-                content: "think".into(),
-            },
-            &mut state,
-        );
-        render_event(
-            &mut buf,
-            &ServerEvent::TextChunk {
-                content: "answer".into(),
-            },
-            &mut state,
-        );
+        let mut renderer = TerminalRenderer::new(&mut buf as &mut dyn Write);
+        renderer.render_event(&ServerEvent::ThinkingChunk {
+            content: "think".into(),
+        });
+        renderer.render_event(&ServerEvent::TextChunk {
+            content: "answer".into(),
+        });
+        assert!(!renderer.in_thinking);
+        drop(renderer);
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("\x1b[m"), "output should contain reset, got: {output:?}");
         assert!(output.contains("think"), "output should contain 'think', got: {output:?}");
         assert!(output.contains("answer"), "output should contain 'answer', got: {output:?}");
-        assert!(!state.in_thinking);
     }
 }

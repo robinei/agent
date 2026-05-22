@@ -338,6 +338,8 @@ pub fn process_chunk(
     if let AgentState::Streaming {
         ref mut response_text,
         ref mut in_thinking,
+        ref mut saw_reasoning_field,
+        ref mut thinking_phase_done,
         ref mut tool_calls_buf,
         ref mut finish_reason,
         ..
@@ -345,22 +347,32 @@ pub fn process_chunk(
     {
         if let Some(rc) = &chunk.delta_reasoning {
             if !rc.is_empty() {
+                *saw_reasoning_field = true;
                 emit_event(out, ServerEvent::ThinkingChunk { content: rc.clone() });
             }
         }
 
         if let Some(delta) = &chunk.delta_text {
             if !delta.is_empty() {
-                for segment in split_thinking_chunks(delta, in_thinking) {
-                    match segment {
-                        ThinkingSegment::Thinking(t) => {
-                            emit_event(out, ServerEvent::ThinkingChunk { content: t });
+                if *saw_reasoning_field || *thinking_phase_done {
+                    response_text.push_str(delta);
+                    emit_event(out, ServerEvent::TextChunk { content: delta.clone() });
+                } else {
+                    let was_thinking = *in_thinking;
+                    for segment in split_thinking_chunks(delta, in_thinking) {
+                        match segment {
+                            ThinkingSegment::Thinking(t) => {
+                                emit_event(out, ServerEvent::ThinkingChunk { content: t });
+                            }
+                            ThinkingSegment::Text(t) if !t.is_empty() => {
+                                response_text.push_str(&t);
+                                emit_event(out, ServerEvent::TextChunk { content: t });
+                            }
+                            _ => {}
                         }
-                        ThinkingSegment::Text(t) if !t.is_empty() => {
-                            response_text.push_str(&t);
-                            emit_event(out, ServerEvent::TextChunk { content: t });
-                        }
-                        _ => {}
+                    }
+                    if was_thinking && !*in_thinking {
+                        *thinking_phase_done = true;
                     }
                 }
             }
@@ -404,6 +416,8 @@ pub fn finish_response(
         mut leaf_id,
         response_text,
         in_thinking: _,
+        saw_reasoning_field: _,
+        thinking_phase_done: _,
         tool_calls_buf,
         finish_reason,
         mut tool_call_round,
@@ -612,7 +626,7 @@ pub fn finish_response(
                 let initial_wait_ms = 1000u64.min(timeout_ms);
                 return AgentState::Streaming {
                     messages, leaf_id,
-                    response_text: String::new(), in_thinking: false,
+                    response_text: String::new(), in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
                     tool_calls_buf: vec![], finish_reason: None,
                     tool_call_round, tool_calls_this_turn, consecutive_failures,
                     lsp_wait: Some(LspWaitState {
@@ -623,6 +637,11 @@ pub fn finish_response(
                         dirty_by_call,
                     }),
                 };
+            }
+
+            if crate::SIGTERM_RECEIVED.load(Ordering::Relaxed) {
+                emit_event(out, ServerEvent::Done { status: "aborted".into() });
+                return AgentState::Idle;
             }
 
             let definitions = collect_tool_definitions(tools);
@@ -749,7 +768,7 @@ pub fn resolve_lsp_wait_with_timeout(
         AgentState::Streaming {
             messages, leaf_id, tool_call_round,
             tool_calls_this_turn, consecutive_failures,
-            response_text: String::new(), in_thinking: false,
+            response_text: String::new(), in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
             tool_calls_buf: vec![], finish_reason: None,
             lsp_wait: Some(LspWaitState {
                 pending_tool_requests: vec![],

@@ -8,8 +8,10 @@ mod util;
 
 use std::io::BufWriter;
 use std::os::fd::{AsRawFd, BorrowedFd};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+pub(crate) static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 use log::warn;
 
@@ -28,6 +30,8 @@ pub(crate) enum AgentState {
         leaf_id: Option<String>,
         response_text: String,
         in_thinking: bool,
+        saw_reasoning_field: bool,
+        thinking_phase_done: bool,
         tool_calls_buf: Vec<agent_core::types::ToolCallBuilder>,
         finish_reason: Option<agent_core::types::StopReason>,
         tool_call_round: usize,
@@ -50,6 +54,8 @@ impl AgentState {
             leaf_id,
             response_text: String::new(),
             in_thinking: false,
+            saw_reasoning_field: false,
+            thinking_phase_done: false,
             tool_calls_buf: vec![],
             finish_reason: None,
             tool_call_round,
@@ -164,6 +170,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let log_file = config.logging_to_file.as_ref().and_then(|p| p.to_str());
     agent_core::logging::init_logging(log_file, &config.logging_level, config.logging_to_stderr);
+
+    ctrlc::set_handler(|| SIGTERM_RECEIVED.store(true, Ordering::Relaxed)).ok();
     let store = Store::default();
     let session_cfg = agent_core::config::SessionConfig {
         soft_cap_pct: config.session_soft_cap_pct,
@@ -221,6 +229,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         ).collect();
 
         nix::poll::poll(&mut pollfds, timeout).ok();
+
+        if SIGTERM_RECEIVED.load(Ordering::Relaxed) {
+            if matches!(state, AgentState::Streaming { .. }) {
+                crate::util::emit_event(&mut out, agent_core::types::ServerEvent::Done { status: "aborted".into() });
+            }
+            break;
+        }
 
         // Read more stdin data if available; break on EOF.
         let stdin_flags = pollfds.first()
