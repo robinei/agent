@@ -601,14 +601,19 @@ pub fn finish_response(
             let needs_lsp_wait = lsp_cfg.enabled && (!dirty.is_empty() || !pending_lsp_tools.is_empty());
             if needs_lsp_wait {
                 let (timeout_ms, silence_ms) = notify_lsp_saves(ctx, lsp_cfg, &dirty, &pending_lsp_tools, out);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
                 return AgentState::Streaming {
                     messages, leaf_id,
                     response_text: String::new(), in_thinking: false,
                     tool_calls_buf: vec![], finish_reason: None,
                     tool_call_round, tool_calls_this_turn, consecutive_failures,
                     lsp_wait: Some(LspWaitState {
-                        deadline: std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms),
-                        silence_until: std::time::Instant::now() + std::time::Duration::from_millis(silence_ms),
+                        deadline,
+                        // Start silence_until at deadline so we wait the full
+                        // timeout_ms for the first notification. Once any
+                        // publishDiagnostics arrives, silence_until is reset to
+                        // now + silence_ms (the normal heuristic takes over).
+                        silence_until: deadline,
                         silence_ms,
                         pending_tool_requests: pending_lsp_tools,
                         dirty_by_call,
