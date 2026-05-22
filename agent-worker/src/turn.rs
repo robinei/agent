@@ -601,7 +601,14 @@ pub fn finish_response(
             let needs_lsp_wait = lsp_cfg.enabled && (!dirty.is_empty() || !pending_lsp_tools.is_empty());
             if needs_lsp_wait {
                 let (timeout_ms, silence_ms) = notify_lsp_saves(ctx, lsp_cfg, &dirty, &pending_lsp_tools, out);
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                let now = std::time::Instant::now();
+                let deadline = now + std::time::Duration::from_millis(timeout_ms);
+                // Give the LSP server up to 2s to send its first notification
+                // before the silence heuristic fires. This handles slow cold
+                // starts without waiting the full timeout_ms when the server
+                // never responds. Once any notification arrives, silence_until
+                // resets to now+silence_ms and the normal heuristic takes over.
+                let initial_wait_ms = 2000u64.min(timeout_ms);
                 return AgentState::Streaming {
                     messages, leaf_id,
                     response_text: String::new(), in_thinking: false,
@@ -609,11 +616,7 @@ pub fn finish_response(
                     tool_call_round, tool_calls_this_turn, consecutive_failures,
                     lsp_wait: Some(LspWaitState {
                         deadline,
-                        // Start silence_until at deadline so we wait the full
-                        // timeout_ms for the first notification. Once any
-                        // publishDiagnostics arrives, silence_until is reset to
-                        // now + silence_ms (the normal heuristic takes over).
-                        silence_until: deadline,
+                        silence_until: now + std::time::Duration::from_millis(initial_wait_ms),
                         silence_ms,
                         pending_tool_requests: pending_lsp_tools,
                         dirty_by_call,
