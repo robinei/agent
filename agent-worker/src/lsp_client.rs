@@ -27,6 +27,9 @@ pub struct LspWaitState {
     pub silence_until: Instant,
     pub silence_ms: u64,
     pub pending_tool_requests: Vec<PendingLspTool>,
+    /// Maps (absolute path, tool_call_id) so diagnostics can be appended to
+    /// the tool result that caused them.
+    pub dirty_by_call: Vec<(std::path::PathBuf, String)>,
 }
 
 pub struct LspClient {

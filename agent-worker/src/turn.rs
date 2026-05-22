@@ -437,6 +437,7 @@ pub fn finish_response(
             tool_call_round += 1;
             let max_per_turn = session_cfg.max_tool_calls_per_turn;
             let mut pending_lsp_tools: Vec<PendingLspTool> = Vec::new();
+            let mut dirty_by_call: Vec<(std::path::PathBuf, String)> = Vec::new();
 
             for call in &completed_calls {
                 tool_calls_this_turn += 1;
@@ -479,6 +480,7 @@ pub fn finish_response(
                     }
                 };
 
+                let pre_dirty_len = ctx.lsp_dirty.len();
                 let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.execute(&call.arguments, ctx))) {
                     Ok(output) => output,
                     Err(_) => {
@@ -501,6 +503,10 @@ pub fn finish_response(
                         continue;
                     }
                 };
+
+                for path in ctx.lsp_dirty[pre_dirty_len..].iter() {
+                    dirty_by_call.push((path.clone(), call.id.clone()));
+                }
 
                 match result {
                     ToolOutput::Done(res) => {
@@ -605,6 +611,7 @@ pub fn finish_response(
                         silence_until: std::time::Instant::now() + std::time::Duration::from_millis(silence_ms),
                         silence_ms,
                         pending_tool_requests: pending_lsp_tools,
+                        dirty_by_call,
                     }),
                 };
             }
@@ -649,8 +656,10 @@ pub fn resolve_lsp_wait_into(
 ) -> AgentState {
     let AgentState::Streaming {
         mut messages, leaf_id, tool_call_round,
-        tool_calls_this_turn, consecutive_failures, ..
+        tool_calls_this_turn, consecutive_failures, lsp_wait, ..
     } = state else { return state };
+
+    let dirty_by_call = lsp_wait.map(|w| w.dirty_by_call).unwrap_or_default();
 
     let results: Vec<LspFileResult> = lsp_clients.values()
         .flat_map(|c| c.all_diagnostics())
@@ -662,18 +671,37 @@ pub fn resolve_lsp_wait_into(
             exit: 0,
             output: diag_text.clone(),
         });
-        // Inject as a user message — a tool result without a matching tool_use
-        // call would be rejected by the API.
-        messages.push(Message {
-            role: MessageRole::User,
-            content: MessageContent::Text(format!("[LSP diagnostics]\n{}", diag_text)),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: None,
-            usage: None,
-            stop_reason: None,
-            is_error: None,
-        });
+
+        // Group per-file diagnostics and append each to the tool result that
+        // edited that file. Diagnostics for files not in dirty_by_call (e.g.
+        // cross-file type errors) fall back to the last tool result.
+        for file_result in &results {
+            let file_diag = format_diagnostics(std::slice::from_ref(file_result));
+            let suffix = format!("\n\n[LSP diagnostics]\n{}", file_diag);
+
+            // Find the tool_call_id that dirtied this file.
+            let diag_path = lsp_types::Url::parse(&file_result.path)
+                .ok()
+                .and_then(|u| u.to_file_path().ok());
+            let call_id = diag_path.as_ref().and_then(|dp| {
+                dirty_by_call.iter().find(|(p, _)| p == dp).map(|(_, id)| id.as_str())
+            });
+
+            let target = if let Some(id) = call_id {
+                messages.iter_mut().rev().find(|m| m.tool_call_id.as_deref() == Some(id))
+            } else {
+                // Cross-file diagnostic: append to last edit/write result.
+                messages.iter_mut().rev().find(|m| {
+                    matches!(m.tool_name.as_deref(), Some("edit") | Some("write"))
+                })
+            };
+
+            if let Some(msg) = target {
+                if let MessageContent::Text(ref mut t) = msg.content {
+                    t.push_str(&suffix);
+                }
+            }
+        }
     }
     let definitions = tools.iter().map(|t| t.definition()).collect();
     send_llm_request(out, messages.clone(), definitions);
@@ -688,7 +716,7 @@ pub fn resolve_lsp_wait_with_timeout(
 ) -> AgentState {
     let AgentState::Streaming {
         mut messages, leaf_id, tool_call_round,
-        tool_calls_this_turn, consecutive_failures, lsp_wait: Some(ref wait), ..
+        tool_calls_this_turn, consecutive_failures, lsp_wait: Some(wait), ..
     } = state else { return state };
 
     for pending in &wait.pending_tool_requests {
@@ -705,7 +733,11 @@ pub fn resolve_lsp_wait_with_timeout(
             tool_calls_this_turn, consecutive_failures,
             response_text: String::new(), in_thinking: false,
             tool_calls_buf: vec![], finish_reason: None,
-            lsp_wait: None,
+            lsp_wait: Some(LspWaitState {
+                pending_tool_requests: vec![],
+                dirty_by_call: wait.dirty_by_call,
+                ..wait
+            }),
         },
         &ctx.lsp_clients, out, tools,
     )
