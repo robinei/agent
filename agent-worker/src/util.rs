@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use agent_core::rpc::{LlmRequest, PipeOut, WorkerConfig};
 use agent_core::store::Store;
-use agent_core::types::*;
+use agent_core::types::{NotificationLevel, *};
 use log::{error, warn};
 use serde::Deserialize;
 
@@ -68,7 +68,7 @@ pub fn emit_event(out: &mut BufWriter<std::io::Stdout>, event: ServerEvent) {
         ServerEvent::ToolResult { tool, exit, .. } => format!("ToolResult({}, exit={})", tool, exit),
         ServerEvent::Entry(e) => format!("Entry({})", e.id()),
         ServerEvent::CapWarning { level, pct } => format!("CapWarning({},{}%)", level, pct),
-        ServerEvent::Error { message, fatal } => format!("Error(fatal={}, {})", fatal, message),
+        ServerEvent::Notification { level, message } => format!("Notification({:?}, {})", level, message),
         ServerEvent::Done { status } => format!("Done({})", status),
         ServerEvent::FileChanged { path, kind } => format!("FileChanged({},{})", kind, path),
         ServerEvent::MetaUpdate { .. } => "MetaUpdate".into(),
@@ -81,8 +81,8 @@ pub fn emit_event(out: &mut BufWriter<std::io::Stdout>, event: ServerEvent) {
     }
 }
 
-pub fn emit_error(out: &mut BufWriter<std::io::Stdout>, message: String, fatal: bool) {
-    emit_event(out, ServerEvent::Error { message, fatal });
+pub fn emit_notification(out: &mut BufWriter<std::io::Stdout>, level: NotificationLevel, message: String) {
+    emit_event(out, ServerEvent::Notification { level, message });
 }
 
 pub fn send_llm_request(

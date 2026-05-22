@@ -17,8 +17,9 @@ use agent_core::rpc::{LlmResponse, PipeIn, WsCommand};
 use agent_core::store::Store;
 use agent_core::types::{LspConfig, Message};
 
+use agent_core::types::NotificationLevel;
 use crate::turn::{begin_turn, cancel_turn, finish_response, process_chunk, resolve_lsp_wait_into, resolve_lsp_wait_with_timeout};
-use crate::util::{parse_tree_id, read_config, resolve_repo_path};
+use crate::util::{emit_notification, parse_tree_id, read_config, resolve_repo_path};
 
 pub(crate) enum AgentState {
     Idle,
@@ -135,7 +136,7 @@ fn dispatch_pipe_in(
         }
         PipeIn::Llm(LlmResponse::Error { message, .. }) => {
             if matches!(state, AgentState::Streaming { .. }) {
-                crate::util::emit_error(out, message, true);
+                emit_notification(out, NotificationLevel::Fatal, message);
                 *state = AgentState::Idle;
             }
         }

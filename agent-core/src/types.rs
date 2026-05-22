@@ -426,6 +426,15 @@ pub struct DeltaToolCallFunction {
 
 // ── Server events (sent from agent thread to CLI/PWA over SSE) ──
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationLevel {
+    Info,
+    Warning,
+    Error,
+    Fatal,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum ServerEvent {
@@ -451,9 +460,9 @@ pub enum ServerEvent {
     /// Runtime advisory only (never stored).
     #[serde(rename = "cap_warning")]
     CapWarning { level: String, pct: u8 },
-    /// Recoverable or fatal error.
-    #[serde(rename = "error")]
-    Error { message: String, fatal: bool },
+    /// User-visible notification from the worker (info / warning / error / fatal).
+    #[serde(rename = "notification")]
+    Notification { level: NotificationLevel, message: String },
     /// Turn complete — CLI shows prompt.
     #[serde(rename = "done")]
     Done { status: String },

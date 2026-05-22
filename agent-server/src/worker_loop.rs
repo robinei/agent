@@ -154,9 +154,9 @@ pub fn run_event_loop(
                 format!("\n{}", g.iter().cloned().collect::<Vec<_>>().join("\n"))
             }
         };
-        ctx.broadcast(agent_core::types::ServerEvent::Error {
+        ctx.broadcast(agent_core::types::ServerEvent::Notification {
+            level: agent_core::types::NotificationLevel::Fatal,
             message: format!("worker exited unexpectedly{}{}", exit_desc, detail),
-            fatal: true,
         });
         ctx.broadcast(agent_core::types::ServerEvent::Done {
             status: "aborted".into(),

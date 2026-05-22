@@ -19,7 +19,7 @@ use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 use termion::{clear, color, style};
 
-use agent_core::types::{Entry, ServerEvent, TreeMeta};
+use agent_core::types::{Entry, NotificationLevel, ServerEvent, TreeMeta};
 
 use crate::client::TryEvent;
 
@@ -85,6 +85,17 @@ fn parse_input(line: &str) -> CliCommand {
 }
 
 // ── Rendering helpers (raw-mode aware ──
+
+fn print_info(out: &mut impl Write, text: &str) {
+    write!(
+        out,
+        "{}ℹ {}{}\r\n",
+        color::Fg(color::Cyan),
+        text,
+        style::Reset
+    )
+    .ok();
+}
 
 fn print_warning(out: &mut impl Write, text: &str) {
     write!(
@@ -609,16 +620,17 @@ fn render_event(out: &mut impl Write, event: &ServerEvent, state: &mut RenderSta
         ServerEvent::CapWarning { level, pct } => {
             print_warning(out, &format!("Context at {}% ({})", pct, level));
         }
-        ServerEvent::Error { message, fatal } => {
+        ServerEvent::Notification { level, message } => {
             if state.in_thinking {
                 state.in_thinking = false;
                 write!(out, "{}\r\n", style::Reset).ok();
                 state.col = 0;
             }
-            if *fatal {
-                print_error(out, &format!("Fatal: {}", message));
-            } else {
-                print_warning(out, &format!("Error: {}", message));
+            match level {
+                NotificationLevel::Info => print_info(out, message),
+                NotificationLevel::Warning => print_warning(out, message),
+                NotificationLevel::Error => print_warning(out, &format!("Error: {}", message)),
+                NotificationLevel::Fatal => print_error(out, &format!("Fatal: {}", message)),
             }
         }
         ServerEvent::Done { status } => {
@@ -1261,7 +1273,7 @@ fn process_message(
                     // INTENTIONAL: fatal errors must exit the loop just like Done.
                     // Without this the dead worker never sends Done and the loop
                     // spins forever, leaving the terminal frozen with no exit.
-                    let fatal = matches!(&ev, ServerEvent::Error { fatal: true, .. });
+                    let fatal = matches!(&ev, ServerEvent::Notification { level: NotificationLevel::Fatal, .. });
                     render_event(out, &ev, &mut state);
                     // All events except streaming chunks always end with \r\n.
                     // ToolStart writes nothing so col is unchanged.

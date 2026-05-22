@@ -11,7 +11,8 @@ use crate::lsp_client::{
     LspClient, LspFileResult, LspWaitState, PendingLspTool,
 };
 use crate::thinking::{split_thinking_chunks, ThinkingSegment};
-use crate::util::{emit_error, emit_event, send_llm_request, write_message_entry, write_session_end};
+use agent_core::types::NotificationLevel;
+use crate::util::{emit_notification, emit_event, send_llm_request, write_message_entry, write_session_end};
 use crate::AgentState;
 use crate::tools::ToolOutput;
 
@@ -108,7 +109,7 @@ fn check_context_cap(
         );
         if estimated >= hard_cap {
             warn!("Hard cap reached for tree {} (est. {} tokens)", tree_id, estimated);
-            emit_error(out, "Hard context cap reached. Ending session.".into(), false);
+            emit_notification(out, NotificationLevel::Error, "Hard context cap reached. Ending session.".into());
             write_session_end(store, tree_id, out, SessionStatus::Continuing, None);
             return Err(());
         }
@@ -141,11 +142,7 @@ pub fn begin_turn(
         Ok(e) => e,
         Err(e) => {
             error!("Failed to read entries for tree {}: {}", tree_id, e);
-            emit_error(
-                out,
-                format!("Failed to read entries: {}", e),
-                true,
-            );
+            emit_notification(out, NotificationLevel::Fatal, format!("Failed to read entries: {}", e));
             return AgentState::Idle;
         }
     };
@@ -228,6 +225,7 @@ fn notify_lsp_saves(
     lsp_cfg: &LspConfig,
     dirty: &[std::path::PathBuf],
     pending_tools: &[PendingLspTool],
+    out: &mut BufWriter<std::io::Stdout>,
 ) -> (u64, u64) {
     let mut max_timeout = 5000u64;
     let mut max_silence = 500u64;
@@ -268,14 +266,16 @@ fn notify_lsp_saves(
         };
 
         if !binary_exists(&cfg.command) {
-            warn!("LSP binary '{}' not found for language '{}'", cfg.command, lang_id);
+            emit_notification(out, NotificationLevel::Warning,
+                format!("LSP: '{}' not found — skipping diagnostics for {}", cfg.command, lang_id));
             continue;
         }
 
         let root_uri = format!("file://{}", ctx.cwd.display());
         match LspClient::spawn(&lang_id, &cfg.command, &cfg.args, &root_uri, cfg.timeout_ms) {
             Ok(client) => {
-                info!("Started LSP client for language '{}'", lang_id);
+                emit_notification(out, NotificationLevel::Info,
+                    format!("LSP: started {} for {}", cfg.command, lang_id));
                 max_timeout = max_timeout.max(cfg.timeout_ms);
                 max_silence = max_silence.max(cfg.silence_ms);
                 ctx.lsp_clients.insert(lang_id.clone(), client);
@@ -285,7 +285,8 @@ fn notify_lsp_saves(
                     }
                 }
             }
-            Err(e) => warn!("Failed to start LSP client for '{}': {}", lang_id, e),
+            Err(e) => emit_notification(out, NotificationLevel::Warning,
+                format!("LSP: failed to start {} for {}: {}", cfg.command, lang_id, e)),
         }
     }
 
@@ -441,7 +442,7 @@ pub fn finish_response(
                 tool_calls_this_turn += 1;
                 if tool_calls_this_turn > max_per_turn {
                     warn!("Max tool calls per turn reached for tree {}", tree_id);
-                    emit_error(out, format!("Max tool calls per turn ({}) reached", max_per_turn), false);
+                    emit_notification(out, NotificationLevel::Error, format!("Max tool calls per turn ({}) reached", max_per_turn));
                     emit_event(out, ServerEvent::Done { status: "error".into() });
                     return AgentState::Idle;
                 }
@@ -470,7 +471,7 @@ pub fn finish_response(
                         consecutive_failures += 1;
                         if consecutive_failures >= 3 {
                             warn!("3 consecutive tool failures for tree {}", tree_id);
-                            emit_error(out, "3 consecutive tool failures, aborting turn".into(), false);
+                            emit_notification(out, NotificationLevel::Error, "3 consecutive tool failures, aborting turn".into());
                             emit_event(out, ServerEvent::Done { status: "error".into() });
                             return AgentState::Idle;
                         }
@@ -493,7 +494,7 @@ pub fn finish_response(
                         consecutive_failures += 1;
                         if consecutive_failures >= 3 {
                             warn!("3 consecutive tool failures for tree {}", tree_id);
-                            emit_error(out, "3 consecutive tool failures, aborting turn".into(), false);
+                            emit_notification(out, NotificationLevel::Error, "3 consecutive tool failures, aborting turn".into());
                             emit_event(out, ServerEvent::Done { status: "error".into() });
                             return AgentState::Idle;
                         }
@@ -508,7 +509,7 @@ pub fn finish_response(
                             consecutive_failures += 1;
                             if consecutive_failures >= 3 {
                                 warn!("3 consecutive tool failures for tree {}", tree_id);
-                                emit_error(out, "3 consecutive tool failures, aborting turn".into(), false);
+                                emit_notification(out, NotificationLevel::Error, "3 consecutive tool failures, aborting turn".into());
                                 emit_event(out, ServerEvent::Done { status: "error".into() });
                                 return AgentState::Idle;
                             }
@@ -583,11 +584,7 @@ pub fn finish_response(
                         "Max tool call rounds ({}) reached for tree {}",
                         max_per_turn, tree_id
                     );
-                    emit_error(
-                        out,
-                        format!("Max tool call rounds ({}) reached", max_per_turn),
-                        false,
-                    );
+                    emit_notification(out, NotificationLevel::Error, format!("Max tool call rounds ({}) reached", max_per_turn));
                     emit_event(out, ServerEvent::Done { status: "error".into() });
                 }
                 return AgentState::Idle;
@@ -597,7 +594,7 @@ pub fn finish_response(
             let dirty = std::mem::take(&mut ctx.lsp_dirty);
             let needs_lsp_wait = lsp_cfg.enabled && (!dirty.is_empty() || !pending_lsp_tools.is_empty());
             if needs_lsp_wait {
-                let (timeout_ms, silence_ms) = notify_lsp_saves(ctx, lsp_cfg, &dirty, &pending_lsp_tools);
+                let (timeout_ms, silence_ms) = notify_lsp_saves(ctx, lsp_cfg, &dirty, &pending_lsp_tools, out);
                 return AgentState::Streaming {
                     messages, leaf_id,
                     response_text: String::new(), in_thinking: false,

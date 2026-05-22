@@ -56,8 +56,8 @@ impl WorkerCtx {
                 }
                 ServerEvent::Entry(e) => format!("Entry({})", e.id()),
                 ServerEvent::CapWarning { level, pct } => format!("CapWarning({},{}%)", level, pct),
-                ServerEvent::Error { message, fatal } => {
-                    format!("Error(fatal={}, {})", fatal, message)
+                ServerEvent::Notification { level, message } => {
+                    format!("Notification({:?}, {})", level, message)
                 }
                 ServerEvent::Done { status } => format!("Done({})", status),
                 ServerEvent::FileChanged { path, kind } => format!("FileChanged({},{})", kind, path),
