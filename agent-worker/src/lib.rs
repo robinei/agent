@@ -24,7 +24,7 @@ pub(crate) enum AgentState {
         response_text: String,
         in_thinking: bool,
         tool_calls_buf: Vec<agent_core::types::ToolCallBuilder>,
-        finish_reason: Option<String>,
+        finish_reason: Option<agent_core::types::StopReason>,
         tool_call_round: usize,
         tool_calls_this_turn: usize,
         consecutive_failures: usize,

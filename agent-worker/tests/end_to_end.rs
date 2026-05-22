@@ -144,18 +144,18 @@ let mut child = std::process::Command::new(&exe)
                 }
             }
             PipeOut::Llm(_req) => {
-                // Respond with canned SSE chunks as PipeIn::Llm, mimicking the
-                // server's handle_llm_request stub mode.
+                // Respond with canned ChatChunk JSON as PipeIn::Llm, mimicking
+                // the server's provider.parse_stream_event output.
                 let chunks = [
-                    r#"data: {"choices":[{"delta":{"content":"Hello! I am an AI assistant."},"index":0,"finish_reason":null}]}"#,
+                    r#"{"delta_text":"Hello! I am an AI assistant.","delta_reasoning":null,"tool_call_delta":[],"finish_reason":null,"usage":null}"#,
                     "",
-                    r#"data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+                    r#"{"delta_text":null,"delta_reasoning":null,"tool_call_delta":[],"finish_reason":"stop","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
                     "",
                 ];
                 for chunk in &chunks {
                     let resp = PipeIn::Llm(LlmResponse::Chunk {
                         id: 0,
-                        data: format!("{}\n", chunk),
+                        data: chunk.to_string(),
                     });
                     resp_tx
                         .send(serde_json::to_string(&resp).unwrap())

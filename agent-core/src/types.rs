@@ -320,7 +320,7 @@ pub struct ToolCallBuilder {
     pub arguments: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum StopReason {
     #[serde(rename = "stop")]
     Stop,
@@ -330,6 +330,8 @@ pub enum StopReason {
     ToolCalls,
     #[serde(rename = "content_filter")]
     ContentFilter,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -353,29 +355,19 @@ pub enum SessionStatus {
 
 // ── LLM streaming response types ──
 
-#[derive(Deserialize, Clone, Debug)]
+/// Provider-neutral chat chunk. Server parses each provider's wire format
+/// into this shape before sending it across the pipe to the worker.
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatChunk {
-    pub choices: Vec<Choice>,
+    pub delta_text: Option<String>,
+    pub delta_reasoning: Option<String>,
+    #[serde(default)]
+    pub tool_call_delta: Vec<DeltaToolCall>,
+    pub finish_reason: Option<StopReason>,
     pub usage: Option<TokenUsage>,
 }
 
-#[derive(Deserialize, Clone, Debug)]
-pub struct Choice {
-    pub delta: Delta,
-    pub finish_reason: Option<String>,
-    pub index: u32,
-}
-
-#[derive(Deserialize, Clone, Debug)]
-pub struct Delta {
-    pub content: Option<String>,
-    #[serde(default)]
-    pub tool_calls: Vec<DeltaToolCall>,
-    #[serde(default)]
-    pub reasoning: Option<String>,
-}
-
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DeltaToolCall {
     pub index: Option<u32>,
     pub id: Option<String>,
@@ -383,7 +375,7 @@ pub struct DeltaToolCall {
     pub function: DeltaToolCallFunction,
 }
 
-#[derive(Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct DeltaToolCallFunction {
     pub name: Option<String>,
     pub arguments: Option<String>,

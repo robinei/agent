@@ -1,12 +1,12 @@
 use agent_core::store::Store;
 use agent_core::types::*;
 
-use crate::provider::Provider;
+use crate::provider;
 
 /// Auto-generate a title for a tree by asking the LLM.
 pub fn auto_title(
     store: &Store,
-    provider: &Provider,
+    provider: &dyn provider::Provider,
     tree_id: &str,
 ) -> Result<String, String> {
     let entries = store.read_all_entries(tree_id).map_err(|e| e.to_string())?;

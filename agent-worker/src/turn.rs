@@ -255,33 +255,23 @@ pub fn process_chunk(
 
     let trimmed = data.trim();
     log::debug!(
-        "process_chunk raw data: {}",
+        "process_chunk data: {}",
         trimmed.chars().take(160).collect::<String>()
     );
-    if trimmed.is_empty() || trimmed == ":" || trimmed == "data: [DONE]" {
+    if trimmed.is_empty() {
         return;
     }
 
-    let raw = trimmed.strip_prefix("data: ").unwrap_or(trimmed);
-    if raw.is_empty() {
-        return;
-    }
-
-    let chunk: ChatChunk = match serde_json::from_str(raw) {
+    let chunk: ChatChunk = match serde_json::from_str(trimmed) {
         Ok(c) => c,
         Err(e) => {
             warn!(
-                "Failed to parse SSE chunk: {} — raw: {}",
+                "Failed to parse ChatChunk: {} — raw: {}",
                 e,
-                raw.chars().take(120).collect::<String>()
+                trimmed.chars().take(120).collect::<String>()
             );
             return;
         }
-    };
-
-    let choice = match chunk.choices.first() {
-        Some(c) => c,
-        None => return,
     };
 
     if let AgentState::Streaming {
@@ -292,13 +282,13 @@ pub fn process_chunk(
         ..
     } = state
     {
-        if let Some(rc) = &choice.delta.reasoning {
+        if let Some(rc) = &chunk.delta_reasoning {
             if !rc.is_empty() {
                 emit_event(out, ServerEvent::ThinkingChunk { content: rc.clone() });
             }
         }
 
-        if let Some(delta) = &choice.delta.content {
+        if let Some(delta) = &chunk.delta_text {
             if !delta.is_empty() {
                 for segment in split_thinking_chunks(delta, in_thinking) {
                     match segment {
@@ -315,7 +305,7 @@ pub fn process_chunk(
             }
         }
 
-        for tc_delta in &choice.delta.tool_calls {
+        for tc_delta in &chunk.tool_call_delta {
             let idx = tc_delta.index.unwrap_or(0) as usize;
             while tool_calls_buf.len() <= idx {
                 tool_calls_buf.push(ToolCallBuilder::default());
@@ -332,10 +322,8 @@ pub fn process_chunk(
             }
         }
 
-        if let Some(reason) = &choice.finish_reason {
-            if !reason.is_empty() {
-                *finish_reason = Some(reason.clone());
-            }
+        if let Some(reason) = chunk.finish_reason {
+            *finish_reason = Some(reason);
         }
     }
 }
@@ -364,10 +352,8 @@ pub fn finish_response(
         return AgentState::Idle;
     };
 
-    let reason = finish_reason.as_deref().unwrap_or("stop");
-
-    match reason {
-        "tool_calls" => {
+    match finish_reason.unwrap_or(StopReason::Stop) {
+        StopReason::ToolCalls => {
             let completed_calls: Vec<ToolCall> = tool_calls_buf
                 .iter()
                 .map(|b| ToolCall {
@@ -480,8 +466,9 @@ pub fn finish_response(
 
             AgentState::new_streaming(messages, leaf_id, tool_call_round, tool_calls_this_turn, consecutive_failures)
         }
-        "stop" | "length" => {
-            emit_event(out, ServerEvent::Done { status: reason.to_string() });
+        reason @ (StopReason::Stop | StopReason::Length) => {
+            let status = if matches!(reason, StopReason::Length) { "length" } else { "stop" };
+            emit_event(out, ServerEvent::Done { status: status.into() });
 
             if !response_text.is_empty() {
                 let msg_id = agent_core::util::generate_entry_id();
@@ -498,9 +485,9 @@ pub fn finish_response(
 
             AgentState::Idle
         }
-        _ => {
-            warn!("Unknown finish reason '{}' for tree {}", reason, tree_id);
-            emit_event(out, ServerEvent::Done { status: reason.to_string() });
+        reason => {
+            warn!("Unhandled finish reason {:?} for tree {}", reason, tree_id);
+            emit_event(out, ServerEvent::Done { status: "stop".into() });
             AgentState::Idle
         }
     }

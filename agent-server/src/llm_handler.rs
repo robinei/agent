@@ -7,7 +7,7 @@ use std::sync::Arc;
 use agent_core::config::Config;
 use agent_core::rpc::{LlmRequest, LlmResponse, PipeIn};
 
-use crate::provider::Provider;
+use crate::provider::{self, Provider, StreamEvent};
 use nix::poll::PollFlags;
 use rustls::pki_types::ServerName;
 
@@ -15,6 +15,7 @@ use crate::worker_ctx::{PollHandler, WorkerCtx};
 
 // ── Transport ──
 
+#[allow(clippy::large_enum_variant)]
 enum LlmTransport {
     Plain(TcpStream),
     Tls {
@@ -70,6 +71,7 @@ pub struct LlmHandler {
     is_chunked: bool,
     chunk_decode: ChunkDecode,
     chunk_size_buf: Vec<u8>,
+    provider: Box<dyn Provider>,
 }
 
 impl LlmHandler {
@@ -80,9 +82,20 @@ impl LlmHandler {
     ) -> Result<Self, String> {
         let base_url = cfg.provider.base_url.trim_end_matches('/');
         let (host, port, base_path) = parse_host_port_path(base_url)?;
-        let path = format!("{}/chat/completions", base_path);
         let addr = format!("{}:{}", host, port);
         let is_tls = base_url.starts_with("https://");
+
+        let prov = provider::create_provider(
+            &cfg.provider.kind,
+            &cfg.provider.base_url,
+            &cfg.provider.api_key,
+            &cfg.provider.model,
+            cfg.provider.enable_thinking,
+            &cfg.provider.reasoning_effort,
+            cfg.provider.max_tokens,
+            cfg.provider.sort.clone(),
+        );
+        let path = format!("{}{}", base_path, prov.endpoint_path());
 
         let tcp = TcpStream::connect(&addr).map_err(|e| format!("connect to {addr}: {e}"))?;
         tcp.set_nonblocking(true)
@@ -98,25 +111,16 @@ impl LlmHandler {
             LlmTransport::Plain(tcp)
         };
 
-        let provider = Provider::new(
-            cfg.provider.base_url.clone(),
-            cfg.provider.api_key.clone(),
-            cfg.provider.model.clone(),
-            cfg.provider.enable_thinking,
-            cfg.provider.reasoning_effort.clone(),
-            cfg.provider.max_tokens,
-            cfg.provider.sort.clone(),
-        );
-        let body = provider.build_body(&req.messages, &req.tools, true);
+        let body = prov.build_body(&req.messages, &req.tools, true);
         let body_str = serde_json::to_string(&body).map_err(|e| format!("json body: {e}"))?;
+        let auth_lines = prov.auth_header_lines();
         let request = format!(
             "POST {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
              Content-Type: application/json\r\n\
-             Authorization: Bearer {}\r\n\
-             Content-Length: {}\r\n\
+             {}Content-Length: {}\r\n\
              Connection: close\r\n\r\n{}",
-            cfg.provider.api_key,
+            auth_lines,
             body_str.len(),
             body_str
         );
@@ -132,6 +136,7 @@ impl LlmHandler {
             is_chunked: false,
             chunk_decode: ChunkDecode::Size,
             chunk_size_buf: Vec::new(),
+            provider: prov,
         })
     }
 
@@ -158,7 +163,7 @@ impl LlmHandler {
         for ch in String::from_utf8_lossy(data).chars() {
             if ch == '\n' {
                 let line = std::mem::take(&mut self.line_buf);
-                if !line.is_empty() && !process_sse_line(ctx, self.req_id, &line) {
+                if !line.is_empty() && !self.handle_sse_line(ctx, &line) {
                     return false;
                 }
             } else {
@@ -166,6 +171,33 @@ impl LlmHandler {
             }
         }
         true
+    }
+
+    fn handle_sse_line(&mut self, ctx: &mut WorkerCtx, line: &str) -> bool {
+        match self.provider.parse_stream_event(line) {
+            StreamEvent::Chunk(chunk) => {
+                let data = serde_json::to_string(&chunk).unwrap_or_default();
+                log::debug!(
+                    "[worker_loop {}] sending ChatChunk -> worker: {}",
+                    ctx.tree_id,
+                    data.chars().take(120).collect::<String>()
+                );
+                ctx.send_pipe_in(&PipeIn::Llm(LlmResponse::Chunk {
+                    id: self.req_id,
+                    data,
+                }));
+                true
+            }
+            StreamEvent::Done => {
+                log::debug!(
+                    "[worker_loop {}] SSE done -> sending Llm::Done",
+                    ctx.tree_id
+                );
+                send_llm_done(ctx, self.req_id);
+                false
+            }
+            StreamEvent::Skip => true,
+        }
     }
 
     fn feed_bytes(&mut self, ctx: &mut WorkerCtx, data: &[u8]) -> bool {
@@ -345,7 +377,8 @@ impl PollHandler for LlmHandler {
                     match self.transport.read(&mut tmp) {
                         Ok(0) => {
                             if !self.line_buf.is_empty() {
-                                process_sse_line(ctx, self.req_id, &self.line_buf);
+                                let line = std::mem::take(&mut self.line_buf);
+                                self.handle_sse_line(ctx, &line);
                             }
                             send_llm_done(ctx, self.req_id);
                             return false;
@@ -358,7 +391,8 @@ impl PollHandler for LlmHandler {
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(e) => {
                             if !self.line_buf.is_empty() {
-                                process_sse_line(ctx, self.req_id, &self.line_buf);
+                                let line = std::mem::take(&mut self.line_buf);
+                                self.handle_sse_line(ctx, &line);
                             }
                             send_llm_error(ctx, self.req_id, &format!("stream error: {e}"));
                             return false;
@@ -403,37 +437,7 @@ fn parse_host_port_path(base_url: &str) -> Result<(String, u16, String), String>
     }
 }
 
-// ── SSE helpers ──
-
-fn process_sse_line(ctx: &mut WorkerCtx, req_id: u64, line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with(':') {
-        return true;
-    }
-    if trimmed == "data: [DONE]" {
-        log::debug!(
-            "[worker_loop {}] SSE [DONE] -> sending Llm::Done",
-            ctx.tree_id
-        );
-        send_llm_done(ctx, req_id);
-        return false;
-    }
-    let data = if let Some(d) = trimmed.strip_prefix("data: ") {
-        d
-    } else {
-        trimmed
-    };
-    log::debug!(
-        "[worker_loop {}] SSE chunk -> worker: {}",
-        ctx.tree_id,
-        data.chars().take(120).collect::<String>()
-    );
-    ctx.send_pipe_in(&PipeIn::Llm(LlmResponse::Chunk {
-        id: req_id,
-        data: format!("{}\n", data),
-    }));
-    true
-}
+// ── Helpers ──
 
 pub fn send_llm_error(ctx: &mut WorkerCtx, req_id: u64, message: &str) {
     log::warn!(

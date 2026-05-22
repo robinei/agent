@@ -115,17 +115,44 @@ pub fn resolve_path(cwd: &Path, requested: &str) -> Result<std::path::PathBuf, S
     };
     let cwd_canonical = std::fs::canonicalize(cwd)
         .map_err(|e| format!("Cannot resolve repo root: {}", e))?;
-    let canonical = std::fs::canonicalize(&joined)
-        .map_err(|_| format!("Path '{}' does not exist", requested))?;
-    if canonical.starts_with(&cwd_canonical) {
-        Ok(canonical)
-    } else {
-        Err(format!(
+
+    // Lexical escape check: resolves `..` without filesystem access so that
+    // traversal attempts against non-existent targets still get the right error.
+    if !normalize_path_lexical(&joined).starts_with(&cwd_canonical) {
+        return Err(format!(
             "Path '{}' is outside the repo root ({})",
             requested,
             cwd_canonical.display()
-        ))
+        ));
     }
+
+    // Canonicalize to resolve symlinks (also confirms the path exists).
+    let canonical = std::fs::canonicalize(&joined)
+        .map_err(|_| format!("Path '{}' does not exist", requested))?;
+
+    // Re-check after symlink resolution to prevent symlink escapes.
+    if !canonical.starts_with(&cwd_canonical) {
+        return Err(format!(
+            "Path '{}' is outside the repo root ({})",
+            requested,
+            cwd_canonical.display()
+        ));
+    }
+
+    Ok(canonical)
+}
+
+fn normalize_path_lexical(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut result = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => { result.pop(); }
+            Component::CurDir => {}
+            c => result.push(c),
+        }
+    }
+    result
 }
 
 /// Truncate output to the given limits, setting `truncated` if exceeded.

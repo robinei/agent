@@ -31,6 +31,8 @@ pub struct ServerConfig {
 
 #[derive(Clone, Debug)]
 pub struct ProviderConfig {
+    /// Provider kind: "openai" (default) or "anthropic".
+    pub kind: String,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -53,6 +55,7 @@ pub struct ProviderConfig {
 
 #[derive(Clone, Debug)]
 pub struct SummaryConfig {
+    pub kind: String,
     pub model: String,
     pub base_url: String,
     pub api_key: String,
@@ -80,6 +83,7 @@ impl Default for Config {
                 port: 8080,
             },
             provider: ProviderConfig {
+                kind: "openai".into(),
                 base_url: "http://localhost:8080/v1".into(),
                 api_key: String::new(),
                 model: "qwen2.5-coder-7b-instruct".into(),
@@ -89,6 +93,7 @@ impl Default for Config {
                 sort: None,
             },
             summary: SummaryConfig {
+                kind: "openai".into(),
                 model: "qwen2.5-coder-1.5b-instruct".into(),
                 base_url: "http://localhost:8080/v1".into(),
                 api_key: String::new(),
@@ -210,6 +215,9 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
 
     // [provider]
     if let Some(Value::Table(section)) = table.get("provider") {
+        if let Some(v) = section.get("kind").and_then(|v| v.as_str()) {
+            cfg.provider.kind = v.to_string();
+        }
         if let Some(v) = section.get("base_url").and_then(|v| v.as_str()) {
             cfg.provider.base_url = v.to_string();
         }
@@ -235,6 +243,9 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
 
     // [summary]
     if let Some(Value::Table(section)) = table.get("summary") {
+        if let Some(v) = section.get("kind").and_then(|v| v.as_str()) {
+            cfg.summary.kind = v.to_string();
+        }
         if let Some(v) = section.get("model").and_then(|v| v.as_str()) {
             cfg.summary.model = v.to_string();
         }

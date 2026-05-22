@@ -126,10 +126,10 @@ mod tests {
     fn test_llm_response_chunk_roundtrip() {
         let resp = LlmResponse::Chunk {
             id: 1,
-            data: "data: {\"key\":\"value\"}\n".into(),
+            data: r#"{"delta_text":"Hello","delta_reasoning":null,"tool_call_delta":[],"finish_reason":null,"usage":null}"#.into(),
         };
         let json = serde_json::to_string(&resp).unwrap();
-        assert_eq!(json, r#"{"kind":"chunk","id":1,"data":"data: {\"key\":\"value\"}\n"}"#);
+        assert_eq!(json, r#"{"kind":"chunk","id":1,"data":"{\"delta_text\":\"Hello\",\"delta_reasoning\":null,\"tool_call_delta\":[],\"finish_reason\":null,\"usage\":null}"}"#);
         let parsed: LlmResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(&parsed, LlmResponse::Chunk { id, .. } if *id == 1));
     }
@@ -189,11 +189,11 @@ mod tests {
     fn test_pipe_in_llm_roundtrip() {
         let resp = LlmResponse::Chunk {
             id: 0,
-            data: "data: {...}\n".into(),
+            data: r#"{"delta_text":"hi","delta_reasoning":null,"tool_call_delta":[],"finish_reason":null,"usage":null}"#.into(),
         };
         let pipe = PipeIn::Llm(resp);
         let json = serde_json::to_string(&pipe).unwrap();
-        assert_eq!(json, r#"{"ch":"llm","msg":{"kind":"chunk","id":0,"data":"data: {...}\n"}}"#);
+        assert_eq!(json, r#"{"ch":"llm","msg":{"kind":"chunk","id":0,"data":"{\"delta_text\":\"hi\",\"delta_reasoning\":null,\"tool_call_delta\":[],\"finish_reason\":null,\"usage\":null}"}}"#);
     }
 
     #[test]

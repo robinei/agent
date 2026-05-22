@@ -15,6 +15,7 @@ use crate::worker_loop;
 
 // ── WorkerMsg ──
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum WorkerMsg {
     NewClient(Box<worker_loop::WsClient>),
@@ -72,16 +73,17 @@ pub fn spawn_auto_title(ctx: &WorkerCtx) {
             if !needs {
                 return;
             }
-            let provider = crate::provider::Provider::new(
-                cfg.summary.base_url.clone(),
-                cfg.summary.api_key.clone(),
-                cfg.summary.model.clone(),
+            let provider = crate::provider::create_provider(
+                &cfg.summary.kind,
+                &cfg.summary.base_url,
+                &cfg.summary.api_key,
+                &cfg.summary.model,
                 false,
-                "medium".into(),
+                "medium",
                 None,
                 None,
             );
-            match crate::auto_title::auto_title(&store, &provider, &tid) {
+            match crate::auto_title::auto_title(&store, &*provider, &tid) {
                 Ok(title) => {
                     let ev = ServerEvent::MetaUpdate { title: Some(title) };
                     let _ = msg_tx.send(WorkerMsg::InjectEvent(ev));

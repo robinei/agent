@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::auto_title;
 use crate::lifecycle;
-use crate::provider::Provider;
+use crate::provider;
 use agent_core::config::Config;
 use agent_core::store::Store;
 use agent_core::types::{Entry, TreeMeta, TreeSandbox};
@@ -217,16 +217,17 @@ fn handle_list_entries(id: &str, store: &Store) -> (u16, Vec<u8>, &'static str) 
 }
 
 fn handle_auto_title(id: &str, store: &Store, config: &Config) -> (u16, Vec<u8>, &'static str) {
-    let provider = Provider::new(
-        config.summary.base_url.clone(),
-        config.summary.api_key.clone(),
-        config.summary.model.clone(),
+    let provider = provider::create_provider(
+        &config.summary.kind,
+        &config.summary.base_url,
+        &config.summary.api_key,
+        &config.summary.model,
         false,
-        "medium".into(),
+        "medium",
         None,
         None,
     );
-    match auto_title::auto_title(store, &provider, id) {
+    match auto_title::auto_title(store, &*provider, id) {
         Ok(title) => {
             lifecycle::broadcast_meta_update(id, Some(title.clone()));
             json(200, &serde_json::json!({"title": title}))
