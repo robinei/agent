@@ -27,23 +27,6 @@ pub fn embed_init(config: Arc<Config>, store: Arc<Store>, to_stderr: bool) {
         Ok(trees) => log::info!("Rebuilt index: {} trees loaded", trees.len()),
         Err(e) => log::warn!("Index rebuild issue: {}", e),
     }
-
-    // Scan for unterminated sessions from a previous unclean shutdown
-    let unterm = store.scan_unterminated();
-    for id in &unterm {
-        log::info!(
-            "[lifecycle] recovering unterminated session for tree {}",
-            id
-        );
-        lifecycle::recover_tree(&store, id);
-    }
-    if !unterm.is_empty() {
-        log::info!(
-            "[lifecycle] cleaned up {} unterminated session(s)",
-            unterm.len()
-        );
-    }
-
 }
 
 /// Bind the TCP listener and run the accept loop (blocks until shutdown signal).

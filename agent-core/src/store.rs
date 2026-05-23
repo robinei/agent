@@ -8,20 +8,6 @@ use log::warn;
 use crate::config::agent_dir;
 use crate::types::{Entry, TreeHeader, TreeId, TreeMeta};
 
-/// Per-file mutex for serializing appends to the same .jsonl file.
-type FileLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
-
-fn with_file_lock<F, T>(file_locks: &FileLocks, id: &str, f: F) -> T
-where
-    F: FnOnce() -> T,
-{
-    let mut locks = file_locks.lock().unwrap_or_else(|e| e.into_inner());
-    let lock = locks.entry(id.to_string()).or_default().clone();
-    drop(locks);
-    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    f()
-}
-
 // ── Error type ──
 
 #[derive(Debug, thiserror::Error)]
@@ -47,7 +33,6 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct Store {
     base_dir: PathBuf,
     index_cache: Arc<Mutex<HashMap<TreeId, TreeMeta>>>,
-    file_locks: FileLocks,
 }
 
 impl Default for Store {
@@ -55,7 +40,6 @@ impl Default for Store {
         Self {
             base_dir: agent_dir(),
             index_cache: Arc::new(Mutex::new(HashMap::new())),
-            file_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -65,7 +49,6 @@ impl Store {
         Self {
             base_dir,
             index_cache: Arc::new(Mutex::new(HashMap::new())),
-            file_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -203,17 +186,15 @@ impl Store {
 
     pub fn append_entry(&self, tree_id: &str, entry: &Entry) -> Result<()> {
         let path = self.jsonl_path(tree_id);
-        with_file_lock(&self.file_locks, tree_id, || -> Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            let mut line = serde_json::to_string(entry)?;
-            line.push('\n');
-            file.write_all(line.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        })
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let mut line = serde_json::to_string(entry)?;
+        line.push('\n');
+        file.write_all(line.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
     }
 
     pub fn read_all_entries(&self, tree_id: &str) -> Result<Vec<Entry>> {
@@ -251,36 +232,6 @@ impl Store {
         }
 
         Ok(entries)
-    }
-
-    /// Scan all trees and return IDs whose last entry is not a `SessionEnd`.
-    /// Used at server startup to detect trees that were interrupted by a crash.
-    pub fn scan_unterminated(&self) -> Vec<String> {
-        let dir = self.tree_dir();
-        if !dir.exists() {
-            return Vec::new();
-        }
-        let dir_entries: Vec<_> = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries.filter_map(|e| e.ok()).collect(),
-            Err(_) => return Vec::new(),
-        };
-        let mut result = Vec::new();
-        for entry in dir_entries {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let tree_id = match path.file_name().and_then(|n| n.to_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-            let entries = self.read_all_entries(&tree_id).unwrap_or_default();
-            match entries.last() {
-                None | Some(Entry::SessionEnd { .. }) => {}
-                _ => result.push(tree_id),
-            }
-        }
-        result
     }
 }
 
@@ -453,77 +404,5 @@ mod tests {
         assert_eq!(header.kind, "meta");
         assert_eq!(header.version, 1);
         assert_eq!(header.id, tree_id);
-    }
-
-    #[test]
-    fn test_scan_unterminated() {
-        let (store, _dir) = make_store("scan_unterm");
-        let id1 = "unterm-001";
-        let id2 = "unterm-002";
-        let id3 = "unterm-003";
-
-        // id1: no entries at all (header only)
-        store.create_tree_file(id1).unwrap();
-        let meta1 = TreeMeta {
-            id: id1.to_string(),
-            parent_id: None,
-            repo_path: None,
-            title: None,
-            created_at: 100,
-            updated_at: 100,
-            leaf_id: None,
-            sandbox: TreeSandbox::default(),
-        };
-        store.save_tree_meta(&meta1).unwrap();
-
-        // id2: session_start + message, no session_end (unterminated)
-        store.create_tree_file(id2).unwrap();
-        let meta2 = TreeMeta {
-            id: id2.to_string(),
-            parent_id: None,
-            repo_path: None,
-            title: None,
-            created_at: 100,
-            updated_at: 100,
-            leaf_id: None,
-            sandbox: TreeSandbox::default(),
-        };
-        store.save_tree_meta(&meta2).unwrap();
-        store.append_entry(id2, &Entry::SessionStart {
-            id: "s1".into(), parent_id: None, timestamp: "t1".into(),
-        }).unwrap();
-        store.append_entry(id2, &Entry::Message {
-            id: "m1".into(), parent_id: Some("s1".into()), timestamp: "t2".into(),
-            message: Message { role: MessageRole::User, content: MessageContent::Text("hi".into()),
-                tool_calls: None, tool_call_id: None, tool_name: None, usage: None,
-                stop_reason: None, is_error: None },
-        }).unwrap();
-
-        // id3: session_start + session_end (properly terminated)
-        store.create_tree_file(id3).unwrap();
-        let meta3 = TreeMeta {
-            id: id3.to_string(),
-            parent_id: None,
-            repo_path: None,
-            title: None,
-            created_at: 100,
-            updated_at: 100,
-            leaf_id: None,
-            sandbox: TreeSandbox::default(),
-        };
-        store.save_tree_meta(&meta3).unwrap();
-        store.append_entry(id3, &Entry::SessionStart {
-            id: "s2".into(), parent_id: None, timestamp: "t3".into(),
-        }).unwrap();
-        store.append_entry(id3, &Entry::SessionEnd {
-            id: "e1".into(), parent_id: Some("s2".into()), timestamp: "t4".into(),
-            summary: Some("done".into()), status: SessionStatus::Completed,
-            continuation_brief: None,
-        }).unwrap();
-
-        let unterm = store.scan_unterminated();
-        assert!(unterm.contains(&id2.to_string()), "id2 should be unterminated");
-        assert!(!unterm.contains(&id1.to_string()), "id1 (no entries) should not be unterminated");
-        assert!(!unterm.contains(&id3.to_string()), "id3 (has session_end) should not be unterminated");
     }
 }

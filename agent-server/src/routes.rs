@@ -7,7 +7,7 @@ use crate::lifecycle;
 use crate::provider;
 use agent_core::config::Config;
 use agent_core::store::Store;
-use agent_core::types::{Entry, TreeMeta, TreeSandbox};
+use agent_core::types::{TreeMeta, TreeSandbox};
 
 #[derive(Deserialize)]
 pub struct CreateTreeBody {
@@ -89,10 +89,6 @@ fn handle_create_tree(body: &[u8], store: &Store, cfg: &Config) -> (u16, Vec<u8>
     };
 
     let now = chrono::Utc::now().timestamp();
-    let model = body
-        .model
-        .clone()
-        .unwrap_or_else(|| "qwen2.5-coder-7b-instruct".to_string());
 
     let meta = TreeMeta {
         id: tree_id.clone(),
@@ -110,38 +106,6 @@ fn handle_create_tree(body: &[u8], store: &Store, cfg: &Config) -> (u16, Vec<u8>
             500,
             &serde_json::json!({"error": format!("failed to create tree file: {}", e)}),
         );
-    }
-
-    let session_start_id = agent_core::util::generate_entry_id();
-    let session_start = Entry::SessionStart {
-        id: session_start_id.clone(),
-        parent_id: None,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    };
-    if let Err(e) = store.append_entry(&tree_id, &session_start) {
-        return json(
-            500,
-            &serde_json::json!({"error": format!("failed to write session_start: {}", e)}),
-        );
-    }
-
-    let mut meta = meta;
-    meta.leaf_id = Some(session_start_id.clone());
-
-    if body.model.is_some() {
-        let model_set = Entry::ModelSet {
-            id: agent_core::util::generate_entry_id(),
-            parent_id: Some(session_start_id),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            model: model.clone(),
-        };
-        if let Err(e) = store.append_entry(&tree_id, &model_set) {
-            return json(
-                500,
-                &serde_json::json!({"error": format!("failed to write model_set: {}", e)}),
-            );
-        }
-        meta.leaf_id = model_set.id().to_string().into();
     }
 
     if let Err(e) = store.save_tree_meta(&meta) {
@@ -254,6 +218,7 @@ fn not_found() -> (u16, Vec<u8>, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::types::Entry;
     use tempfile::TempDir;
 
     #[test]
@@ -324,7 +289,8 @@ mod tests {
         let (status, body, _) = dispatch("GET", &entries_path, &[], &store, &cfg);
         assert_eq!(status, 200);
         let entries: Vec<Entry> = serde_json::from_slice(&body).unwrap();
-        assert!(entries.iter().any(|e| matches!(e, Entry::SessionStart { .. })));
+        // Worker writes SessionStart on connect; a freshly-created tree has no entries.
+        assert!(entries.is_empty(), "new tree should have no entries");
     }
 
     #[test]

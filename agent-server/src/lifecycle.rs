@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use agent_core::config::Config;
 use agent_core::store::Store;
-use agent_core::types::{Entry, ServerEvent, TreeId, TreeMeta};
+use agent_core::types::{ServerEvent, TreeId, TreeMeta};
 
 use crate::worker_loop;
 
@@ -373,61 +373,7 @@ pub fn worker_stop(tree_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn recover_tree(store: &Store, tree_id: &str) {
-    let meta = match store.get_tree(tree_id) {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            log::warn!(
-                "[lifecycle] recover_tree: tree {} not found, skipping",
-                tree_id
-            );
-            return;
-        }
-        Err(e) => {
-            log::error!(
-                "[lifecycle] recover_tree: failed to read meta for {}: {}",
-                tree_id,
-                e
-            );
-            return;
-        }
-    };
-
-    let parent_id = meta.leaf_id.clone();
-    if parent_id.is_none() {
-        log::info!(
-            "[lifecycle] recover_tree: tree {} has no leaf_id, nothing to recover",
-            tree_id
-        );
-        return;
-    }
-
-    let new_id = agent_core::util::generate_entry_id();
-    let entry = Entry::SessionEnd {
-        id: new_id.clone(),
-        parent_id,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        summary: Some("session aborted (worker exit or server shutdown)".into()),
-        status: agent_core::types::SessionStatus::Aborted,
-        continuation_brief: None,
-    };
-    if let Err(e) = store.append_entry(tree_id, &entry) {
-        log::error!(
-            "[lifecycle] recover_tree: append session_end for {}: {}",
-            tree_id,
-            e
-        );
-        return;
-    }
-
-    let mut meta = meta;
-    meta.leaf_id = Some(new_id);
-    if let Err(e) = store.save_tree_meta(&meta) {
-        log::error!("[lifecycle] recover_tree: save meta for {}: {}", tree_id, e);
-    }
-}
-
-pub fn shutdown_all(store: &Store) {
+pub fn shutdown_all(_store: &Store) {
     let snapshot: Vec<(String, u32)> = {
         let map = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
         map.iter()
@@ -448,7 +394,6 @@ pub fn shutdown_all(store: &Store) {
     }
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut killed = false;
     for (id, pid) in &snapshot {
         loop {
             if std::time::Instant::now() > deadline {
@@ -457,7 +402,6 @@ pub fn shutdown_all(store: &Store) {
                     nix::unistd::Pid::from_raw(*pid as i32),
                     nix::sys::signal::Signal::SIGKILL,
                 );
-                killed = true;
                 break;
             }
             let gone = !ACTIVE_WORKERS
@@ -468,9 +412,6 @@ pub fn shutdown_all(store: &Store) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        if killed || ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(id) {
-            recover_tree(store, id);
         }
     }
 
@@ -484,99 +425,6 @@ mod tests {
     use agent_core::config::{SandboxConfig, SandboxDefaults};
     use agent_core::types::TreeSandbox;
     use std::path::PathBuf;
-
-    #[test]
-    fn test_recover_tree_links_chain() {
-        use agent_core::store::Store;
-        use agent_core::types::SessionStatus;
-        use tempfile::TempDir;
-
-        let dir = TempDir::with_prefix("agent-lifecycle-test-").unwrap();
-        let store = Store::new(dir.path().to_path_buf());
-        let tree_id = "recover-test";
-
-        store.create_tree_file(tree_id).unwrap();
-        let start_id = "s1".to_string();
-        let meta = agent_core::types::TreeMeta {
-            id: tree_id.to_string(),
-            parent_id: None,
-            repo_path: None,
-            title: None,
-            created_at: 100,
-            updated_at: 100,
-            leaf_id: Some(start_id.clone()),
-            sandbox: agent_core::types::TreeSandbox::default(),
-        };
-        store.save_tree_meta(&meta).unwrap();
-
-        store
-            .append_entry(
-                tree_id,
-                &Entry::SessionStart {
-                    id: start_id.clone(),
-                    parent_id: None,
-                    timestamp: "t1".into(),
-                },
-            )
-            .unwrap();
-
-        recover_tree(&store, tree_id);
-
-        let entries = store.read_all_entries(tree_id).unwrap();
-        let last = entries.last().unwrap();
-        match last {
-            Entry::SessionEnd {
-                status,
-                summary,
-                parent_id,
-                ..
-            } => {
-                assert_eq!(*status, SessionStatus::Aborted);
-                assert!(summary.as_deref().unwrap_or("").contains("aborted"));
-                assert_eq!(
-                    *parent_id,
-                    Some(start_id.clone()),
-                    "parent_id must link to leaf_id"
-                );
-            }
-            other => panic!("expected SessionEnd, got {:?}", other),
-        }
-
-        let updated = store.get_tree(tree_id).unwrap().unwrap();
-        assert!(updated.leaf_id.is_some());
-        assert_ne!(updated.leaf_id, Some(start_id), "leaf_id must advance");
-    }
-
-    #[test]
-    fn test_recover_tree_empty_tree() {
-        use agent_core::store::Store;
-        use tempfile::TempDir;
-
-        let dir = TempDir::with_prefix("agent-lifecycle-test-").unwrap();
-        let store = Store::new(dir.path().to_path_buf());
-        let tree_id = "recover-empty";
-
-        store.create_tree_file(tree_id).unwrap();
-        let meta = agent_core::types::TreeMeta {
-            id: tree_id.to_string(),
-            parent_id: None,
-            repo_path: None,
-            title: None,
-            created_at: 100,
-            updated_at: 100,
-            leaf_id: None,
-            sandbox: agent_core::types::TreeSandbox::default(),
-        };
-        store.save_tree_meta(&meta).unwrap();
-
-        recover_tree(&store, tree_id);
-
-        let entries = store.read_all_entries(tree_id).unwrap();
-        assert!(
-            entries.is_empty(),
-            "empty tree should have no entries after recover"
-        );
-    }
 
     #[test]
     #[ignore = "needs investigation - test runner hangs"]

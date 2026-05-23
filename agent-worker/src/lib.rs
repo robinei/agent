@@ -17,7 +17,7 @@ use log::warn;
 
 use agent_core::rpc::{LlmResponse, PipeIn, WsCommand};
 use agent_core::store::Store;
-use agent_core::types::{LspConfig, Message};
+use agent_core::types::{Entry, LspConfig, Message, SessionStatus, TreeMeta};
 
 use agent_core::types::NotificationLevel;
 use crate::turn::{begin_turn, cancel_turn, finish_response, process_chunk, resolve_lsp_wait_into, resolve_lsp_wait_with_timeout};
@@ -161,6 +161,74 @@ fn dispatch_pipe_in(
     }
 }
 
+fn startup_writes(store: &Store, tree_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let entries = store.read_all_entries(tree_id).unwrap_or_default();
+
+    // If entries exist and the last entry is not a SessionEnd, write a recovery
+    // SessionEnd to mark the previous session as aborted.
+    let recovery_parent = if !entries.is_empty() {
+        match entries.last() {
+            Some(Entry::SessionEnd { .. }) => None,
+            _ => {
+                let meta = store.get_tree(tree_id).ok().flatten();
+                let parent_id = meta.as_ref().and_then(|m| m.leaf_id.clone());
+                let entry = Entry::SessionEnd {
+                    id: agent_core::util::generate_entry_id(),
+                    parent_id: parent_id.clone(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    summary: Some("session aborted (worker exit or server shutdown)".into()),
+                    status: SessionStatus::Aborted,
+                    continuation_brief: None,
+                };
+                let _ = store.append_entry(tree_id, &entry);
+                log::info!(
+                    "[worker] startup: tree={} recovery session_end appended (parent={:?})",
+                    tree_id,
+                    parent_id
+                );
+                Some(entry)
+            }
+        }
+    } else {
+        None
+    };
+
+    // Write a new SessionStart
+    let session_start = Entry::SessionStart {
+        id: agent_core::util::generate_entry_id(),
+        parent_id: None,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    store.append_entry(tree_id, &session_start)?;
+
+    // Update meta.leaf_id to point at the new SessionStart
+    let mut meta: TreeMeta = store.get_tree(tree_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| TreeMeta {
+            id: tree_id.to_string(),
+            parent_id: None,
+            repo_path: None,
+            title: None,
+            created_at: chrono::Utc::now().timestamp(),
+            updated_at: chrono::Utc::now().timestamp(),
+            leaf_id: None,
+            sandbox: Default::default(),
+        });
+    meta.leaf_id = Some(session_start.id().to_string());
+    meta.updated_at = chrono::Utc::now().timestamp();
+    store.save_tree_meta(&meta)?;
+
+    log::info!(
+        "[worker] startup: tree={} recovery={} new session_start={}",
+        tree_id,
+        recovery_parent.is_some(),
+        session_start.id()
+    );
+
+    Ok(())
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -184,6 +252,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     ctrlc::set_handler(|| SIGTERM_RECEIVED.store(true, Ordering::Relaxed)).ok();
     let store = Store::default();
+    startup_writes(&store, &tree_id)?;
     let session_cfg = agent_core::config::SessionConfig {
         soft_cap_pct: config.session_soft_cap_pct,
         hard_cap_pct: config.session_hard_cap_pct,
