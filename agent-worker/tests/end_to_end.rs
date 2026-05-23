@@ -142,9 +142,11 @@ let mut child = std::process::Command::new(&exe)
                     break;
                 }
             }
-            PipeOut::Llm(_req) => {
+            PipeOut::Llm(req) => {
                 // Respond with canned ChatChunk JSON as PipeIn::Llm, mimicking
                 // the server's provider.parse_stream_event output.
+                // IMPORTANT: use req.id, not a hardcoded 0 — the worker filters
+                // responses by req_id and silently drops mismatches.
                 let chunks = [
                     r#"{"delta_text":"Hello! I am an AI assistant.","delta_reasoning":null,"tool_call_delta":[],"finish_reason":null,"usage":null}"#,
                     "",
@@ -153,14 +155,14 @@ let mut child = std::process::Command::new(&exe)
                 ];
                 for chunk in &chunks {
                     let resp = PipeIn::Llm(LlmResponse::Chunk {
-                        id: 0,
+                        id: req.id,
                         data: chunk.to_string(),
                     });
                     resp_tx
                         .send(serde_json::to_string(&resp).unwrap())
                         .unwrap();
                 }
-                let done = PipeIn::Llm(LlmResponse::Done { id: 0 });
+                let done = PipeIn::Llm(LlmResponse::Done { id: req.id });
                 resp_tx
                     .send(serde_json::to_string(&done).unwrap())
                     .unwrap();
@@ -197,8 +199,8 @@ let mut child = std::process::Command::new(&exe)
     );
 
     // 11. Tree data.jsonl should contain the user message and assistant message
-    let store = agent_core::store::Store::new(agent_dir);
-    let entries = store.read_all_entries(tree_id).unwrap();
+    let store = agent_worker::store::Store::new(agent_dir, tree_id);
+    let entries = store.read_all_entries().unwrap();
     let has_user = entries.iter().any(|e| {
         matches!(
             e,

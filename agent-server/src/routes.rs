@@ -2,18 +2,14 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::auto_title;
 use crate::lifecycle;
-use crate::provider;
 use agent_core::config::Config;
-use agent_core::store::Store;
 use agent_core::types::{TreeMeta, TreeSandbox};
 
 #[derive(Deserialize)]
 pub struct CreateTreeBody {
     pub title: Option<String>,
     pub repo_path: Option<String>,
-    pub model: Option<String>,
     pub sandbox: Option<TreeSandbox>,
 }
 
@@ -27,7 +23,6 @@ pub fn dispatch(
     method: &str,
     path: &str,
     body: &[u8],
-    store: &Arc<Store>,
     cfg: &Arc<Config>,
 ) -> (u16, Vec<u8>, &'static str) {
     if method == "GET" && path == "/" {
@@ -37,35 +32,37 @@ pub fn dispatch(
         );
     }
     if method == "GET" && path == "/trees" {
-        return handle_list_trees(store);
+        return handle_list_trees();
     }
     if method == "POST" && path == "/trees" {
-        return handle_create_tree(body, store, cfg);
+        return handle_create_tree(body, cfg);
     }
     if let Some(rest) = path.strip_prefix("/trees/") {
         let (id, suffix) = rest.split_once('/').unwrap_or((rest, ""));
         return match (method, suffix) {
-            ("GET", "") => handle_get_tree(id, store),
-            ("PATCH", "") => handle_update_tree(id, body, store),
-            ("GET", "entries") => handle_list_entries(id, store),
+            ("GET", "") => handle_get_tree(id),
+            ("PATCH", "") => handle_update_tree(id, body),
             ("POST", "stop") => handle_stop_agent(id),
-            ("POST", "auto-title") => handle_auto_title(id, store, cfg),
             _ => not_found(),
         };
     }
     not_found()
 }
 
-fn handle_list_trees(store: &Store) -> (u16, Vec<u8>, &'static str) {
-    match store.list_trees() {
+fn agent_dir() -> std::path::PathBuf {
+    agent_core::config::agent_dir()
+}
+
+fn handle_list_trees() -> (u16, Vec<u8>, &'static str) {
+    match agent_core::tree_io::list_trees(&agent_dir()) {
         Ok(trees) => json(200, &trees),
         Err(e) => {
-            json(500, &serde_json::json!({"error": format!("{}", e)}))
+            json(500, &serde_json::json!({"error": e}))
         }
     }
 }
 
-fn handle_create_tree(body: &[u8], store: &Store, cfg: &Config) -> (u16, Vec<u8>, &'static str) {
+fn handle_create_tree(body: &[u8], cfg: &Config) -> (u16, Vec<u8>, &'static str) {
     let body: CreateTreeBody = match serde_json::from_slice(body) {
         Ok(b) => b,
         Err(_) => {
@@ -101,32 +98,25 @@ fn handle_create_tree(body: &[u8], store: &Store, cfg: &Config) -> (u16, Vec<u8>
         sandbox,
     };
 
-    if let Err(e) = store.create_tree_file(&tree_id) {
+    if let Err(e) = agent_core::tree_io::create_tree(&agent_dir(), &meta) {
         return json(
             500,
-            &serde_json::json!({"error": format!("failed to create tree file: {}", e)}),
-        );
-    }
-
-    if let Err(e) = store.save_tree_meta(&meta) {
-        return json(
-            500,
-            &serde_json::json!({"error": format!("failed to save tree metadata: {}", e)}),
+            &serde_json::json!({"error": format!("failed to create tree: {}", e)}),
         );
     }
 
     json(201, &meta)
 }
 
-fn handle_get_tree(id: &str, store: &Store) -> (u16, Vec<u8>, &'static str) {
-    match store.get_tree(id) {
+fn handle_get_tree(id: &str) -> (u16, Vec<u8>, &'static str) {
+    match agent_core::tree_io::read_meta(&agent_dir(), id) {
         Ok(Some(meta)) => json(200, &meta),
         Ok(None) => json(404, &serde_json::json!({"error": format!("tree {} not found", id)})),
-        Err(e) => json(500, &serde_json::json!({"error": format!("{}", e)})),
+        Err(e) => json(500, &serde_json::json!({"error": e})),
     }
 }
 
-fn handle_update_tree(id: &str, body: &[u8], store: &Store) -> (u16, Vec<u8>, &'static str) {
+fn handle_update_tree(id: &str, body: &[u8]) -> (u16, Vec<u8>, &'static str) {
     let body: UpdateTreeBody = match serde_json::from_slice(body) {
         Ok(b) => b,
         Err(_) => {
@@ -134,13 +124,13 @@ fn handle_update_tree(id: &str, body: &[u8], store: &Store) -> (u16, Vec<u8>, &'
         }
     };
 
-    let mut meta = match store.get_tree(id) {
+    let mut meta = match agent_core::tree_io::read_meta(&agent_dir(), id) {
         Ok(Some(m)) => m,
         Ok(None) => {
             return json(404, &serde_json::json!({"error": format!("tree {} not found", id)}));
         }
         Err(e) => {
-            return json(500, &serde_json::json!({"error": format!("{}", e)}));
+            return json(500, &serde_json::json!({"error": e}));
         }
     };
 
@@ -152,7 +142,7 @@ fn handle_update_tree(id: &str, body: &[u8], store: &Store) -> (u16, Vec<u8>, &'
     }
     meta.updated_at = chrono::Utc::now().timestamp();
 
-    if let Err(e) = store.save_tree_meta(&meta) {
+    if let Err(e) = agent_core::tree_io::write_meta(&agent_dir(), &meta) {
         return json(
             500,
             &serde_json::json!({"error": format!("failed to update tree: {}", e)}),
@@ -160,43 +150,6 @@ fn handle_update_tree(id: &str, body: &[u8], store: &Store) -> (u16, Vec<u8>, &'
     }
 
     json(200, &meta)
-}
-
-fn handle_list_entries(id: &str, store: &Store) -> (u16, Vec<u8>, &'static str) {
-    match store.get_tree(id) {
-        Ok(None) => {
-            return json(404, &serde_json::json!({"error": format!("tree {} not found", id)}));
-        }
-        Err(e) => {
-            return json(500, &serde_json::json!({"error": format!("{}", e)}));
-        }
-        Ok(Some(_)) => {}
-    }
-
-    match store.read_all_entries(id) {
-        Ok(entries) => json(200, &entries),
-        Err(e) => json(500, &serde_json::json!({"error": format!("{}", e)})),
-    }
-}
-
-fn handle_auto_title(id: &str, store: &Store, config: &Config) -> (u16, Vec<u8>, &'static str) {
-    let provider = provider::create_provider(
-        &config.summary.kind,
-        &config.summary.base_url,
-        &config.summary.api_key,
-        &config.summary.model,
-        false,
-        "medium",
-        None,
-        None,
-    );
-    match auto_title::auto_title(store, &*provider, id) {
-        Ok(title) => {
-            lifecycle::broadcast_meta_update(id, Some(title.clone()));
-            json(200, &serde_json::json!({"title": title}))
-        }
-        Err(e) => json(500, &serde_json::json!({"error": e})),
-    }
 }
 
 fn handle_stop_agent(id: &str) -> (u16, Vec<u8>, &'static str) {
@@ -218,12 +171,32 @@ fn not_found() -> (u16, Vec<u8>, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::types::Entry;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static AGENT_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run a test with AGENT_DIR set to a temp dir. Keeps TempDir alive,
+    /// recovers from poisoned mutex, and restores the original env var.
+    fn with_agent_dir<F>(f: F)
+    where
+        F: FnOnce(Arc<Config>, &TempDir),
+    {
+        let _guard = AGENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let old = std::env::var_os("AGENT_DIR");
+        std::env::set_var("AGENT_DIR", tmp.path());
+        let cfg = Arc::new(Config::default());
+        f(cfg, &tmp);
+        match old {
+            Some(v) => std::env::set_var("AGENT_DIR", v),
+            None => std::env::remove_var("AGENT_DIR"),
+        }
+    }
 
     #[test]
     fn test_dispatch_static() {
-        let (status, body, ct) = dispatch("GET", "/", &[], &Arc::new(Store::default()), &Arc::new(Config::default()));
+        let (status, body, ct) = dispatch("GET", "/", &[], &Arc::new(Config::default()));
         assert_eq!(status, 200);
         assert_eq!(ct, "application/json");
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -232,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_not_found() {
-        let (status, body, ct) = dispatch("GET", "/nonexistent", &[], &Arc::new(Store::default()), &Arc::new(Config::default()));
+        let (status, body, ct) = dispatch("GET", "/nonexistent", &[], &Arc::new(Config::default()));
         assert_eq!(status, 404);
         assert_eq!(ct, "application/json");
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -241,14 +214,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_create_tree_bad_body() {
-        let (status, _, _) = dispatch("POST", "/trees", b"not json", &Arc::new(Store::default()), &Arc::new(Config::default()));
+        let (status, _, _) = dispatch("POST", "/trees", b"not json", &Arc::new(Config::default()));
         assert_eq!(status, 400);
-    }
-
-    #[test]
-    fn test_dispatch_tree_entries_not_found() {
-        let (status, _, _) = dispatch("GET", "/trees/no-such-tree/entries", &[], &Arc::new(Store::default()), &Arc::new(Config::default()));
-        assert_eq!(status, 404);
     }
 
     #[test]
@@ -262,67 +229,56 @@ mod tests {
 
     #[test]
     fn test_dispatch_get_tree_no_such() {
-        let store = Arc::new(Store::default());
-        let (status, _body, _) = dispatch("GET", "/trees/nonexistent", &[], &store, &Arc::new(Config::default()));
+        let (status, _body, _) = dispatch("GET", "/trees/nonexistent", &[], &Arc::new(Config::default()));
         assert_eq!(status, 404);
     }
 
     #[test]
     fn test_dispatch_create_and_get_tree() {
-        let tmp = TempDir::new().unwrap();
-        let store = Arc::new(Store::new(tmp.path().join(".agent")));
-        let cfg = Arc::new(Config::default());
+        with_agent_dir(|cfg, _tmp| {
+            let create_body = serde_json::json!({"title": "test-tree"});
+            let (status, body, _) = dispatch("POST", "/trees", &serde_json::to_vec(&create_body).unwrap(), &cfg);
+            assert_eq!(status, 201);
+            let meta: TreeMeta = serde_json::from_slice(&body).unwrap();
+            assert_eq!(meta.title.unwrap(), "test-tree");
 
-        let create_body = serde_json::json!({"title": "test-tree"});
-        let (status, body, _) = dispatch("POST", "/trees", &serde_json::to_vec(&create_body).unwrap(), &store, &cfg);
-        assert_eq!(status, 201);
-        let meta: TreeMeta = serde_json::from_slice(&body).unwrap();
-        assert_eq!(meta.title.unwrap(), "test-tree");
-
-        let get_path = format!("/trees/{}", meta.id);
-        let (status, body, _) = dispatch("GET", &get_path, &[], &store, &cfg);
-        assert_eq!(status, 200);
-        let fetched: TreeMeta = serde_json::from_slice(&body).unwrap();
-        assert_eq!(fetched.id, meta.id);
-
-        let entries_path = format!("/trees/{}/entries", meta.id);
-        let (status, body, _) = dispatch("GET", &entries_path, &[], &store, &cfg);
-        assert_eq!(status, 200);
-        let entries: Vec<Entry> = serde_json::from_slice(&body).unwrap();
-        // Worker writes SessionStart on connect; a freshly-created tree has no entries.
-        assert!(entries.is_empty(), "new tree should have no entries");
+            let get_path = format!("/trees/{}", meta.id);
+            let (status, body, _) = dispatch("GET", &get_path, &[], &cfg);
+            assert_eq!(status, 200);
+            let fetched: TreeMeta = serde_json::from_slice(&body).unwrap();
+            assert_eq!(fetched.id, meta.id);
+        });
     }
 
     #[test]
     fn test_create_tree_rejects_repo_inside_default_hide() {
         use agent_core::config::{SandboxConfig, SandboxDefaults};
 
-        let tmp = TempDir::new().unwrap();
-        let store = Arc::new(Store::new(tmp.path().join(".agent")));
+        with_agent_dir(|_cfg, tmp| {
+            // Create a hidden directory inside the temp dir
+            let hidden_dir = tmp.path().join(".ssh");
+            std::fs::create_dir_all(&hidden_dir).unwrap();
 
-        // Create a directory that will be in the default hide list
-        let hidden_dir = tmp.path().join(".ssh");
-        std::fs::create_dir_all(&hidden_dir).unwrap();
-
-        let cfg = Arc::new(Config {
-            sandbox: SandboxConfig {
-                enabled: false,
-                bwrap_path: None,
-                defaults: SandboxDefaults {
-                    hide: vec![hidden_dir.clone()],
+            let cfg = Arc::new(Config {
+                sandbox: SandboxConfig {
+                    enabled: false,
+                    bwrap_path: None,
+                    defaults: SandboxDefaults {
+                        hide: vec![hidden_dir.clone()],
+                    },
                 },
-            },
-            ..Config::default()
-        });
+                ..Config::default()
+            });
 
-        let create_body = serde_json::json!({
-            "title": "test-tree",
-            "repo_path": hidden_dir.to_str().unwrap(),
+            let create_body = serde_json::json!({
+                "title": "test-tree",
+                "repo_path": hidden_dir.to_str().unwrap(),
+            });
+            let (status, body, _) = dispatch("POST", "/trees", &serde_json::to_vec(&create_body).unwrap(), &cfg);
+            assert_eq!(status, 400);
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let err = v["error"].as_str().unwrap();
+            assert!(err.contains("hidden"), "error should mention 'hidden': {}", err);
         });
-        let (status, body, _) = dispatch("POST", "/trees", &serde_json::to_vec(&create_body).unwrap(), &store, &cfg);
-        assert_eq!(status, 400);
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let err = v["error"].as_str().unwrap();
-        assert!(err.contains("hidden"), "error should mention 'hidden': {}", err);
     }
 }

@@ -3,7 +3,6 @@ use std::net::TcpStream;
 use std::sync::Arc;
 
 use agent_core::config::Config;
-use agent_core::store::Store;
 
 use crate::lifecycle::{self, WorkerMsg};
 use crate::worker_loop::WsClient;
@@ -12,7 +11,6 @@ pub fn accept(
     mut stream: TcpStream,
     path: &str,
     headers: &[(String, Vec<u8>)],
-    store: Arc<Store>,
     cfg: Arc<Config>,
 ) {
     let tree_id = match path
@@ -49,7 +47,7 @@ pub fn accept(
     }
 
     if lifecycle::worker_get(&tree_id).is_none() {
-        if let Err(e) = lifecycle::spawn_worker(&tree_id, store.clone(), cfg.clone()) {
+        if let Err(e) = lifecycle::spawn_worker(&tree_id, cfg.clone()) {
             let mut ws = tungstenite::WebSocket::from_raw_socket(
                 stream,
                 tungstenite::protocol::Role::Server,

@@ -7,7 +7,6 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use agent_core::rpc::PipeIn;
-use agent_core::types::ServerEvent;
 use nix::poll::PollFlags;
 
 use crate::lifecycle::WorkerMsg;
@@ -70,10 +69,13 @@ impl PollHandler for StdoutHandler {
             self.line_buf.clear();
             match pipe_out {
                 agent_core::rpc::PipeOut::Event(event) => {
-                    if matches!(event, ServerEvent::Done { .. }) {
-                        crate::lifecycle::spawn_auto_title(ctx);
-                    }
+                    let is_done = matches!(&event, agent_core::types::ServerEvent::Done { .. });
                     ctx.broadcast(event);
+                    if is_done {
+                        ctx.send_pipe_in(&PipeIn::Cmd(
+                            agent_core::rpc::WsCommand::AutoTitle,
+                        ));
+                    }
                 }
                 agent_core::rpc::PipeOut::Llm(req) => {
                     log::debug!(
@@ -180,12 +182,11 @@ impl PollHandler for NotifyHandler {
         }
         loop {
             match ctx.msg_rx.try_recv() {
-                Ok(WorkerMsg::NewClient(mut ws_client)) => {
-                    for ev in &ctx.event_buffer {
-                        let json = serde_json::to_string(ev).unwrap_or_default();
-                        let _ = ws_client.write_raw(&json);
-                    }
+                Ok(WorkerMsg::NewClient(ws_client)) => {
                     ctx.ws_clients.push(*ws_client);
+                    ctx.send_pipe_in(&PipeIn::Cmd(
+                        agent_core::rpc::WsCommand::GetEntries { count: None },
+                    ));
                 }
                 Ok(WorkerMsg::InjectEvent(ev)) => {
                     ctx.broadcast(ev);

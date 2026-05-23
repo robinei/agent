@@ -1,12 +1,13 @@
 pub mod agent;
 mod context_files;
 pub mod lsp_client;
+pub mod store;
 mod thinking;
 mod tools;
 mod turn;
 mod util;
 
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -16,10 +17,8 @@ pub(crate) static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 use log::warn;
 
 use agent_core::rpc::{LlmResponse, PipeIn, WsCommand};
-use agent_core::store::Store;
-use agent_core::types::{Entry, LspConfig, Message, SessionStatus, TreeMeta};
-
-use agent_core::types::NotificationLevel;
+use crate::store::Store;
+use agent_core::types::{Entry, LspConfig, Message, NotificationLevel, ServerEvent, SessionStatus, TreeMeta};
 use crate::turn::{begin_turn, cancel_turn, finish_response, process_chunk, resolve_lsp_wait_into, resolve_lsp_wait_with_timeout};
 use crate::util::{emit_notification, parse_tree_id, read_config, resolve_repo_path};
 
@@ -38,6 +37,9 @@ pub(crate) enum AgentState {
         tool_calls_this_turn: usize,
         consecutive_failures: usize,
         lsp_wait: Option<crate::lsp_client::LspWaitState>,
+    },
+    AutoTitling {
+        accumulated: String,
     },
 }
 
@@ -102,7 +104,6 @@ fn parse_pipe_messages(buf: &mut Vec<u8>) -> Vec<PipeIn> {
 fn dispatch_pipe_in(
     msg: PipeIn,
     state: &mut AgentState,
-    tree_id: &str,
     store: &Store,
     session_cfg: &agent_core::config::SessionConfig,
     tools: &[Box<dyn crate::tools::Tool>],
@@ -113,55 +114,141 @@ fn dispatch_pipe_in(
 ) {
     match msg {
         PipeIn::Cmd(WsCommand::Message { params }) => {
-            if matches!(state, AgentState::Idle) {
-                *state = begin_turn(
-                    params.text, tree_id, store, session_cfg,
-                    tools, ctx, out, req_id,
-                );
+            match state {
+                AgentState::Idle => {
+                    *state = begin_turn(
+                        params.text, store, session_cfg,
+                        tools, ctx, out, req_id,
+                    );
+                }
+                AgentState::AutoTitling { .. } => {
+                    log::warn!("[worker] dropping message while auto-titling: {}", params.text);
+                }
+                _ => {}
             }
         }
         PipeIn::Cmd(WsCommand::Stop) => {
             if matches!(state, AgentState::Streaming { .. }) {
-                *state = cancel_turn(std::mem::replace(state, AgentState::Idle), tree_id, store, ctx, out);
+                *state = cancel_turn(std::mem::replace(state, AgentState::Idle), store, ctx, out);
             } else {
                 ctx.stop.store(false, Ordering::Relaxed);
             }
+        }
+        PipeIn::Cmd(WsCommand::GetEntries { count }) => {
+            let entries = store.read_all_entries().unwrap_or_default();
+            let to_emit: &[Entry] = if let Some(n) = count {
+                let len = entries.len();
+                &entries[len.saturating_sub(n)..]
+            } else {
+                &entries
+            };
+            for entry in to_emit {
+                crate::util::emit_event(out, ServerEvent::Entry(entry.clone()));
+            }
+            out.flush().ok();
+        }
+        PipeIn::Cmd(WsCommand::AutoTitle) => {
+            if !matches!(state, AgentState::Idle) { return; }
+            let meta = match store.get_tree().ok() {
+                Some(m) => m,
+                None => return,
+            };
+            if meta.title.is_some() { return; }
+            let entries = store.read_all_entries().unwrap_or_default();
+            let leaf_id = match &meta.leaf_id {
+                Some(id) => id.clone(),
+                None => return,
+            };
+            let mut messages = crate::agent::build_context(&entries, &leaf_id);
+            messages.insert(0, Message {
+                role: agent_core::types::MessageRole::System,
+                content: agent_core::types::MessageContent::Text(
+                    "Generate a concise title (6 words or fewer) for this coding \
+                     conversation. Return ONLY the title text, no quotes, no \
+                     punctuation, no explanation.".into()
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                tool_name: None,
+                usage: None,
+                stop_reason: None,
+                is_error: None,
+            });
+            *req_id += 1;
+            let llm_req = agent_core::rpc::LlmRequest { id: *req_id, messages, tools: vec![] };
+            agent_core::rpc::write_json_line(out, &agent_core::rpc::PipeOut::Llm(llm_req))
+                .ok();
+            out.flush().ok();
+            *state = AgentState::AutoTitling { accumulated: String::new() };
         }
         PipeIn::Llm(LlmResponse::Chunk { id, data, .. }) => {
             if id != *req_id {
                 return;
             }
-            if let AgentState::Streaming { .. } = state {
-                process_chunk(&data, state, out);
+            match state {
+                AgentState::Streaming { .. } => {
+                    process_chunk(&data, state, out);
+                }
+                AgentState::AutoTitling { ref mut accumulated, .. } => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if let Some(t) = v["delta_text"].as_str() {
+                            accumulated.push_str(t);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         PipeIn::Llm(LlmResponse::Done { id, .. }) => {
             if id != *req_id {
                 return;
             }
-            if matches!(state, AgentState::Streaming { .. }) {
-                let old = std::mem::replace(state, AgentState::Idle);
-                *state = finish_response(
-                    old, tree_id, store, session_cfg,
-                    tools, ctx, out, lsp_cfg, req_id,
-                );
+            match state {
+                AgentState::Streaming { .. } => {
+                    let old = std::mem::replace(state, AgentState::Idle);
+                    *state = finish_response(
+                        old, store, session_cfg,
+                        tools, ctx, out, lsp_cfg, req_id,
+                    );
+                }
+                AgentState::AutoTitling { ref accumulated, .. } => {
+                    let title = accumulated.trim().trim_matches('"').to_string();
+                    if !title.is_empty() {
+                        if let Ok(mut meta) = store.get_tree() {
+                            meta.title = Some(title.clone());
+                            let _ = store.save_tree_meta(&meta);
+                        }
+                        crate::util::emit_event(out, ServerEvent::MetaUpdate { title: Some(title) });
+                        out.flush().ok();
+                    }
+                    *state = AgentState::Idle;
+                }
+                _ => {}
             }
         }
         PipeIn::Llm(LlmResponse::Error { id, message, .. }) => {
             if id != *req_id {
                 return;
             }
-            if matches!(state, AgentState::Streaming { .. }) {
-                emit_notification(out, NotificationLevel::Fatal, message);
-                *state = AgentState::Idle;
+            match state {
+                AgentState::Streaming { .. } => {
+                    emit_notification(out, NotificationLevel::Fatal, message);
+                    *state = AgentState::Idle;
+                }
+                AgentState::AutoTitling { .. } => {
+                    log::warn!("[worker] auto-title LLM error: {}", message);
+                    *state = AgentState::Idle;
+                }
+                _ => {}
             }
         }
         PipeIn::Config(_) => {}
     }
 }
 
-fn startup_writes(store: &Store, tree_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let entries = store.read_all_entries(tree_id).unwrap_or_default();
+fn startup_writes(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
+    let tree_id = store.tree_id();
+    let entries = store.read_all_entries().unwrap_or_default();
 
     // If entries exist and the last entry is not a SessionEnd, write a recovery
     // SessionEnd to mark the previous session as aborted.
@@ -169,7 +256,7 @@ fn startup_writes(store: &Store, tree_id: &str) -> Result<(), Box<dyn std::error
         match entries.last() {
             Some(Entry::SessionEnd { .. }) => None,
             _ => {
-                let meta = store.get_tree(tree_id).ok().flatten();
+                let meta = store.get_tree().ok();
                 let parent_id = meta.as_ref().and_then(|m| m.leaf_id.clone());
                 let entry = Entry::SessionEnd {
                     id: agent_core::util::generate_entry_id(),
@@ -179,7 +266,7 @@ fn startup_writes(store: &Store, tree_id: &str) -> Result<(), Box<dyn std::error
                     status: SessionStatus::Aborted,
                     continuation_brief: None,
                 };
-                let _ = store.append_entry(tree_id, &entry);
+                let _ = store.append_entry(&entry);
                 log::info!(
                     "[worker] startup: tree={} recovery session_end appended (parent={:?})",
                     tree_id,
@@ -198,13 +285,11 @@ fn startup_writes(store: &Store, tree_id: &str) -> Result<(), Box<dyn std::error
         parent_id: None,
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
-    store.append_entry(tree_id, &session_start)?;
+    store.append_entry(&session_start)?;
 
     // Update meta.leaf_id to point at the new SessionStart
-    let mut meta: TreeMeta = store.get_tree(tree_id)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| TreeMeta {
+    let mut meta: TreeMeta = store.get_tree()
+        .unwrap_or_else(|_| TreeMeta {
             id: tree_id.to_string(),
             parent_id: None,
             repo_path: None,
@@ -250,14 +335,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     agent_core::logging::init_logging(log_file, &config.logging_level, config.logging_to_stderr);
 
     ctrlc::set_handler(|| SIGTERM_RECEIVED.store(true, Ordering::Relaxed)).ok();
-    let store = Store::default();
-    startup_writes(&store, &tree_id)?;
+    let store = Store::new_default(&tree_id);
+    startup_writes(&store)?;
     let session_cfg = agent_core::config::SessionConfig {
         soft_cap_pct: config.session_soft_cap_pct,
         hard_cap_pct: config.session_hard_cap_pct,
         max_tool_calls_per_turn: config.max_tool_calls_per_turn,
     };
-    let cwd = resolve_repo_path(&store, &tree_id);
+    let cwd = resolve_repo_path(&store);
     let tools = tools::all_tools();
     let mut ctx = tools::ToolContext::new(cwd.clone());
 
@@ -279,7 +364,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let msgs = parse_pipe_messages(&mut stdin_buf);
         for msg in msgs {
             dispatch_pipe_in(
-                msg, &mut state, &tree_id, &store,
+                msg, &mut state, &store,
                 &session_cfg, &tools, &mut ctx, &mut out,
                 &config.lsp, &mut req_id,
             );
@@ -330,7 +415,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let msgs = parse_pipe_messages(&mut stdin_buf);
                 for msg in msgs {
                     dispatch_pipe_in(
-                        msg, &mut state, &tree_id, &store,
+                        msg, &mut state, &store,
                         &session_cfg, &tools, &mut ctx, &mut out,
                         &config.lsp, &mut req_id,
                     );

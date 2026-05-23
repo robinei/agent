@@ -3,12 +3,11 @@ use std::net::TcpStream;
 use std::sync::Arc;
 
 use agent_core::config::Config;
-use agent_core::store::Store;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
-pub fn handle_connection(mut stream: TcpStream, store: Arc<Store>, cfg: Arc<Config>) {
+pub fn handle_connection(mut stream: TcpStream, cfg: Arc<Config>) {
     // Slowloris guard: a misbehaving client could open a TCP connection and
     // dribble bytes forever, pinning a thread. 30s read timeout closes the
     // connection if no progress is made between reads. Required, not optional.
@@ -63,7 +62,7 @@ pub fn handle_connection(mut stream: TcpStream, store: Arc<Store>, cfg: Arc<Conf
         && header_contains(&headers, "connection", b"upgrade");
     log::debug!("[http] {} {}{}", method, path, if is_ws { " (ws)" } else { "" });
     if is_ws {
-        crate::ws::accept(stream, &path, &headers, store, cfg);
+        crate::ws::accept(stream, &path, &headers, cfg);
         return;
     }
 
@@ -96,7 +95,7 @@ pub fn handle_connection(mut stream: TcpStream, store: Arc<Store>, cfg: Arc<Conf
     let body = &buf[header_end..need.min(buf.len())];
 
     let (status, body_bytes, content_type) =
-        crate::routes::dispatch(&method, &path, body, &store, &cfg);
+        crate::routes::dispatch(&method, &path, body, &cfg);
     write_response(&mut stream, status, &body_bytes, content_type);
 }
 

@@ -10,6 +10,8 @@ use crate::types::LspConfig;
 pub enum WsCommand {
     Message { params: MessageParams },
     Stop,
+    GetEntries { count: Option<usize> },
+    AutoTitle,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

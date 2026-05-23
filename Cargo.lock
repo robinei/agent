@@ -45,7 +45,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "toml",
 ]
 
@@ -54,7 +53,6 @@ name = "agent-server"
 version = "0.1.0"
 dependencies = [
  "agent-core",
- "agent-worker",
  "chrono",
  "httparse",
  "log",
@@ -85,6 +83,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "unicode-normalization",
  "walkdir",
 ]

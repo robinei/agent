@@ -1,5 +1,4 @@
 use std::any::TypeId;
-use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::os::fd::RawFd;
 use std::process::ChildStdin;
@@ -8,7 +7,6 @@ use std::sync::Arc;
 
 use agent_core::config::Config;
 use agent_core::rpc::PipeIn;
-use agent_core::store::Store;
 use agent_core::types::ServerEvent;
 use nix::poll::PollFlags;
 
@@ -31,8 +29,6 @@ pub struct WorkerCtx {
     pub tree_id: String,
     pub stdin: BufWriter<ChildStdin>,
     pub ws_clients: Vec<WsClient>,
-    pub event_buffer: VecDeque<ServerEvent>,
-    pub store: Arc<Store>,
     pub cfg: Arc<Config>,
     pub msg_rx: mpsc::Receiver<WorkerMsg>,
     pub tls_config: Arc<rustls::ClientConfig>,
@@ -41,7 +37,6 @@ pub struct WorkerCtx {
 
 impl WorkerCtx {
     pub fn broadcast(&mut self, ev: ServerEvent) {
-        const BUFFER_CAPACITY: usize = 1000;
         log::debug!(
             "[worker_loop {}] broadcast: {} to {} client(s)",
             self.tree_id,
@@ -69,12 +64,6 @@ impl WorkerCtx {
             },
             self.ws_clients.len()
         );
-        if matches!(ev, ServerEvent::Entry(_)) {
-            if self.event_buffer.len() >= BUFFER_CAPACITY {
-                self.event_buffer.pop_front();
-            }
-            self.event_buffer.push_back(ev.clone());
-        }
         let json = serde_json::to_string(&ev).unwrap_or_default();
         let mut i = 0;
         while i < self.ws_clients.len() {

@@ -8,7 +8,6 @@ use std::sync::mpsc;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use agent_core::config::Config;
-use agent_core::store::Store;
 use agent_core::types::{ServerEvent, TreeId, TreeMeta};
 
 use crate::worker_loop;
@@ -51,51 +50,11 @@ pub fn broadcast_meta_update(tree_id: &str, title: Option<String>) {
     let _ = nix::unistd::write(&guard.notify_write, b"\x00");
 }
 
-use crate::worker_ctx::WorkerCtx;
-
-/// Spawn a background thread to auto-title a tree after a session ends.
-/// Does nothing if the tree already has a title.
-pub fn spawn_auto_title(ctx: &WorkerCtx) {
-    let store = ctx.store.clone();
-    let cfg = ctx.cfg.clone();
-    let entry = worker_get(&ctx.tree_id);
-    let msg_tx = entry.as_ref().map(|e| e.lock().unwrap_or_else(|e| e.into_inner()).msg_tx.clone());
-    let notify_write = entry
-        .as_ref()
-        .and_then(|e| std::fs::File::try_clone(&e.lock().unwrap_or_else(|e| e.into_inner()).notify_write).ok());
-    let tid = ctx.tree_id.clone();
-    if let (Some(msg_tx), Some(notify_write)) = (msg_tx, notify_write) {
-        std::thread::spawn(move || {
-            let needs = match store.get_tree(&tid) {
-                Ok(Some(m)) => m.title.is_none(),
-                _ => false,
-            };
-            if !needs {
-                return;
-            }
-            let provider = crate::provider::create_provider(
-                &cfg.summary.kind,
-                &cfg.summary.base_url,
-                &cfg.summary.api_key,
-                &cfg.summary.model,
-                false,
-                "medium",
-                None,
-                None,
-            );
-            match crate::auto_title::auto_title(&store, &*provider, &tid) {
-                Ok(title) => {
-                    let ev = ServerEvent::MetaUpdate { title: Some(title) };
-                    let _ = msg_tx.send(WorkerMsg::InjectEvent(ev));
-                    let _ = nix::unistd::write(&notify_write, b"\x00");
-                }
-                Err(e) => log::warn!("[auto-title {}] {}", tid, e),
-            }
-        });
-    }
+fn agent_dir() -> PathBuf {
+    agent_core::config::agent_dir()
 }
 
-pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Result<(), String> {
+pub fn spawn_worker(tree_id: &str, cfg: Arc<Config>) -> Result<(), String> {
     let workers = ACTIVE_WORKERS.lock().map_err(|e| e.to_string())?;
     if workers.contains_key(tree_id) {
         return Err(format!("Worker already active for tree {}", tree_id));
@@ -114,9 +73,8 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
             .join(exe)
     };
 
-    let meta = store
-        .get_tree(tree_id)
-        .map_err(|e| format!("get_tree: {e}"))?
+    let meta = agent_core::tree_io::read_meta(&agent_dir(), tree_id)
+        .map_err(|e| format!("read_meta: {e}"))?
         .ok_or_else(|| format!("tree {} not found", tree_id))?;
 
     let (msg_tx, msg_rx) = mpsc::sync_channel::<WorkerMsg>(64);
@@ -144,7 +102,6 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
     let tree_id_str = tree_id.to_string();
     std::thread::spawn({
         let cfg = cfg.clone();
-        let store = store.clone();
         let stderr_buf = stderr_buf.clone();
         move || {
             // Spawn the subprocess (bwrap or direct)
@@ -252,7 +209,6 @@ pub fn spawn_worker(tree_id: &str, store: Arc<Store>, cfg: Arc<Config>) -> Resul
                 msg_rx,
                 notify_read,
                 notify_write,
-                store,
                 cfg,
                 stderr_buf,
                 spawn_tx,
@@ -373,7 +329,7 @@ pub fn worker_stop(tree_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn shutdown_all(_store: &Store) {
+pub fn shutdown_all() {
     let snapshot: Vec<(String, u32)> = {
         let map = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
         map.iter()
@@ -425,60 +381,6 @@ mod tests {
     use agent_core::config::{SandboxConfig, SandboxDefaults};
     use agent_core::types::TreeSandbox;
     use std::path::PathBuf;
-
-    #[test]
-    #[ignore = "needs investigation - test runner hangs"]
-    fn test_broadcast_meta_update() {
-        let (msg_tx, msg_rx) = mpsc::sync_channel::<WorkerMsg>(64);
-        let (notify_read, notify_write) = {
-            use std::os::fd::FromRawFd;
-            let (r, w) = nix::unistd::pipe().unwrap();
-            (
-                unsafe { std::fs::File::from_raw_fd(r.into_raw_fd()) },
-                unsafe { std::fs::File::from_raw_fd(w.into_raw_fd()) },
-            )
-        };
-
-        let entry = Arc::new(Mutex::new(WorkerEntry {
-            pid: 0,
-            msg_tx: msg_tx.clone(),
-            notify_write: notify_write
-                .try_clone()
-                .unwrap(),
-        }));
-
-        let tree_id = "test-meta-update";
-        ACTIVE_WORKERS
-            .lock()
-            .unwrap()
-            .insert(tree_id.to_string(), entry.clone());
-
-        // Send directly via the channel to verify the mechanism works
-        let _ = msg_tx.send(WorkerMsg::InjectEvent(ServerEvent::MetaUpdate {
-            title: Some("Generated Title".into()),
-        }));
-        let _ = nix::unistd::write(&notify_write, b"\x00");
-
-        match msg_rx.try_recv() {
-            Ok(WorkerMsg::InjectEvent(ServerEvent::MetaUpdate { title })) => {
-                assert_eq!(title, Some("Generated Title".into()));
-            }
-            other => panic!("expected InjectEvent(MetaUpdate), got {:?}", other),
-        }
-
-        // Drain the pipe
-        use std::os::fd::AsRawFd;
-        loop {
-            let mut buf = [0u8; 64];
-            match nix::unistd::read(notify_read.as_raw_fd(), &mut buf) {
-                Ok(0) | Err(nix::errno::Errno::EAGAIN) => break,
-                Ok(_) => continue,
-                Err(_) => break,
-            }
-        }
-
-        ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner()).remove(tree_id);
-    }
 
     #[test]
     fn test_build_bwrap_argv_basic() {

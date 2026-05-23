@@ -1,10 +1,11 @@
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use agent_core::rpc::{LlmRequest, PipeOut, WorkerConfig};
-use agent_core::store::Store;
 use agent_core::types::{NotificationLevel, *};
 use log::{error, warn};
 use serde::Deserialize;
+
+use crate::store::Store;
 
 #[derive(Deserialize)]
 struct ConfigEnvelope {
@@ -41,9 +42,10 @@ pub fn parse_tree_id() -> Result<String, Box<dyn std::error::Error>> {
     tree_id.ok_or_else(|| "--tree-id is required".into())
 }
 
-pub fn resolve_repo_path(store: &Store, tree_id: &str) -> std::path::PathBuf {
-    match store.get_tree(tree_id) {
-        Ok(Some(meta)) => {
+pub fn resolve_repo_path(store: &Store) -> std::path::PathBuf {
+    let tree_id = store.tree_id();
+    match store.get_tree() {
+        Ok(meta) => {
             if let Some(repo_path) = &meta.repo_path {
                 if repo_path.exists() {
                     return repo_path.clone();
@@ -54,7 +56,6 @@ pub fn resolve_repo_path(store: &Store, tree_id: &str) -> std::path::PathBuf {
                 );
             }
         }
-        Ok(None) => warn!("Tree {} not found, using cwd", tree_id),
         Err(e) => warn!("Failed to get tree {}: {}, using cwd", tree_id, e),
     }
     std::env::current_dir().unwrap_or_else(|_| store.base_dir().clone())
@@ -111,19 +112,19 @@ pub fn send_llm_request(
 
 pub fn write_message_entry(
     store: &Store,
-    tree_id: &str,
     out: &mut BufWriter<std::io::Stdout>,
     entry_id: &str,
     parent_id: Option<&str>,
     message: &Message,
 ) {
+    let tree_id = store.tree_id();
     let entry = Entry::Message {
         id: entry_id.to_string(),
         parent_id: parent_id.map(|s| s.to_string()),
         timestamp: chrono::Utc::now().to_rfc3339(),
         message: message.clone(),
     };
-    if let Err(e) = store.append_entry(tree_id, &entry) {
+    if let Err(e) = store.append_entry(&entry) {
         error!("Failed to append message entry for tree {}: {}", tree_id, e);
     }
     emit_event(out, ServerEvent::Entry(entry));
@@ -131,11 +132,11 @@ pub fn write_message_entry(
 
 pub fn write_session_end(
     store: &Store,
-    tree_id: &str,
     out: &mut BufWriter<std::io::Stdout>,
     status: SessionStatus,
     continuation_brief: Option<String>,
 ) {
+    let tree_id = store.tree_id();
     let entry = Entry::SessionEnd {
         id: agent_core::util::generate_entry_id(),
         parent_id: None,
@@ -144,7 +145,7 @@ pub fn write_session_end(
         status,
         continuation_brief,
     };
-    if let Err(e) = store.append_entry(tree_id, &entry) {
+    if let Err(e) = store.append_entry(&entry) {
         error!("Failed to write session_end for tree {}: {}", tree_id, e);
     }
     emit_event(out, ServerEvent::Entry(entry));

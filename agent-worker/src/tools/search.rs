@@ -233,7 +233,7 @@ struct SearchMatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::store::Store;
+    use crate::store::Store;
     use agent_core::types::{Entry, Message, MessageContent, MessageRole};
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -280,9 +280,9 @@ mod tests {
     #[test]
     fn test_search_messages_finds_match() {
         with_temp_agent_dir("find", |path| {
-            let store = Store::new(path.clone());
             let tree_id = "search-test-001";
-            store.create_tree_file(tree_id).unwrap();
+            let store = Store::new(path.clone(), tree_id);
+            store.create_tree_file().unwrap();
 
             let msg = Message {
                 role: MessageRole::User,
@@ -300,7 +300,7 @@ mod tests {
                 timestamp: "2026-01-01T00:00:00Z".into(),
                 message: msg,
             };
-            store.append_entry(tree_id, &entry).unwrap();
+            store.append_entry(&entry).unwrap();
 
             let tool = SearchMessagesTool;
             let mut ctx = make_ctx();
@@ -313,9 +313,9 @@ mod tests {
     #[test]
     fn test_search_messages_by_tree() {
         with_temp_agent_dir("by_tree", |path| {
-            let store = Store::new(path.clone());
             let tree_id = "search-test-002";
-            store.create_tree_file(tree_id).unwrap();
+            let store = Store::new(path.clone(), tree_id);
+            store.create_tree_file().unwrap();
 
             let msg = Message {
                 role: MessageRole::User,
@@ -333,7 +333,7 @@ mod tests {
                 timestamp: "2026-01-01T00:00:00Z".into(),
                 message: msg,
             };
-            store.append_entry(tree_id, &entry).unwrap();
+            store.append_entry(&entry).unwrap();
 
             let tool = SearchMessagesTool;
             let mut ctx = make_ctx();

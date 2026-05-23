@@ -1,12 +1,10 @@
 use std::any::TypeId;
-use std::collections::VecDeque;
 use std::os::fd::BorrowedFd;
 use std::process::Child;
 use std::sync::mpsc;
 use std::sync::Arc;
 
 use agent_core::config::Config;
-use agent_core::store::Store;
 use nix::poll::{PollFd, PollFlags};
 
 pub use crate::handlers::StderrBuf;
@@ -25,7 +23,6 @@ pub fn run_event_loop(
     msg_rx: mpsc::Receiver<WorkerMsg>,
     notify_read: std::fs::File,
     notify_write: std::fs::File,
-    store: Arc<Store>,
     cfg: Arc<Config>,
     stderr_buf: StderrBuf,
     spawn_tx: mpsc::SyncSender<Result<(), String>>,
@@ -45,8 +42,6 @@ pub fn run_event_loop(
         tree_id: tree_id.clone(),
         stdin: std::io::BufWriter::new(child_stdin),
         ws_clients: Vec::new(),
-        event_buffer: VecDeque::with_capacity(1000),
-        store,
         cfg,
         msg_rx,
         tls_config,

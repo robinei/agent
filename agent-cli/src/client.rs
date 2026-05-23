@@ -5,7 +5,7 @@
 use tungstenite::stream::MaybeTlsStream;
 use ureq::http;
 
-use agent_core::types::{Entry, TreeMeta};
+use agent_core::types::TreeMeta;
 
 /// Build a base URL from the server address string.
 fn base_url(server: &str) -> String {
@@ -140,34 +140,6 @@ impl AgentClient {
     /// Stop the active agent for a tree.
     pub fn stop_agent(&self, tree_id: &str) -> Result<(), String> {
         self.post_empty(&format!("/trees/{}/stop", tree_id))
-    }
-
-    /// Get all entries for a tree.
-    pub fn get_entries(&self, tree_id: &str) -> Result<Vec<Entry>, String> {
-        self.get_json(&self.entries_url(tree_id))
-    }
-
-    fn entries_url(&self, tree_id: &str) -> String {
-        format!("/trees/{}/entries", tree_id)
-    }
-
-    /// Ask the server to auto-generate a title for a tree.
-    pub fn auto_title(&self, tree_id: &str) -> Result<String, String> {
-        let url = format!("{}/trees/{}/auto-title", self.base, tree_id);
-        let resp = ureq::post(&url)
-            .send_json(serde_json::json!({}))
-            .map_err(|e| format!("request failed: {}", e))?;
-        if resp.status().as_u16() >= 400 {
-            return Err(extract_error(resp));
-        }
-        let json: serde_json::Value = resp
-            .into_body()
-            .read_json()
-            .map_err(|e| format!("failed to parse response: {}", e))?;
-        json.get("title")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| "no title in response".to_string())
     }
 }
 
@@ -329,13 +301,6 @@ mod tests {
         let (host, port) = parse_host_port("localhost:8080").unwrap();
         let url = format!("ws://{}:{}/trees/abc123/ws", host, port);
         assert_eq!(url, "ws://localhost:8080/trees/abc123/ws");
-    }
-
-    #[test]
-    fn test_get_entries_url() {
-        let client = AgentClient::new("localhost:8080");
-        let url = client.entries_url("abc123");
-        assert_eq!(url, "/trees/abc123/entries");
     }
 
     #[test]

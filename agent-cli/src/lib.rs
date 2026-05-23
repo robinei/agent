@@ -117,24 +117,10 @@ impl Backend {
         }
     }
 
-    fn get_entries(&self, tree_id: &str) -> Result<Vec<agent_core::types::Entry>, String> {
-        match self {
-            Backend::Remote(c) => c.get_entries(tree_id),
-            Backend::Local(c) => c.get_entries(tree_id),
-        }
-    }
-
     fn stop_agent(&self, tree_id: &str) -> Result<(), String> {
         match self {
             Backend::Remote(c) => c.stop_agent(tree_id),
             Backend::Local(c) => c.stop_agent(tree_id),
-        }
-    }
-
-    fn auto_title(&self, tree_id: &str) -> Result<String, String> {
-        match self {
-            Backend::Remote(c) => c.auto_title(tree_id),
-            Backend::Local(c) => c.auto_title(tree_id),
         }
     }
 
@@ -144,7 +130,7 @@ impl Backend {
                 let (host, port) = client::parse_host_port(c.server_addr())?;
                 AgentSession::connect(&format!("{}:{}", host, port), tree_id)
             }
-            Backend::Local(c) => embedded_session(tree_id, c.store.clone(), c.config.clone()),
+            Backend::Local(c) => embedded_session(tree_id, c.config.clone()),
         }
     }
 }
@@ -164,17 +150,15 @@ fn resolve_backend(server: &str, explicit: bool) -> Backend {
     // No server found — start embedded.
     eprintln!("No server at {server}, hosting server");
     let config = Arc::new(agent_core::config::load_config());
-    let store = Arc::new(agent_core::store::Store::default());
-    agent_server::embed_init(config.clone(), store.clone(), false);
+    agent_server::embed_init(config.clone(), false);
     // Start TCP listener in background so other clients can connect later.
     // Pass a never-signalled AtomicBool — the embedded server runs until the
     // CLI process exits; the CLI owns SIGINT via ctrlc and must not fight the
     // server's signal handler for it.
-    let sc = store.clone();
     let cc = config.clone();
     let no_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    std::thread::spawn(move || agent_server::serve(cc, sc, no_shutdown));
-    Backend::Local(LocalClient::new(store, config))
+    std::thread::spawn(move || agent_server::serve(cc, no_shutdown));
+    Backend::Local(LocalClient::new(config))
 }
 
 fn parse_server_addr(server: &str) -> Result<std::net::SocketAddr, String> {
@@ -191,7 +175,6 @@ fn default_server_addr() -> std::net::SocketAddr {
 
 pub fn embedded_session(
     tree_id: &str,
-    store: Arc<agent_core::store::Store>,
     config: Arc<agent_core::config::Config>,
 ) -> Result<AgentSession, String> {
     // AF_UNIX SOCK_STREAM pair — both ends behave like a TcpStream fd on Linux.
@@ -205,10 +188,9 @@ pub fn embedded_session(
     let server_stream = unsafe { TcpStream::from_raw_fd(server_fd.into_raw_fd()) };
     let client_stream = unsafe { TcpStream::from_raw_fd(client_fd.into_raw_fd()) };
     // Server side: run the real HTTP+WS handler in a thread.
-    let store_for_server = store.clone();
     let cfg_for_server = config.clone();
     std::thread::spawn(move || {
-        agent_server::http::handle_connection(server_stream, store_for_server, cfg_for_server);
+        agent_server::http::handle_connection(server_stream, cfg_for_server);
     });
     // Client side: WS handshake over the socketpair.
     AgentSession::from_stream(client_stream, tree_id)
@@ -432,9 +414,20 @@ fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &
             _ => {}
         }
     }
-
-    match backend.auto_title(&meta.id) {
-        Ok(title) => println!("\nTitle: {}", title),
-        Err(e) => eprintln!("Auto-title failed: {}", e),
+    
+    // Listen for MetaUpdate emitted by the worker after auto-title completes.
+    loop {
+        match session.next_event() {
+            Some(Ok(ServerEvent::MetaUpdate { title: Some(t) })) => {
+                println!("\nTitle: {}", t);
+                break;
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => {
+                eprintln!("Auto-title event error: {}", e);
+                break;
+            }
+            None => break,
+        }
     }
 }

@@ -2,7 +2,6 @@ use std::io::BufWriter;
 use std::sync::atomic::Ordering;
 
 use agent_core::config::SessionConfig;
-use agent_core::store::Store;
 use agent_core::types::*;
 use log::{error, info, warn};
 
@@ -13,6 +12,7 @@ use crate::lsp_client::{
 use crate::thinking::{split_thinking_chunks, ThinkingSegment};
 use agent_core::types::NotificationLevel;
 use crate::util::{emit_notification, emit_event, send_llm_request, write_message_entry, write_session_end};
+use crate::store::Store;
 use crate::AgentState;
 use crate::tools::ToolOutput;
 
@@ -81,7 +81,6 @@ fn build_system_prompt(repo_path: &std::path::Path, context_section: &str) -> St
 fn check_context_cap(
     estimated: usize,
     session_cfg: &SessionConfig,
-    tree_id: &str,
     store: &Store,
     out: &mut BufWriter<std::io::Stdout>,
 ) -> Result<(), ()> {
@@ -108,9 +107,9 @@ fn check_context_cap(
             },
         );
         if estimated >= hard_cap {
-            warn!("Hard cap reached for tree {} (est. {} tokens)", tree_id, estimated);
+            warn!("Hard cap reached for tree {} (est. {} tokens)", store.tree_id(), estimated);
             emit_notification(out, NotificationLevel::Error, "Hard context cap reached. Ending session.".into());
-            write_session_end(store, tree_id, out, SessionStatus::Continuing, None);
+            write_session_end(store, out, SessionStatus::Continuing, None);
             return Err(());
         }
     }
@@ -130,7 +129,6 @@ fn parse_exit_code(content: &str) -> i32 {
 
 pub fn begin_turn(
     text: String,
-    tree_id: &str,
     store: &Store,
     session_cfg: &SessionConfig,
     tools: &[Box<dyn crate::tools::Tool>],
@@ -138,9 +136,10 @@ pub fn begin_turn(
     out: &mut BufWriter<std::io::Stdout>,
     req_id: &mut u64,
 ) -> AgentState {
+    let tree_id = store.tree_id();
     info!("begin_turn: tree={}, text={}", tree_id, text);
 
-    let entries = match store.read_all_entries(tree_id) {
+    let entries = match store.read_all_entries() {
         Ok(e) => e,
         Err(e) => {
             error!("Failed to read entries for tree {}: {}", tree_id, e);
@@ -149,12 +148,8 @@ pub fn begin_turn(
         }
     };
 
-    let tree_meta = match store.get_tree(tree_id) {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            error!("Tree {} not found", tree_id);
-            return AgentState::Idle;
-        }
+    let tree_meta = match store.get_tree() {
+        Ok(m) => m,
         Err(e) => {
             error!("Failed to get tree {}: {}", tree_id, e);
             return AgentState::Idle;
@@ -170,7 +165,7 @@ pub fn begin_turn(
 
     let user_msg = make_user_message(text);
 
-    write_message_entry(store, tree_id, out, &user_msg_id, leaf_id.as_deref(), &user_msg);
+    write_message_entry(store, out, &user_msg_id, leaf_id.as_deref(), &user_msg);
     leaf_id = Some(user_msg_id.clone());
 
     messages.push(user_msg);
@@ -192,7 +187,7 @@ pub fn begin_turn(
     );
 
     let estimated = crate::agent::estimate_context_tokens(&messages);
-    if check_context_cap(estimated, session_cfg, tree_id, store, out).is_err() {
+    if check_context_cap(estimated, session_cfg, store, out).is_err() {
         return AgentState::Idle;
     }
 
@@ -405,7 +400,6 @@ pub fn process_chunk(
 
 pub fn finish_response(
     state: AgentState,
-    tree_id: &str,
     store: &Store,
     session_cfg: &SessionConfig,
     tools: &[Box<dyn crate::tools::Tool>],
@@ -414,6 +408,7 @@ pub fn finish_response(
     lsp_cfg: &LspConfig,
     req_id: &mut u64,
 ) -> AgentState {
+    let tree_id = store.tree_id();
     let AgentState::Streaming {
         mut messages,
         mut leaf_id,
@@ -448,7 +443,7 @@ pub fn finish_response(
             let assistant_msg =
                 make_assistant_message(response_text.clone(), Some(completed_calls.clone()));
 
-            write_message_entry(store, tree_id, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
+            write_message_entry(store, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
             leaf_id = Some(msg_id);
             messages.push(assistant_msg);
 
@@ -484,7 +479,7 @@ pub fn finish_response(
                         });
                         let err_msg = make_tool_result_message(&call.id, &call.name, &Err(format!("Unknown tool '{}'", call.name)));
                         let result_msg_id = agent_core::util::generate_entry_id();
-                        write_message_entry(store, tree_id, out, &result_msg_id, leaf_id.as_deref(), &err_msg);
+                        write_message_entry(store, out, &result_msg_id, leaf_id.as_deref(), &err_msg);
                         leaf_id = Some(result_msg_id);
                         messages.push(err_msg);
                         consecutive_failures += 1;
@@ -508,7 +503,7 @@ pub fn finish_response(
                         });
                         let err_msg = make_tool_result_message(&call.id, &call.name, &Err(format!("Tool '{}' panicked", call.name)));
                         let result_msg_id = agent_core::util::generate_entry_id();
-                        write_message_entry(store, tree_id, out, &result_msg_id, leaf_id.as_deref(), &err_msg);
+                        write_message_entry(store, out, &result_msg_id, leaf_id.as_deref(), &err_msg);
                         leaf_id = Some(result_msg_id);
                         messages.push(err_msg);
                         consecutive_failures += 1;
@@ -579,7 +574,7 @@ pub fn finish_response(
                                 truncated: content.contains("Output truncated"),
                                 duration_ms: None,
                             };
-                            if let Err(e) = store.append_entry(tree_id, &bash_entry) {
+                            if let Err(e) = store.append_entry(&bash_entry) {
                                 error!("Failed to append bash_exec: {}", e);
                             }
                             emit_event(out, ServerEvent::Entry(bash_entry));
@@ -587,7 +582,7 @@ pub fn finish_response(
 
                         let tool_result_msg = make_tool_result_message(&call.id, &call.name, &res);
                         let result_msg_id = agent_core::util::generate_entry_id();
-                        write_message_entry(store, tree_id, out, &result_msg_id, leaf_id.as_deref(), &tool_result_msg);
+                        write_message_entry(store, out, &result_msg_id, leaf_id.as_deref(), &tool_result_msg);
                         leaf_id = Some(result_msg_id);
                         messages.push(tool_result_msg);
                     }
@@ -660,11 +655,11 @@ pub fn finish_response(
             if !response_text.is_empty() {
                 let msg_id = agent_core::util::generate_entry_id();
                 let assistant_msg = make_assistant_message(response_text.clone(), None);
-                write_message_entry(store, tree_id, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
+                write_message_entry(store, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
                 leaf_id = Some(msg_id);
             }
 
-            if let Ok(Some(mut meta)) = store.get_tree(tree_id) {
+            if let Ok(mut meta) = store.get_tree() {
                 meta.leaf_id = leaf_id.clone();
                 meta.updated_at = chrono::Utc::now().timestamp();
                 let _ = store.save_tree_meta(&meta);
@@ -789,7 +784,6 @@ pub fn resolve_lsp_wait_with_timeout(
 
 pub fn cancel_turn(
     state: AgentState,
-    tree_id: &str,
     store: &Store,
     ctx: &mut crate::tools::ToolContext,
     out: &mut BufWriter<std::io::Stdout>,
@@ -803,7 +797,7 @@ pub fn cancel_turn(
         if !response_text.is_empty() {
             let msg_id = agent_core::util::generate_entry_id();
             let assistant_msg = make_assistant_message(response_text.clone(), None);
-            write_message_entry(store, tree_id, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
+            write_message_entry(store, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
         }
     }
 

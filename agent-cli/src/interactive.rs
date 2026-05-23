@@ -37,7 +37,6 @@ enum CliCommand {
     Switch(String),
     Stop,
     Show,
-    Entries(Option<usize>),
     Help,
     Quit,
 }
@@ -73,10 +72,6 @@ fn parse_input(line: &str) -> CliCommand {
         }
         "/stop" => CliCommand::Stop,
         "/show" => CliCommand::Show,
-        "/entries" => {
-            let n = parts.get(1).and_then(|s| s.parse::<usize>().ok());
-            CliCommand::Entries(n)
-        }
         "/help" => CliCommand::Help,
         "/quit" | "/exit" => CliCommand::Quit,
         _ => CliCommand::Help,
@@ -141,11 +136,6 @@ fn print_help(out: &mut impl Write) {
         "  /show                       Show current tree info\r\n"
     )
     .ok();
-    write!(
-        out,
-        "  /entries [n]                Show last N entries (default 10)\r\n"
-    )
-    .ok();
     write!(out, "  /help                       Show this help\r\n").ok();
     write!(out, "  /quit                       Exit\r\n").ok();
     write!(
@@ -178,62 +168,8 @@ fn print_tree_meta(out: &mut impl Write, meta: &TreeMeta, index: usize) {
     .ok();
 }
 
-/// Replay old entries as if they just happened — seamless, no "quit" feel.
-fn replay_entries(out: &mut impl Write, entries: &[Entry]) {
-    write!(out, "\x1b[?25l").ok();
-    let mut in_turn = false;
 
-    for entry in entries {
-        match entry {
-            Entry::SessionStart { .. } | Entry::SessionEnd { .. } | Entry::Label { .. } => continue,
-
-            Entry::Message { message, .. }
-                if message.role == agent_core::types::MessageRole::User =>
-            {
-                if in_turn {
-                    write!(out, "\r\n").ok();
-                }
-                in_turn = true;
-
-                let t = match &message.content {
-                    agent_core::types::MessageContent::Text(t) => t.clone(),
-                    _ => "[content blocks]".into(),
-                };
-                write!(out, "\r\n").ok();
-                write!(
-                    out,
-                    "{}▸{} {}\r\n",
-                    color::Fg(color::Green),
-                    style::Reset,
-                    t
-                )
-                .ok();
-            }
-
-            _ => {
-                if !in_turn {
-                    write!(
-                        out,
-                        "{}·  ·  ·{}\r\n",
-                        color::Fg(color::LightBlack),
-                        style::Reset
-                    )
-                    .ok();
-                    in_turn = true;
-                }
-                print_entry_summary(out, entry);
-            }
-        }
-    }
-
-    if let Some(last) = entries.last() {
-        if !matches!(last, Entry::SessionEnd { .. }) && in_turn {
-            // blank line before prompt
-        }
-    }
-}
-
-
+#[cfg(test)]
 fn render_done(out: &mut impl Write, status: &str) {
     match status {
         "stop" | "complete" | "error" => {}
@@ -248,66 +184,6 @@ fn render_done(out: &mut impl Write, status: &str) {
         }
         other => {
             print_warning(out, &format!("unknown completion status: {}", other));
-        }
-    }
-}
-
-fn print_entry_summary(out: &mut impl Write, entry: &Entry) {
-    match entry {
-        Entry::Message { message, .. } => {
-            let role_str = match message.role {
-                agent_core::types::MessageRole::User => "User",
-                agent_core::types::MessageRole::Assistant => "Assistant",
-                agent_core::types::MessageRole::System => "System",
-                agent_core::types::MessageRole::Tool => "Tool",
-            };
-            let snippet = match &message.content {
-                agent_core::types::MessageContent::Text(t) => {
-                    if t.len() > 100 {
-                        format!("{}...", &t[..100])
-                    } else {
-                        t.clone()
-                    }
-                }
-                agent_core::types::MessageContent::Blocks(b) => format!("[{} blocks]", b.len()),
-            };
-            write!(out, "  {} ({}): {}\r\n", entry.id(), role_str, snippet).ok();
-        }
-        Entry::BashExec {
-            command, exit_code, ..
-        } => {
-            write!(
-                out,
-                "  {} bash: {} (exit: {})\r\n",
-                entry.id(),
-                command,
-                exit_code
-            )
-            .ok();
-        }
-        Entry::GoalSet { goal, .. } => {
-            let _ = write!(out, "  {} 🎯 Goal: {}\r\n", entry.id(), goal);
-        }
-        Entry::ModelSet { model, .. } => {
-            let _ = write!(out, "  {} 🤖 Model: {}\r\n", entry.id(), model);
-        }
-        Entry::SessionEnd {
-            status, summary, ..
-        } => {
-            let s = summary.as_deref().unwrap_or("no summary");
-            let _ = write!(
-                out,
-                "  {} 📝 Session end ({:?}): {}\r\n",
-                entry.id(),
-                status,
-                s
-            );
-        }
-        Entry::SessionStart { .. } => {
-            let _ = write!(out, "  {} ▶ Session start\r\n", entry.id());
-        }
-        Entry::Label { label, .. } => {
-            let _ = write!(out, "  {} 🏷 Label: {}\r\n", entry.id(), label);
         }
     }
 }
@@ -1495,12 +1371,9 @@ pub fn run_interactive(
                     )
                     .ok();
 
-                    if let Ok(entries) = backend.get_entries(&current_tree_id) {
-                        if !entries.is_empty() {
-                            let last: Vec<_> =
-                                entries.iter().rev().take(10).rev().cloned().collect();
-                            replay_entries(&mut out, &last);
-                        }
+                    if let Ok(_entries) = backend.get_tree(&current_tree_id) {
+                        // In the future, entries will arrive automatically via
+                        // WsCommand::GetEntries push on WS connect.
                     }
                 }
                 Err(e) => print_warning(&mut out, &format!("Failed to load tree: {}", e)),
@@ -1644,26 +1517,6 @@ pub fn run_interactive(
                 }
                 Err(e) => print_error(&mut out, &format!("Failed to load tree: {}", e)),
             },
-            CliCommand::Entries(n) => {
-                let limit = n.unwrap_or(10);
-                match backend.get_entries(&current_tree_id) {
-                    Ok(entries) => {
-                        let last: Vec<_> = entries.iter().rev().take(limit).rev().collect();
-                        write!(
-                            out,
-                            "{}Last {} entries:{}\r\n",
-                            style::Bold,
-                            last.len(),
-                            style::Reset
-                        )
-                        .ok();
-                        for e in &last {
-                            print_entry_summary(&mut out, e);
-                        }
-                    }
-                    Err(e) => print_error(&mut out, &format!("Failed to load entries: {}", e)),
-                }
-            }
             CliCommand::Message(text) => {
                 write!(out, "\x1b[?25l").ok();
                 out.flush().ok();
