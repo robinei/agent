@@ -40,7 +40,10 @@ impl PollHandler for StdoutHandler {
 
     fn on_ready(&mut self, ctx: &mut WorkerCtx) -> bool {
         loop {
-            self.line_buf.clear();
+            // Do NOT clear line_buf here — partial reads must survive across
+            // on_ready calls. When a JSON line exceeds the pipe buffer (64KB),
+            // read_line returns WouldBlock mid-line; the accumulated bytes must
+            // still be in line_buf when on_ready is called again after POLLIN.
             match self.reader.read_line(&mut self.line_buf) {
                 Ok(0) => return false,
                 Ok(_) => {}
@@ -60,9 +63,11 @@ impl PollHandler for StdoutHandler {
                         e,
                         trimmed
                     );
+                    self.line_buf.clear();
                     continue;
                 }
             };
+            self.line_buf.clear();
             match pipe_out {
                 agent_core::rpc::PipeOut::Event(event) => {
                     if matches!(event, ServerEvent::Done { .. }) {
