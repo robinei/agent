@@ -63,6 +63,8 @@ pub struct EditRecord {
     /// Full file content after the operation. `Some` for write records;
     /// `None` for edits (computed on demand from pre_snapshot + edits).
     pub post_snapshot: Option<String>,
+    /// Whether this record has been reverted. Prevents double-revert corruption.
+    pub reverted: bool,
 }
 
 pub struct EditStore {
@@ -87,6 +89,10 @@ impl EditStore {
 
     pub fn get(&self, id: u64) -> Option<&EditRecord> {
         self.records.get(&id)
+    }
+
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut EditRecord> {
+        self.records.get_mut(&id)
     }
 }
 

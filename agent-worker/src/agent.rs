@@ -22,7 +22,7 @@ pub fn build_context(entries: &[Entry], leaf_id: &str) -> Vec<Message> {
     let mut messages: Vec<Message> = Vec::new();
     let mut current: Option<&str> = Some(leaf_id);
     let mut found_goal = None;
-    let mut found_model = None;
+    let mut _found_model = None;
 
     while let Some(cid) = current {
         let entry = match map.get(cid) {
@@ -60,7 +60,7 @@ pub fn build_context(entries: &[Entry], leaf_id: &str) -> Vec<Message> {
                 found_goal = Some(goal.clone());
             }
             Entry::ModelSet { model, .. } => {
-                found_model = Some(model.clone());
+                _found_model = Some(model.clone());
             }
             _ => {}
         }
@@ -85,8 +85,6 @@ pub fn build_context(entries: &[Entry], leaf_id: &str) -> Vec<Message> {
             },
         );
     }
-
-    let _ = found_model;
 
     messages
 }

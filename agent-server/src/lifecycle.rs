@@ -35,7 +35,7 @@ pub static ACTIVE_WORKERS: LazyLock<Mutex<HashMap<TreeId, Arc<Mutex<WorkerEntry>
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn worker_get(tree_id: &str) -> Option<Arc<Mutex<WorkerEntry>>> {
-    ACTIVE_WORKERS.lock().unwrap().get(tree_id).cloned()
+    ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner()).get(tree_id).cloned()
 }
 
 /// Broadcast a MetaUpdate event by sending a message to the worker's event loop.
@@ -44,7 +44,7 @@ pub fn broadcast_meta_update(tree_id: &str, title: Option<String>) {
         Some(e) => e,
         None => return,
     };
-    let guard = entry.lock().unwrap();
+    let guard = entry.lock().unwrap_or_else(|e| e.into_inner());
     let _ = guard
         .msg_tx
         .send(WorkerMsg::InjectEvent(ServerEvent::MetaUpdate { title }));
@@ -59,10 +59,10 @@ pub fn spawn_auto_title(ctx: &WorkerCtx) {
     let store = ctx.store.clone();
     let cfg = ctx.cfg.clone();
     let entry = worker_get(&ctx.tree_id);
-    let msg_tx = entry.as_ref().map(|e| e.lock().unwrap().msg_tx.clone());
+    let msg_tx = entry.as_ref().map(|e| e.lock().unwrap_or_else(|e| e.into_inner()).msg_tx.clone());
     let notify_write = entry
         .as_ref()
-        .and_then(|e| std::fs::File::try_clone(&e.lock().unwrap().notify_write).ok());
+        .and_then(|e| std::fs::File::try_clone(&e.lock().unwrap_or_else(|e| e.into_inner()).notify_write).ok());
     let tid = ctx.tree_id.clone();
     if let (Some(msg_tx), Some(notify_write)) = (msg_tx, notify_write) {
         std::thread::spawn(move || {
@@ -364,7 +364,7 @@ pub fn build_bwrap_argv(exe: &Path, tree_id: &str, meta: &TreeMeta, cfg: &Config
 pub fn worker_stop(tree_id: &str) -> Result<(), String> {
     let entry =
         worker_get(tree_id).ok_or_else(|| format!("No active worker for tree {}", tree_id))?;
-    let guard = entry.lock().unwrap();
+    let guard = entry.lock().unwrap_or_else(|e| e.into_inner());
     guard
         .msg_tx
         .send(WorkerMsg::Stop)
@@ -429,10 +429,10 @@ pub fn recover_tree(store: &Store, tree_id: &str) {
 
 pub fn shutdown_all(store: &Store) {
     let snapshot: Vec<(String, u32)> = {
-        let map = ACTIVE_WORKERS.lock().unwrap();
+        let map = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
         map.iter()
             .map(|(id, entry)| {
-                let pid = entry.lock().unwrap().pid;
+                let pid = entry.lock().unwrap_or_else(|e| e.into_inner()).pid;
                 (id.clone(), pid)
             })
             .collect()
@@ -469,12 +469,12 @@ pub fn shutdown_all(store: &Store) {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        if killed || ACTIVE_WORKERS.lock().unwrap().contains_key(id) {
+        if killed || ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(id) {
             recover_tree(store, id);
         }
     }
 
-    ACTIVE_WORKERS.lock().unwrap().clear();
+    ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     log::info!("[lifecycle] shutdown complete");
 }
 
@@ -629,7 +629,7 @@ mod tests {
             }
         }
 
-        ACTIVE_WORKERS.lock().unwrap().remove(tree_id);
+        ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner()).remove(tree_id);
     }
 
     #[test]

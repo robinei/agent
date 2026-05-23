@@ -176,6 +176,7 @@ impl Tool for EditTool {
             pre_snapshot,
             edits: edit_tuples,
             post_snapshot: None,
+            reverted: false,
         });
 
         let diff = build_context_window(file_path, &content, &changed_lines, edits.len(), id);

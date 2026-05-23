@@ -15,10 +15,10 @@ fn with_file_lock<F, T>(file_locks: &FileLocks, id: &str, f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let mut locks = file_locks.lock().unwrap();
+    let mut locks = file_locks.lock().unwrap_or_else(|e| e.into_inner());
     let lock = locks.entry(id.to_string()).or_default().clone();
     drop(locks);
-    let _guard = lock.lock().unwrap();
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     f()
 }
 
@@ -93,7 +93,7 @@ impl Store {
     // ── Index cache helpers ──
 
     fn update_index_cache(&self, meta: &TreeMeta) {
-        self.index_cache.lock().unwrap().insert(meta.id.clone(), meta.clone());
+        self.index_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(meta.id.clone(), meta.clone());
     }
 
     // ── Tree metadata I/O ──
@@ -122,7 +122,7 @@ impl Store {
 
     pub fn get_tree(&self, id: &str) -> Result<Option<TreeMeta>> {
         // Check cache first
-        if let Some(meta) = self.index_cache.lock().unwrap().get(id).cloned() {
+        if let Some(meta) = self.index_cache.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned() {
             return Ok(Some(meta));
         }
         // Fall back to disk
@@ -134,14 +134,14 @@ impl Store {
     }
 
     pub fn list_trees(&self) -> Result<Vec<TreeMeta>> {
-        let cache = self.index_cache.lock().unwrap();
+        let cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut trees: Vec<TreeMeta> = cache.values().cloned().collect();
         trees.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         Ok(trees)
     }
 
     pub fn clear_cache(&self, id: &str) {
-        self.index_cache.lock().unwrap().remove(id);
+        self.index_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
 
     pub fn rebuild_index(&self) -> Result<Vec<TreeMeta>> {

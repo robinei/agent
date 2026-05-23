@@ -95,6 +95,7 @@ impl Tool for WriteTool {
             pre_snapshot,
             edits: vec![],
             post_snapshot: Some(new_content.clone()),
+            reverted: false,
         });
 
         let line_count = new_content.lines().count();

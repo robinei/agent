@@ -70,6 +70,16 @@ pub fn handle_connection(mut stream: TcpStream, store: Arc<Store>, cfg: Arc<Conf
     let content_length: usize = header_get(&headers, "content-length")
         .and_then(|v| std::str::from_utf8(&v).ok()?.parse().ok())
         .unwrap_or(0);
+
+    let has_transfer_encoding = header_contains(&headers, "transfer-encoding", b"chunked");
+    if has_transfer_encoding && content_length > 0 {
+        write_status(&mut stream, 400, "Bad Request");
+        return;
+    }
+    if has_transfer_encoding {
+        write_status(&mut stream, 411, "Length Required");
+        return;
+    }
     if content_length > MAX_BODY_BYTES {
         write_status(&mut stream, 413, "Payload Too Large");
         return;

@@ -6,7 +6,7 @@ Issues identified during code review, ordered by severity.
 
 ## 🔴 Critical
 
-### 1. Broken brace nesting in `config.rs` — silently breaks `[lsp]` TOML parsing
+### 1. [DONE] Broken brace nesting in `config.rs` — silently breaks `[lsp]` TOML parsing
 
 **File:** `agent-core/src/config.rs` (lines 301–340)
 
@@ -31,7 +31,7 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
 
 ## 🟠 High
 
-### 2. Global statics create shared mutable state across tests and instances
+### 2. [DONE] Global statics create shared mutable state across tests and instances
 
 **Files:** `agent-core/src/store.rs`, `agent-server/src/lifecycle.rs`
 
@@ -43,7 +43,7 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
 
 **Fix:** Remove the `INDEX_CACHE` static and store the cache on `Store` itself (behind an `Arc<Mutex<...>>`). For `ACTIVE_WORKERS`, either make it a parameter threaded through the server, or (if it must be a global for signal-handler access) ensure every test cleans up in a `Drop` impl or `#[ctor]` destructor.
 
-### 3. `do_tls_io` silently swallows `read_tls` errors
+### 3. [DONE] `do_tls_io` silently swallows `read_tls` errors
 
 **File:** `agent-server/src/llm_handler.rs` (line 147)
 
@@ -62,7 +62,7 @@ let n = conn.read_tls(tcp).map_err(|e| {
 })?;  // or return false on error
 ```
 
-### 4. `restore_edit` can be called twice on the same record, corrupting files
+### 4. [DONE] `restore_edit` can be called twice on the same record, corrupting files
 
 **File:** `agent-worker/src/tools/restore_edit.rs` (conceptual)
 
@@ -72,7 +72,7 @@ The `EditRecord` has no `reverted` flag. If the LLM calls `restore_edit` with `r
 
 ### 5. REMOVED!
 
-### 6. Chunked-encoding terminal chunk handled as success, not EOF
+### 6. [DONE] Chunked-encoding terminal chunk handled as success, not EOF
 
 **File:** `agent-server/src/llm_handler.rs` (lines 218–219)
 
@@ -96,7 +96,7 @@ if size == 0 {
 
 ## 🟡 Medium
 
-### 7. `StderrHandler` reads only one line per `on_ready` call
+### 7. [DONE] `StderrHandler` reads only one line per `on_ready` call
 
 **File:** `agent-server/src/handlers.rs` (lines 126–141)
 
@@ -119,7 +119,7 @@ fn on_ready(&mut self, ctx: &mut WorkerCtx) -> bool {
 }
 ```
 
-### 8. `header_contains` doesn't handle `Transfer-Encoding + Content-Length` conflicts
+### 8. [DONE] `header_contains` doesn't handle `Transfer-Encoding + Content-Length` conflicts
 
 **File:** `agent-server/src/http.rs` (lines 93–107)
 
@@ -127,7 +127,7 @@ The server reads `Content-Length` to determine body size but never checks for `T
 
 **Fix:** After parsing headers, check for `Transfer-Encoding`. If present, use chunked framing instead of `Content-Length`. If both are present and disagree, reject with 400.
 
-### 9. Race between `WorkerMsg::Stop` and in-flight `LlmResponse::Chunk`
+### 9. [DONE] Race between `WorkerMsg::Stop` and in-flight `LlmResponse::Chunk`
 
 **File:** `agent-server/src/handlers.rs` (lines 185–188)
 
@@ -141,7 +141,7 @@ When `NotifyHandler` receives `WorkerMsg::Stop`, it sends `PipeIn::Cmd(Stop)` to
 
 ## 🔵 Low / Style
 
-### 11. `unsafe` raw-fd borrows lack safety comments
+### 11. [DONE] `unsafe` raw-fd borrows lack safety comments
 
 **Files:** `agent-server/src/worker_loop.rs`, `agent-server/src/lifecycle.rs`, `agent-worker/src/lib.rs`
 
@@ -152,7 +152,7 @@ When `NotifyHandler` receives `WorkerMsg::Stop`, it sends `PipeIn::Cmd(Stop)` to
 PollFd::new(unsafe { BorrowedFd::borrow_raw(fd) }, flags)
 ```
 
-### 12. `unwrap()` on `Mutex::lock` can panic the whole server on poisoning
+### 12. [DONE] `unwrap()` on `Mutex::lock` can panic the whole server on poisoning
 
 **Files:** `agent-core/src/store.rs`, `agent-server/src/lifecycle.rs`
 
@@ -160,7 +160,7 @@ PollFd::new(unsafe { BorrowedFd::borrow_raw(fd) }, flags)
 
 **Fix:** Use `lock().map_err(|e| ...)` and propagate, or use `LockResult::into_inner()` to recover from poisoning, or at least catch_unwind around thread entry points to prevent poisoning in the first place.
 
-### 13. Unused variable `let _ = found_model;`
+### 13. [DONE] Unused variable `let _ = found_model;`
 
 **File:** `agent-worker/src/agent.rs` (line 89)
 

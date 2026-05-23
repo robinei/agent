@@ -87,8 +87,14 @@ impl Tool for RestoreEditTool {
 
         match mode {
             "pre_snapshot" => {
+                if record.reverted {
+                    return ToolOutput::Done(Err(format!("Edit {} has already been reverted", id)));
+                }
                 if let Err(e) = restore_pre(&resolved, &record) {
                     return ToolOutput::Done(Err(e.to_string()));
+                }
+                if let Some(r) = ctx.edit_store.get_mut(id) {
+                    r.reverted = true;
                 }
                 ToolOutput::Done(Ok(restore_pre_msg(&record, id)))
             }
@@ -133,6 +139,9 @@ impl Tool for RestoreEditTool {
                     if let Err(e) = std::fs::write(&resolved, &content) {
                         return ToolOutput::Done(Err(e.to_string()));
                     }
+                    if let Some(r) = ctx.edit_store.get_mut(id) {
+                        r.reverted = false;
+                    }
                     return ToolOutput::Done(Ok(format!("Re-applied (write) for edit {}", id)));
                 }
 
@@ -163,13 +172,23 @@ impl Tool for RestoreEditTool {
                 if let Err(e) = std::fs::write(&resolved, &content) {
                     return ToolOutput::Done(Err(e.to_string()));
                 }
+                if let Some(r) = ctx.edit_store.get_mut(id) {
+                    r.reverted = false;
+                }
                 ToolOutput::Done(Ok(format!("Re-applied patch for edit {}", id)))
             }
 
             "revert_patch" => {
+                if record.reverted {
+                    return ToolOutput::Done(Err(format!("Edit {} has already been reverted", id)));
+                }
+
                 if record.edits.is_empty() {
                     if let Err(e) = restore_pre(&resolved, &record) {
                         return ToolOutput::Done(Err(e.to_string()));
+                    }
+                    if let Some(r) = ctx.edit_store.get_mut(id) {
+                        r.reverted = true;
                     }
                     return ToolOutput::Done(Ok(restore_pre_msg(&record, id)));
                 }
@@ -203,6 +222,9 @@ impl Tool for RestoreEditTool {
                     if let Err(e) = restore_pre(&resolved, &record) {
                         return ToolOutput::Done(Err(e.to_string()));
                     }
+                    if let Some(r) = ctx.edit_store.get_mut(id) {
+                        r.reverted = true;
+                    }
                     ToolOutput::Done(Ok(format!(
                         "Patch revert failed (text not found); restored full pre-edit \
                          snapshot for edit {}. Other changes to this file since edit {} \
@@ -212,6 +234,9 @@ impl Tool for RestoreEditTool {
                 } else {
                     if let Err(e) = std::fs::write(&resolved, &content) {
                         return ToolOutput::Done(Err(e.to_string()));
+                    }
+                    if let Some(r) = ctx.edit_store.get_mut(id) {
+                        r.reverted = true;
                     }
                     ToolOutput::Done(Ok(format!("Reverted patch for edit {}", id)))
                 }

@@ -71,11 +71,13 @@ pub fn run_event_loop(
             .map(|h| {
                 let fd = h.fd();
                 let flags = h.interests();
+                // SAFETY: Each handler owns its fd and lives for the duration of the loop.
                 PollFd::new(unsafe { BorrowedFd::borrow_raw(fd) }, flags)
             })
             .collect();
 
         for c in &ctx.ws_clients {
+            // SAFETY: ws_clients owns the WsClient objects, which hold the fd.
             pollfds.push(PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(c.fd()) },
                 PollFlags::POLLIN,
@@ -147,7 +149,7 @@ pub fn run_event_loop(
             exit_desc
         );
         let detail = {
-            let g = stderr_buf.lock().unwrap();
+            let g = stderr_buf.lock().unwrap_or_else(|e| e.into_inner());
             if g.is_empty() {
                 String::new()
             } else {
@@ -163,5 +165,5 @@ pub fn run_event_loop(
         });
     }
 
-    lifecycle::ACTIVE_WORKERS.lock().unwrap().remove(&tree_id);
+    lifecycle::ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner()).remove(&tree_id);
 }

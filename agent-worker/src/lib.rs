@@ -109,6 +109,7 @@ fn dispatch_pipe_in(
     ctx: &mut crate::tools::ToolContext,
     out: &mut BufWriter<std::io::Stdout>,
     lsp_cfg: &LspConfig,
+    stop_seen: &mut bool,
 ) {
     match msg {
         PipeIn::Cmd(WsCommand::Message { params }) => {
@@ -120,6 +121,7 @@ fn dispatch_pipe_in(
             }
         }
         PipeIn::Cmd(WsCommand::Stop) => {
+            *stop_seen = true;
             if matches!(state, AgentState::Streaming { .. }) {
                 *state = cancel_turn(std::mem::replace(state, AgentState::Idle), tree_id, store, ctx, out);
             } else {
@@ -127,11 +129,17 @@ fn dispatch_pipe_in(
             }
         }
         PipeIn::Llm(LlmResponse::Chunk { data, .. }) => {
+            if *stop_seen {
+                return;
+            }
             if let AgentState::Streaming { .. } = state {
                 process_chunk(&data, state, out);
             }
         }
         PipeIn::Llm(LlmResponse::Done { .. }) => {
+            if *stop_seen {
+                return;
+            }
             if matches!(state, AgentState::Streaming { .. }) {
                 let old = std::mem::replace(state, AgentState::Idle);
                 *state = finish_response(
@@ -141,6 +149,9 @@ fn dispatch_pipe_in(
             }
         }
         PipeIn::Llm(LlmResponse::Error { message, .. }) => {
+            if *stop_seen {
+                return;
+            }
             if matches!(state, AgentState::Streaming { .. }) {
                 emit_notification(out, NotificationLevel::Fatal, message);
                 *state = AgentState::Idle;
@@ -185,6 +196,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = BufWriter::new(std::io::stdout());
 
     let mut state = AgentState::Idle;
+    let mut stop_seen = false;
 
     // Switch stdin to non-blocking for the poll loop
     let stdin_fd = std::io::stdin().as_raw_fd();
@@ -201,7 +213,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             dispatch_pipe_in(
                 msg, &mut state, &tree_id, &store,
                 &session_cfg, &tools, &mut ctx, &mut out,
-                &config.lsp,
+                &config.lsp, &mut stop_seen,
             );
         }
 
@@ -215,12 +227,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let mut pollfds: Vec<nix::poll::PollFd> = std::iter::once(
+            // SAFETY: stdin_fd is stdin's fd, valid for the lifetime of the process.
             nix::poll::PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(stdin_fd) },
                 nix::poll::PollFlags::POLLIN,
             )
         ).chain(
             ctx.lsp_clients.values().map(|c|
+                // SAFETY: c.stdout_fd is owned by LspClient which lives in ctx for the loop.
                 nix::poll::PollFd::new(
                     unsafe { BorrowedFd::borrow_raw(c.stdout_fd) },
                     nix::poll::PollFlags::POLLIN,
@@ -250,7 +264,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     dispatch_pipe_in(
                         msg, &mut state, &tree_id, &store,
                         &session_cfg, &tools, &mut ctx, &mut out,
-                        &config.lsp,
+                        &config.lsp, &mut stop_seen,
                     );
                 }
                 break;

@@ -143,8 +143,16 @@ impl LlmHandler {
     fn do_tls_io(&mut self, ctx: &mut WorkerCtx) -> bool {
         if let LlmTransport::Tls { tcp, conn } = &mut self.transport {
             if conn.wants_read() {
-                let n = conn.read_tls(tcp).unwrap_or(0);
-                log::debug!("[LlmHandler {}] TLS read_tls={}", ctx.tree_id, n);
+                match conn.read_tls(tcp) {
+                    Ok(n) => {
+                        log::debug!("[LlmHandler {}] TLS read_tls={}", ctx.tree_id, n);
+                    }
+                    Err(e) => {
+                        log::error!("[LlmHandler {}] TLS read_tls error: {}", ctx.tree_id, e);
+                        send_llm_error(ctx, self.req_id, &format!("TLS read error: {e}"));
+                        return false;
+                    }
+                }
             }
             if let Err(e) = conn.process_new_packets() {
                 log::error!("[LlmHandler {}] TLS error: {}", ctx.tree_id, e);
@@ -216,7 +224,12 @@ impl LlmHandler {
                         let size = usize::from_str_radix(hex, 16).unwrap_or(0);
                         self.chunk_size_buf.clear();
                         if size == 0 {
-                            return true;
+                            if !self.line_buf.is_empty() {
+                                let line = std::mem::take(&mut self.line_buf);
+                                self.handle_sse_line(ctx, &line);
+                            }
+                            send_llm_done(ctx, self.req_id);
+                            return false;
                         }
                         self.chunk_decode = ChunkDecode::Data(size);
                     } else if b != b'\r' {

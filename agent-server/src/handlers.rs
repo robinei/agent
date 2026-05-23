@@ -129,20 +129,21 @@ impl PollHandler for StderrHandler {
     }
 
     fn on_ready(&mut self, ctx: &mut WorkerCtx) -> bool {
-        self.line_buf.clear();
-        match self.reader.read_line(&mut self.line_buf) {
-            Ok(0) | Err(_) => return false,
-            Ok(_) => {}
+        loop {
+            self.line_buf.clear();
+            match self.reader.read_line(&mut self.line_buf) {
+                Ok(0) | Err(_) => return false,
+                Ok(_) => {}
+            }
+            let trimmed = self.line_buf.trim_end().to_string();
+            let short = &ctx.tree_id[..ctx.tree_id.len().min(8)];
+            log::debug!("[worker {}] {}", short, trimmed);
+            let mut g = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+            if g.len() >= 20 {
+                g.pop_front();
+            }
+            g.push_back(trimmed);
         }
-        let trimmed = self.line_buf.trim_end().to_string();
-        let short = &ctx.tree_id[..ctx.tree_id.len().min(8)];
-        log::debug!("[worker {}] {}", short, trimmed);
-        let mut g = self.buf.lock().unwrap();
-        if g.len() >= 20 {
-            g.pop_front();
-        }
-        g.push_back(trimmed);
-        true
     }
 }
 
