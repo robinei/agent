@@ -129,21 +129,23 @@ impl PollHandler for StderrHandler {
     }
 
     fn on_ready(&mut self, ctx: &mut WorkerCtx) -> bool {
-        loop {
-            self.line_buf.clear();
-            match self.reader.read_line(&mut self.line_buf) {
-                Ok(0) | Err(_) => return false,
-                Ok(_) => {}
-            }
-            let trimmed = self.line_buf.trim_end().to_string();
-            let short = &ctx.tree_id[..ctx.tree_id.len().min(8)];
-            log::debug!("[worker {}] {}", short, trimmed);
-            let mut g = self.buf.lock().unwrap_or_else(|e| e.into_inner());
-            if g.len() >= 20 {
-                g.pop_front();
-            }
-            g.push_back(trimmed);
+        // Stderr fd is blocking (unlike stdout), so we read exactly one line
+        // per POLLIN event. Looping would block on the second read_line call
+        // when there is no more data, freezing the entire event loop.
+        self.line_buf.clear();
+        match self.reader.read_line(&mut self.line_buf) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
         }
+        let trimmed = self.line_buf.trim_end().to_string();
+        let short = &ctx.tree_id[..ctx.tree_id.len().min(8)];
+        log::debug!("[worker {}] {}", short, trimmed);
+        let mut g = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() >= 20 {
+            g.pop_front();
+        }
+        g.push_back(trimmed);
+        true
     }
 }
 
