@@ -147,6 +147,7 @@ impl LlmHandler {
                     Ok(n) => {
                         log::debug!("[LlmHandler {}] TLS read_tls={}", ctx.tree_id, n);
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
                         log::error!("[LlmHandler {}] TLS read_tls error: {}", ctx.tree_id, e);
                         send_llm_error(ctx, self.req_id, &format!("TLS read error: {e}"));
