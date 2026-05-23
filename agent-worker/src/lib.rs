@@ -109,47 +109,46 @@ fn dispatch_pipe_in(
     ctx: &mut crate::tools::ToolContext,
     out: &mut BufWriter<std::io::Stdout>,
     lsp_cfg: &LspConfig,
-    stop_seen: &mut bool,
+    req_id: &mut u64,
 ) {
     match msg {
         PipeIn::Cmd(WsCommand::Message { params }) => {
             if matches!(state, AgentState::Idle) {
                 *state = begin_turn(
                     params.text, tree_id, store, session_cfg,
-                    tools, ctx, out,
+                    tools, ctx, out, req_id,
                 );
             }
         }
         PipeIn::Cmd(WsCommand::Stop) => {
-            *stop_seen = true;
             if matches!(state, AgentState::Streaming { .. }) {
                 *state = cancel_turn(std::mem::replace(state, AgentState::Idle), tree_id, store, ctx, out);
             } else {
                 ctx.stop.store(false, Ordering::Relaxed);
             }
         }
-        PipeIn::Llm(LlmResponse::Chunk { data, .. }) => {
-            if *stop_seen {
+        PipeIn::Llm(LlmResponse::Chunk { id, data, .. }) => {
+            if id != *req_id {
                 return;
             }
             if let AgentState::Streaming { .. } = state {
                 process_chunk(&data, state, out);
             }
         }
-        PipeIn::Llm(LlmResponse::Done { .. }) => {
-            if *stop_seen {
+        PipeIn::Llm(LlmResponse::Done { id, .. }) => {
+            if id != *req_id {
                 return;
             }
             if matches!(state, AgentState::Streaming { .. }) {
                 let old = std::mem::replace(state, AgentState::Idle);
                 *state = finish_response(
                     old, tree_id, store, session_cfg,
-                    tools, ctx, out, lsp_cfg,
+                    tools, ctx, out, lsp_cfg, req_id,
                 );
             }
         }
-        PipeIn::Llm(LlmResponse::Error { message, .. }) => {
-            if *stop_seen {
+        PipeIn::Llm(LlmResponse::Error { id, message, .. }) => {
+            if id != *req_id {
                 return;
             }
             if matches!(state, AgentState::Streaming { .. }) {
@@ -265,7 +264,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = BufWriter::new(std::io::stdout());
 
     let mut state = AgentState::Idle;
-    let mut stop_seen = false;
+    let mut req_id: u64 = 0;
 
     // Switch stdin to non-blocking for the poll loop
     let stdin_fd = std::io::stdin().as_raw_fd();
@@ -282,7 +281,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             dispatch_pipe_in(
                 msg, &mut state, &tree_id, &store,
                 &session_cfg, &tools, &mut ctx, &mut out,
-                &config.lsp, &mut stop_seen,
+                &config.lsp, &mut req_id,
             );
         }
 
@@ -333,7 +332,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     dispatch_pipe_in(
                         msg, &mut state, &tree_id, &store,
                         &session_cfg, &tools, &mut ctx, &mut out,
-                        &config.lsp, &mut stop_seen,
+                        &config.lsp, &mut req_id,
                     );
                 }
                 break;
@@ -388,10 +387,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let tools_done = wait.pending_tool_requests.is_empty();
             if tools_done && (now >= wait.silence_until || now >= wait.deadline) {
                 let old = std::mem::replace(&mut state, AgentState::Idle);
-                state = resolve_lsp_wait_into(old, &mut ctx.lsp_clients, &mut out, &tools);
+                state = resolve_lsp_wait_into(old, &mut ctx.lsp_clients, &mut out, &tools, &mut req_id);
             } else if !tools_done && now >= wait.deadline {
                 let old = std::mem::replace(&mut state, AgentState::Idle);
-                state = resolve_lsp_wait_with_timeout(old, &mut ctx, &mut out, &tools);
+                state = resolve_lsp_wait_with_timeout(old, &mut ctx, &mut out, &tools, &mut req_id);
             }
         }
 

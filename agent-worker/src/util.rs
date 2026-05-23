@@ -93,11 +93,12 @@ pub fn send_llm_request(
     out: &mut BufWriter<std::io::Stdout>,
     messages: Vec<Message>,
     tools: Vec<ToolDefinition>,
+    req_id: u64,
 ) {
     let n_msg = messages.len();
     let n_tools = tools.len();
-    log::info!("send_llm_request: {} messages, {} tools", n_msg, n_tools);
-    let req = PipeOut::Llm(LlmRequest { id: 0, messages, tools });
+    log::info!("send_llm_request: id={} {} messages, {} tools", req_id, n_msg, n_tools);
+    let req = PipeOut::Llm(LlmRequest { id: req_id, messages, tools });
     if let Ok(json) = serde_json::to_string(&req) {
         log::debug!(
             "send_llm_request pipe out: {}",

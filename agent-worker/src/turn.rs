@@ -136,6 +136,7 @@ pub fn begin_turn(
     tools: &[Box<dyn crate::tools::Tool>],
     ctx: &mut crate::tools::ToolContext,
     out: &mut BufWriter<std::io::Stdout>,
+    req_id: &mut u64,
 ) -> AgentState {
     info!("begin_turn: tree={}, text={}", tree_id, text);
 
@@ -196,7 +197,8 @@ pub fn begin_turn(
     }
 
     let definitions = collect_tool_definitions(tools);
-    send_llm_request(out, messages.clone(), definitions);
+    *req_id += 1;
+    send_llm_request(out, messages.clone(), definitions, *req_id);
 
     AgentState::new_streaming(messages, leaf_id, 0, 0, 0)
 }
@@ -410,6 +412,7 @@ pub fn finish_response(
     ctx: &mut crate::tools::ToolContext,
     out: &mut BufWriter<std::io::Stdout>,
     lsp_cfg: &LspConfig,
+    req_id: &mut u64,
 ) -> AgentState {
     let AgentState::Streaming {
         mut messages,
@@ -645,7 +648,8 @@ pub fn finish_response(
             }
 
             let definitions = collect_tool_definitions(tools);
-            send_llm_request(out, messages.clone(), definitions);
+            *req_id += 1;
+            send_llm_request(out, messages.clone(), definitions, *req_id);
 
             AgentState::new_streaming(messages, leaf_id, tool_call_round, tool_calls_this_turn, consecutive_failures)
         }
@@ -681,6 +685,7 @@ pub fn resolve_lsp_wait_into(
     lsp_clients: &mut std::collections::HashMap<String, LspClient>,
     out: &mut BufWriter<std::io::Stdout>,
     tools: &[Box<dyn crate::tools::Tool>],
+    req_id: &mut u64,
 ) -> AgentState {
     let AgentState::Streaming {
         mut messages, leaf_id, tool_call_round,
@@ -741,7 +746,8 @@ pub fn resolve_lsp_wait_into(
         }
     }
     let definitions = tools.iter().map(|t| t.definition()).collect();
-    send_llm_request(out, messages.clone(), definitions);
+    *req_id += 1;
+    send_llm_request(out, messages.clone(), definitions, *req_id);
     AgentState::new_streaming(messages, leaf_id, tool_call_round, tool_calls_this_turn, consecutive_failures)
 }
 
@@ -750,6 +756,7 @@ pub fn resolve_lsp_wait_with_timeout(
     ctx: &mut crate::tools::ToolContext,
     out: &mut BufWriter<std::io::Stdout>,
     tools: &[Box<dyn crate::tools::Tool>],
+    req_id: &mut u64,
 ) -> AgentState {
     let AgentState::Streaming {
         mut messages, leaf_id, tool_call_round,
@@ -776,7 +783,7 @@ pub fn resolve_lsp_wait_with_timeout(
                 ..wait
             }),
         },
-        &mut ctx.lsp_clients, out, tools,
+        &mut ctx.lsp_clients, out, tools, req_id,
     )
 }
 
