@@ -425,9 +425,6 @@ pub fn recover_tree(store: &Store, tree_id: &str) {
     if let Err(e) = store.save_tree_meta(&meta) {
         log::error!("[lifecycle] recover_tree: save meta for {}: {}", tree_id, e);
     }
-    if let Err(e) = store.reset_header_tokens(tree_id) {
-        log::warn!("[lifecycle] recover_tree: reset_header_tokens for {}: {}", tree_id, e);
-    }
 }
 
 pub fn shutdown_all(store: &Store) {
@@ -498,7 +495,7 @@ mod tests {
         let store = Store::new(dir.path().to_path_buf());
         let tree_id = "recover-test";
 
-        store.create_tree_file(tree_id, "model").unwrap();
+        store.create_tree_file(tree_id).unwrap();
         let start_id = "s1".to_string();
         let meta = agent_core::types::TreeMeta {
             id: tree_id.to_string(),
@@ -559,7 +556,7 @@ mod tests {
         let store = Store::new(dir.path().to_path_buf());
         let tree_id = "recover-empty";
 
-        store.create_tree_file(tree_id, "model").unwrap();
+        store.create_tree_file(tree_id).unwrap();
         let meta = agent_core::types::TreeMeta {
             id: tree_id.to_string(),
             parent_id: None,

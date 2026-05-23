@@ -76,6 +76,7 @@ impl Tool for BashTool {
         cmd.arg("-c")
             .arg(command)
             .current_dir(&ctx.cwd)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 

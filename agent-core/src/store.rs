@@ -1,27 +1,21 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use log::warn;
 
 use crate::config::agent_dir;
 use crate::types::{Entry, TreeHeader, TreeId, TreeMeta};
 
-// ── In-memory index cache ──
-
-static INDEX_CACHE: LazyLock<Mutex<HashMap<TreeId, TreeMeta>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 /// Per-file mutex for serializing appends to the same .jsonl file.
-static FILE_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+type FileLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
-fn with_file_lock<F, T>(id: &str, f: F) -> T
+fn with_file_lock<F, T>(file_locks: &FileLocks, id: &str, f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let mut locks = FILE_LOCKS.lock().unwrap();
+    let mut locks = file_locks.lock().unwrap();
     let lock = locks.entry(id.to_string()).or_default().clone();
     drop(locks);
     let _guard = lock.lock().unwrap();
@@ -52,19 +46,27 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Clone)]
 pub struct Store {
     base_dir: PathBuf,
+    index_cache: Arc<Mutex<HashMap<TreeId, TreeMeta>>>,
+    file_locks: FileLocks,
 }
 
 impl Default for Store {
     fn default() -> Self {
         Self {
             base_dir: agent_dir(),
+            index_cache: Arc::new(Mutex::new(HashMap::new())),
+            file_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
 impl Store {
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self {
+            base_dir,
+            index_cache: Arc::new(Mutex::new(HashMap::new())),
+            file_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn base_dir(&self) -> &PathBuf {
@@ -91,7 +93,7 @@ impl Store {
     // ── Index cache helpers ──
 
     fn update_index_cache(&self, meta: &TreeMeta) {
-        INDEX_CACHE.lock().unwrap().insert(meta.id.clone(), meta.clone());
+        self.index_cache.lock().unwrap().insert(meta.id.clone(), meta.clone());
     }
 
     // ── Tree metadata I/O ──
@@ -120,7 +122,7 @@ impl Store {
 
     pub fn get_tree(&self, id: &str) -> Result<Option<TreeMeta>> {
         // Check cache first
-        if let Some(meta) = INDEX_CACHE.lock().unwrap().get(id).cloned() {
+        if let Some(meta) = self.index_cache.lock().unwrap().get(id).cloned() {
             return Ok(Some(meta));
         }
         // Fall back to disk
@@ -132,14 +134,14 @@ impl Store {
     }
 
     pub fn list_trees(&self) -> Result<Vec<TreeMeta>> {
-        let cache = INDEX_CACHE.lock().unwrap();
+        let cache = self.index_cache.lock().unwrap();
         let mut trees: Vec<TreeMeta> = cache.values().cloned().collect();
         trees.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         Ok(trees)
     }
 
     pub fn clear_cache(&self, id: &str) {
-        INDEX_CACHE.lock().unwrap().remove(id);
+        self.index_cache.lock().unwrap().remove(id);
     }
 
     pub fn rebuild_index(&self) -> Result<Vec<TreeMeta>> {
@@ -183,7 +185,7 @@ impl Store {
 
     // ── Tree file (JSONL) I/O ──
 
-    pub fn create_tree_file(&self, id: &str, model: &str) -> Result<()> {
+    pub fn create_tree_file(&self, id: &str) -> Result<()> {
         let path = self.jsonl_path(id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -192,8 +194,6 @@ impl Store {
             kind: "meta".to_string(),
             version: 1,
             id: id.to_string(),
-            total_tokens: 0,
-            current_model: model.to_string(),
         };
         let mut line = serde_json::to_string(&header)?;
         line.push('\n');
@@ -203,7 +203,7 @@ impl Store {
 
     pub fn append_entry(&self, tree_id: &str, entry: &Entry) -> Result<()> {
         let path = self.jsonl_path(tree_id);
-        with_file_lock(tree_id, || -> Result<()> {
+        with_file_lock(&self.file_locks, tree_id, || -> Result<()> {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -251,47 +251,6 @@ impl Store {
         }
 
         Ok(entries)
-    }
-
-    pub fn update_header(&self, tree_id: &str, updates: &serde_json::Value) -> Result<()> {
-        let path = self.jsonl_path(tree_id);
-        with_file_lock(tree_id, || -> Result<()> {
-            let content = std::fs::read_to_string(&path)?;
-            let first_newline = content.find('\n').unwrap_or(content.len());
-            let header_line = &content[..first_newline];
-            let mut header: TreeHeader = serde_json::from_str(header_line)?;
-
-            if let Some(tokens) = updates.get("total_tokens").and_then(|v| v.as_u64()) {
-                header.total_tokens = tokens;
-            }
-            if let Some(model) = updates.get("current_model").and_then(|v| v.as_str()) {
-                header.current_model = model.to_string();
-            }
-
-            let rest = if first_newline < content.len() {
-                &content[first_newline + 1..]
-            } else {
-                ""
-            };
-            let mut new_header = serde_json::to_string(&header)?;
-            new_header.push('\n');
-
-            // Atomic write: temp file → write header + rest → rename
-            let tmp = path.with_extension("jsonl.tmp");
-            std::fs::write(&tmp, new_header.as_bytes())?;
-            let mut file = std::fs::OpenOptions::new().append(true).open(&tmp)?;
-            file.write_all(rest.as_bytes())?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&tmp, &path)?;
-
-            Ok(())
-        })
-    }
-
-    /// Reset `total_tokens` in the header to zero (called after session_end).
-    pub fn reset_header_tokens(&self, tree_id: &str) -> Result<()> {
-        self.update_header(tree_id, &serde_json::json!({"total_tokens": 0}))
     }
 
     /// Scan all trees and return IDs whose last entry is not a `SessionEnd`.
@@ -344,7 +303,7 @@ mod tests {
         let (store, dir) = make_store("subdir");
         let tree_id = "subdir-001";
 
-        store.create_tree_file(tree_id, "test-model").unwrap();
+        store.create_tree_file(tree_id).unwrap();
 
         let meta = TreeMeta {
             id: tree_id.to_string(),
@@ -368,7 +327,7 @@ mod tests {
         let (store, _dir) = make_store("create_read");
         let tree_id = "test-001";
 
-        store.create_tree_file(tree_id, "test-model").unwrap();
+        store.create_tree_file(tree_id).unwrap();
 
         let entries = store.read_all_entries(tree_id).unwrap();
         assert_eq!(entries.len(), 0);
@@ -379,7 +338,7 @@ mod tests {
         let (store, _dir) = make_store("append_read");
         let tree_id = "test-002";
 
-        store.create_tree_file(tree_id, "test-model").unwrap();
+        store.create_tree_file(tree_id).unwrap();
 
         let entry = Entry::SessionStart {
             id: "00000001".into(),
@@ -481,22 +440,19 @@ mod tests {
     }
 
     #[test]
-    fn test_update_header() {
-        let (store, _dir) = make_store("update_hdr");
+    fn test_header_is_immutable() {
+        let (store, _dir) = make_store("header_immutable");
         let tree_id = "test-004";
 
-        store.create_tree_file(tree_id, "old-model").unwrap();
+        store.create_tree_file(tree_id).unwrap();
 
-        store.update_header(tree_id, &serde_json::json!({
-            "total_tokens": 500,
-            "current_model": "new-model",
-        })).unwrap();
-
+        // Header should contain only structural fields
         let content = std::fs::read_to_string(store.jsonl_path(tree_id)).unwrap();
         let first_line = content.lines().next().unwrap();
         let header: TreeHeader = serde_json::from_str(first_line).unwrap();
-        assert_eq!(header.current_model, "new-model");
-        assert_eq!(header.total_tokens, 500);
+        assert_eq!(header.kind, "meta");
+        assert_eq!(header.version, 1);
+        assert_eq!(header.id, tree_id);
     }
 
     #[test]
@@ -507,7 +463,7 @@ mod tests {
         let id3 = "unterm-003";
 
         // id1: no entries at all (header only)
-        store.create_tree_file(id1, "model").unwrap();
+        store.create_tree_file(id1).unwrap();
         let meta1 = TreeMeta {
             id: id1.to_string(),
             parent_id: None,
@@ -521,7 +477,7 @@ mod tests {
         store.save_tree_meta(&meta1).unwrap();
 
         // id2: session_start + message, no session_end (unterminated)
-        store.create_tree_file(id2, "model").unwrap();
+        store.create_tree_file(id2).unwrap();
         let meta2 = TreeMeta {
             id: id2.to_string(),
             parent_id: None,
@@ -544,7 +500,7 @@ mod tests {
         }).unwrap();
 
         // id3: session_start + session_end (properly terminated)
-        store.create_tree_file(id3, "model").unwrap();
+        store.create_tree_file(id3).unwrap();
         let meta3 = TreeMeta {
             id: id3.to_string(),
             parent_id: None,

@@ -18,8 +18,6 @@ fn worker_round_trip() {
         "type": "meta",
         "version": 1,
         "id": tree_id,
-        "total_tokens": 0,
-        "current_model": "test-model"
     });
     let mut header_line = serde_json::to_string(&header).unwrap();
     header_line.push('\n');

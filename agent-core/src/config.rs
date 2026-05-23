@@ -306,7 +306,9 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
                     .collect();
                 if !paths.is_empty() {
                     cfg.sandbox.defaults.hide = paths;
-}
+                }
+            }
+        }
     }
 
     // [lsp]
@@ -335,8 +337,6 @@ fn apply_toml(cfg: &mut Config, table: &toml::Table) {
                 cfg.lsp.servers = parsed;
             }
         }
-    }
-}
     }
 }
 

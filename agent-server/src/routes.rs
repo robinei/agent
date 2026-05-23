@@ -105,7 +105,7 @@ fn handle_create_tree(body: &[u8], store: &Store, cfg: &Config) -> (u16, Vec<u8>
         sandbox,
     };
 
-    if let Err(e) = store.create_tree_file(&tree_id, &model) {
+    if let Err(e) = store.create_tree_file(&tree_id) {
         return json(
             500,
             &serde_json::json!({"error": format!("failed to create tree file: {}", e)}),
@@ -142,7 +142,6 @@ fn handle_create_tree(body: &[u8], store: &Store, cfg: &Config) -> (u16, Vec<u8>
             );
         }
         meta.leaf_id = model_set.id().to_string().into();
-        let _ = store.update_header(&tree_id, &serde_json::json!({"current_model": model}));
     }
 
     if let Err(e) = store.save_tree_meta(&meta) {

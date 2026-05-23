@@ -73,7 +73,7 @@ impl LocalClient {
         };
 
         self.store
-            .create_tree_file(&tree_id, &model)
+            .create_tree_file(&tree_id)
             .map_err(|e| format!("failed to create tree file: {}", e))?;
 
         let session_start_id = agent_core::util::generate_entry_id();
@@ -101,9 +101,6 @@ let mut meta = meta;
                 .append_entry(&tree_id, &model_set)
                 .map_err(|e| format!("failed to write model_set: {}", e))?;
             meta.leaf_id = model_set.id().to_string().into();
-            let _ = self
-                .store
-                .update_header(&tree_id, &serde_json::json!({"current_model": model}));
         }
 
         self.store

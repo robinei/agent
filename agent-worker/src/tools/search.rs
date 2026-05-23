@@ -282,7 +282,7 @@ mod tests {
         with_temp_agent_dir("find", |path| {
             let store = Store::new(path.clone());
             let tree_id = "search-test-001";
-            store.create_tree_file(tree_id, "test-model").unwrap();
+            store.create_tree_file(tree_id).unwrap();
 
             let msg = Message {
                 role: MessageRole::User,
@@ -315,7 +315,7 @@ mod tests {
         with_temp_agent_dir("by_tree", |path| {
             let store = Store::new(path.clone());
             let tree_id = "search-test-002";
-            store.create_tree_file(tree_id, "test-model").unwrap();
+            store.create_tree_file(tree_id).unwrap();
 
             let msg = Message {
                 role: MessageRole::User,

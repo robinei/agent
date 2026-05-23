@@ -192,14 +192,14 @@ pub fn current_goal(entries: &[Entry], leaf_id: &str) -> Option<String> {
 
 // ── File header (first line of .jsonl) ──
 
+/// Immutable file header (first line of data.jsonl). Never mutated after
+/// creation — treat as a magic number / structural identifier.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TreeHeader {
     #[serde(rename = "type")]
     pub kind: String,
     pub version: u8,
     pub id: TreeId,
-    pub total_tokens: u64,
-    pub current_model: String,
 }
 
 // ── Tree entries ──
