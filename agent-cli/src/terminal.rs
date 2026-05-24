@@ -28,7 +28,7 @@ pub enum TermEvent {
 
 /// A styled text chunk for `Terminal::append`. Build with `Span::plain` or
 /// `Span::styled`; use `crossterm::style::ContentStyle` to set colors/attributes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     pub text: String,
     pub style: ContentStyle,
@@ -66,6 +66,7 @@ pub struct Terminal {
     spinner_active: bool,
     spinner_frame: usize,
     last_spinner_tick: Instant,
+    torn_down: bool,
 }
 
 impl Terminal {
@@ -94,6 +95,7 @@ impl Terminal {
             spinner_active: false,
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
+            torn_down: false,
         };
 
         execute!(term.stdout, DisableLineWrap)?;
@@ -645,6 +647,10 @@ impl Terminal {
     }
 
     pub fn teardown(&mut self) -> io::Result<()> {
+        if self.torn_down {
+            return Ok(());
+        }
+        self.torn_down = true;
         let _ = execute!(self.stdout, PopKeyboardEnhancementFlags);
         execute!(
             self.stdout,

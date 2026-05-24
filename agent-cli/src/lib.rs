@@ -369,7 +369,7 @@ fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &
     let rp = abs.to_string_lossy().to_string();
 
     let meta = backend.create_tree(
-        Some("untitled"),
+        None,
         Some(&rp),
         None,
         &[],
@@ -418,18 +418,21 @@ fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &
     }
     
     // Listen for MetaUpdate emitted by the worker after auto-title completes.
+    use client::TryEvent;
+    session.set_nonblocking(true).ok();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        match session.next_event() {
-            Some(Ok(ServerEvent::MetaUpdate { title: Some(t) })) => {
+        if stop.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
+            break;
+        }
+        match session.try_next_event() {
+            TryEvent::Event(ServerEvent::MetaUpdate { title: Some(t) }) => {
                 println!("\nTitle: {}", t);
                 break;
             }
-            Some(Ok(_)) => continue,
-            Some(Err(e)) => {
-                eprintln!("Auto-title event error: {}", e);
-                break;
-            }
-            None => break,
+            TryEvent::Event(_) => continue,
+            TryEvent::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(100)),
+            TryEvent::Closed | TryEvent::Err(_) => break,
         }
     }
 }

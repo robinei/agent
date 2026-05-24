@@ -282,7 +282,8 @@ fn render_event(
                 term.append(&[Span::plain("\r\n")])?;
                 state.trailing_newlines = 1;
             }
-            md.push(content, term)?;
+            let tw = term.cols() as usize;
+            md.push(content, &mut |spans| term.append(spans), tw)?;
         }
         ServerEvent::ThinkingChunk { content } => {
             if !state.in_thinking {
@@ -547,7 +548,8 @@ fn render_event(
             term.flush_append()?;
         }
         ServerEvent::Done { status } => {
-            md.flush(term)?;
+            let tw = term.cols() as usize;
+            md.flush(&mut |spans| term.append(spans), tw)?;
             if state.in_thinking {
                 state.in_thinking = false;
                 term.append(&[Span::plain("\r\n")])?;
@@ -751,6 +753,10 @@ fn process_message(
                             ..
                         }
                     );
+                    if fatal {
+                        let tw = term.cols() as usize;
+                        md.flush(&mut |spans| term.append(spans), tw).map_err(|e| e.to_string())?;
+                    }
                     if done || fatal {
                         term.set_spinner_active(false)
                             .map_err(|e| e.to_string())?;
@@ -761,11 +767,15 @@ fn process_message(
                 TryEvent::Closed => {
                     term.set_spinner_active(false)
                         .map_err(|e| e.to_string())?;
+                    let tw = term.cols() as usize;
+                    md.flush(&mut |spans| term.append(spans), tw).map_err(|e| e.to_string())?;
                     return Ok(());
                 }
                 TryEvent::Err(e) => {
                     term.set_spinner_active(false)
                         .map_err(|e| e.to_string())?;
+                    let tw = term.cols() as usize;
+                    md.flush(&mut |spans| term.append(spans), tw).map_err(|e| e.to_string())?;
                     let _ = term.append(&[Span::plain(format!("\r\nws error: {}\r\n", e))]);
                     let _ = term.flush_append();
                     return Ok(());
@@ -778,6 +788,8 @@ fn process_message(
         if stop.load(Ordering::Relaxed) {
             term.set_spinner_active(false)
                 .map_err(|e| e.to_string())?;
+            let tw = term.cols() as usize;
+            let _ = md.flush(&mut |spans| term.append(spans), tw);
             let _ = term.append(&[Span::plain("\r\nInterrupted\r\n")]);
             let _ = term.flush_append();
             break;
@@ -962,6 +974,7 @@ pub fn run_interactive(
     let mut md = MarkdownEmitter::new();
     let mut history: Vec<String> = Vec::new();
     let mut history_idx: Option<usize> = None;
+    let mut history_draft = String::new();
 
     let green = ContentStyle {
         foreground_color: Some(Color::Green),
@@ -1050,6 +1063,7 @@ pub fn run_interactive(
                     }
                     match history_idx {
                         None => {
+                            history_draft = term.input().to_string();
                             history_idx = Some(history.len() - 1);
                         }
                         Some(0) => {}
@@ -1064,7 +1078,7 @@ pub fn run_interactive(
                         None => {}
                         Some(i) if i + 1 >= history.len() => {
                             history_idx = None;
-                            let _ = term.clear_input();
+                            let _ = term.set_input(&history_draft);
                         }
                         Some(ref mut i) => {
                             *i += 1;

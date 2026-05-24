@@ -82,10 +82,14 @@ fn main() -> io::Result<()> {
             // immediately once the sender finishes, stopping the spinner promptly.
             loop {
                 match rx.try_recv() {
-                    Ok(c) => { md.push(&c.to_string(), &mut term)?; }
+                    Ok(c) => {
+                        let tw = term.cols() as usize;
+                        md.push(&c.to_string(), &mut |spans| term.append(spans), tw)?;
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        md.flush(&mut term)?;
+                        let tw = term.cols() as usize;
+                        md.flush(&mut |spans| term.append(spans), tw)?;
                         content_done = true;
                         term.set_spinner_active(false)?;
                         break;
