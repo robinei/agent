@@ -648,6 +648,7 @@ struct InputLine {
     last_visual_line: usize,
     total_visual_lines: usize,
     anchored_col: Option<usize>,
+    last_term_cols: usize,
 }
 
 impl InputLine {
@@ -661,6 +662,7 @@ impl InputLine {
             last_visual_line: 0,
             total_visual_lines: 1,
             anchored_col: None,
+            last_term_cols: 0,
         }
     }
 
@@ -971,8 +973,43 @@ impl InputLine {
         }
     }
 
+    // Compute which visual terminal row the cursor is on, given a terminal width.
+    fn cursor_visual_row(&self, prompt_len: usize, tw: usize) -> usize {
+        let vrows = |n: usize| if n == 0 { 1 } else { (n - 1) / tw + 1 };
+        let content: String = self.buf.iter().collect();
+        let logical_lines: Vec<&str> = content.split('\n').collect();
+        let newlines_before = self.buf[..self.cursor].iter().filter(|&&c| c == '\n').count();
+        let line_start = self.buf[..self.cursor].iter().rposition(|&c| c == '\n').map(|p| p + 1).unwrap_or(0);
+        let col_in_line = self.cursor - line_start;
+        let cursor_eff = if newlines_before == 0 { prompt_len + col_in_line } else { col_in_line };
+        let mut visual_line = 0usize;
+        for (i, line) in logical_lines[..newlines_before].iter().enumerate() {
+            let eff = if i == 0 { prompt_len + line.chars().count() } else { line.chars().count() };
+            visual_line += vrows(eff);
+        }
+        let row_in_line = if cursor_eff == 0 {
+            0
+        } else if cursor_eff % tw == 0 {
+            cursor_eff / tw - 1
+        } else {
+            cursor_eff / tw
+        };
+        visual_line + row_in_line
+    }
+
     fn redraw(&mut self, out: &mut impl Write, prompt: &str) {
         self.snap_cursor();
+
+        let tw = termion::terminal_size().map(|(w, _)| w as usize).unwrap_or(80).max(1);
+        let prompt_len = prompt.chars().count();
+
+        // On resize the terminal reflows content, moving the cursor to a different
+        // row. Recompute last_visual_line under the new width so the Up() below
+        // reaches the top of the input area correctly.
+        if tw != self.last_term_cols && self.last_term_cols != 0 {
+            self.last_visual_line = self.cursor_visual_row(prompt_len, tw);
+        }
+        self.last_term_cols = tw;
 
         let old_total = self.total_visual_lines;
 
@@ -985,45 +1022,63 @@ impl InputLine {
         let content: String = self.buf.iter().collect();
         write!(out, "{}", content.replace('\n', "\r\n")).ok();
 
-        self.total_visual_lines = 1 + self.buf.iter().filter(|&&c| c == '\n').count();
+        // Count visual rows accounting for terminal line-wrapping.
+        // Each logical line (between \n chars) may wrap across multiple terminal rows.
+        // An exactly-full row (effective_len == tw) leaves the cursor at the last
+        // column with the pending-wrap flag — it is still one visual row, not two.
+        // Use ceiling division: (n-1)/tw + 1, which gives 1 for any n in 1..=tw.
+        let logical_lines: Vec<&str> = content.split('\n').collect();
+        let vrows = |n: usize| if n == 0 { 1 } else { (n - 1) / tw + 1 };
+        let mut total_visual = 0usize;
+        for (i, line) in logical_lines.iter().enumerate() {
+            let eff = if i == 0 { prompt_len + line.chars().count() } else { line.chars().count() };
+            total_visual += vrows(eff);
+        }
+        self.total_visual_lines = total_visual;
 
+        // Clear old lines if the input shrank.
         write!(out, "\r").ok();
         for _ in self.total_visual_lines..old_total {
             write!(out, "\r\n{}", clear::AfterCursor).ok();
         }
 
-        let cursor_row = if old_total > self.total_visual_lines {
-            old_total - 1
-        } else {
-            self.total_visual_lines - 1
-        };
-
-        let newlines_before = self.buf[..self.cursor]
-            .iter()
-            .filter(|&&c| c == '\n')
-            .count();
+        // Compute cursor visual row and terminal column, accounting for wrapping.
+        let newlines_before = self.buf[..self.cursor].iter().filter(|&&c| c == '\n').count();
         let line_start = self.buf[..self.cursor]
             .iter()
             .rposition(|&c| c == '\n')
             .map(|pos| pos + 1)
             .unwrap_or(0);
         let col_in_line = self.cursor - line_start;
-        let cursor_line = newlines_before;
-        self.last_visual_line = cursor_line;
+        let cursor_eff = if newlines_before == 0 { prompt_len + col_in_line } else { col_in_line };
 
-        let rows_to_move = cursor_row - cursor_line;
-        if rows_to_move > 0 {
-            write!(out, "{}", termion::cursor::Up(rows_to_move as u16)).ok();
+        let mut cursor_visual_line = 0usize;
+        for (i, line) in logical_lines[..newlines_before].iter().enumerate() {
+            let eff = if i == 0 { prompt_len + line.chars().count() } else { line.chars().count() };
+            cursor_visual_line += vrows(eff);
         }
+        // When cursor_eff is an exact multiple of tw the cursor sits at the last
+        // column of the current terminal row (pending-wrap state), not the first
+        // column of the next row.
+        let (row_in_line, cursor_term_col) = if cursor_eff == 0 {
+            (0, 0)
+        } else if cursor_eff % tw == 0 {
+            (cursor_eff / tw - 1, tw - 1)
+        } else {
+            (cursor_eff / tw, cursor_eff % tw)
+        };
+        cursor_visual_line += row_in_line;
 
-        let prompt_width = if cursor_line == 0 { prompt.len() } else { 0 };
-        if prompt_width + col_in_line > 0 {
-            write!(
-                out,
-                "{}",
-                termion::cursor::Right((prompt_width + col_in_line) as u16)
-            )
-            .ok();
+        self.last_visual_line = cursor_visual_line;
+
+        // Move from the bottom of the drawn area up to the cursor row, then right.
+        let bottom_row = old_total.max(self.total_visual_lines) - 1;
+        let rows_up = bottom_row - cursor_visual_line;
+        if rows_up > 0 {
+            write!(out, "{}", termion::cursor::Up(rows_up as u16)).ok();
+        }
+        if cursor_term_col > 0 {
+            write!(out, "{}", termion::cursor::Right(cursor_term_col as u16)).ok();
         }
 
         out.flush().ok();
