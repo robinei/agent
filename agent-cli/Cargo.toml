@@ -10,7 +10,7 @@ ureq          = "3"
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
 clap          = { version = "4", features = ["derive"] }
-termion       = "4"
+crossterm     = "0.28"
 ctrlc         = "3.4"
 tungstenite   = { version = "0.21", default-features = false, features = ["handshake"] }
 nix           = { version = "0.29", features = ["poll", "socket"] }

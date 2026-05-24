@@ -9,6 +9,8 @@ use clap::Parser;
 mod client;
 mod interactive;
 mod local;
+pub mod markdown;
+pub mod terminal;
 
 use client::{AgentClient, AgentSession};
 use local::LocalClient;

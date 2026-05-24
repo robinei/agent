@@ -118,153 +118,184 @@ On completion: delete this entry, then commit code + PLAN.md together with:
 
 ## Pending Steps
 
-### OwnedRegion + InputBox + StatusBar
+### Migrate `interactive.rs` to `Terminal` + `MarkdownEmitter`
 
-**Goal:** Replace the direct-terminal `InputLine::redraw` with a clean owned-region
-abstraction. Components produce `Frame`s (lines + cursor); one place handles all
-cursor arithmetic, grow/shrink, resize, and scroll-region management. Then add a
-persistent status bar and make the input box always visible — even while the agent
-is streaming output above it.
+- [ ] Step 1: `terminal.rs` — add `timeout: Duration` parameter to `poll`; update `terminal_demo.rs` call site to pass `Duration::ZERO`
+- [ ] Step 2: `interactive.rs` — delete removed infrastructure (see spec below)
+- [ ] Step 3: `interactive.rs` — add `RenderState` and `render_event` free function
+- [ ] Step 4: `interactive.rs` — add `wait_for_wakeup` (`#[cfg(unix)]` + `#[cfg(not(unix))]`)
+- [ ] Step 5: `interactive.rs` — rewrite `process_message`
+- [ ] Step 6: `interactive.rs` — rewrite `select_or_create_tree` / `create_tree_interactive`
+- [ ] Step 7: `interactive.rs` — rewrite `run_interactive`
+- [ ] Step 8: `interactive.rs` helper fns — convert `print_warning` / `print_error` / `print_help` / `print_tree_meta` to use `Terminal`
+- [ ] Step 9: `agent-cli/Cargo.toml` — remove `termion` dependency
 
----
+**Goal:** `termion` goes away completely. `TerminalRenderer`, `InputLine`, `LineEvent` go away with it. All terminal mechanism lives in `terminal.rs`; `interactive.rs` keeps only app logic.
 
-#### Key design
+**Spec:**
 
-**Unified model — owned region is always active.**
-There is no "streaming mode" vs "input mode" switch. The owned region (input box
-+ status bar) is set up once at session start and stays up until exit.
-`TerminalRenderer` always writes via `OwnedRegion::append_above`; the cursor
-lives in the input line permanently.
+_Step 1 — `terminal.rs`: `poll` signature change_
 
-**`OwnedRegion::render(out, frame)`** — redraws the owned block in place:
+```rust
+// before
+pub fn poll(&mut self) -> io::Result<Option<TermEvent>>
+// after
+pub fn poll(&mut self, timeout: Duration) -> io::Result<Option<TermEvent>>
 ```
-Up(last_row_count)   go to top of owned region
-\r + AfterCursor     erase old contents
-write frame.lines    separated by \r\n, no trailing newline
-set scroll region    \x1b[1;{H - frame_height}r  (protects owned rows)
-position cursor      Up(rows_from_bottom) + Right(col)
+Inside: replace `event::poll(Duration::ZERO)` with `event::poll(timeout)`.
+`terminal_demo.rs`: `term.poll(Duration::ZERO)?`
+
+_Step 2 — Delete from `interactive.rs`:_
+
+- All `use termion::…` imports
+- `use nix::poll::…` (move under `#[cfg(unix)]` in step 4)
+- `const SPINNER_FRAMES` and `const SPINNER_INTERVAL_MS` (duplicates of `terminal.rs`)
+- `struct TerminalRenderer<'a>` + full `impl` block
+- `fn normalize_for_raw`, `fn count_trailing_crlf`, `fn poll_key`
+- `struct InputLine` + full `impl` block
+- `enum LineEvent`
+- Tests: `test_normalize_for_raw_*` and `test_inputline_*`
+- Keep: `format_tool_args`, `test_format_tool_args_*`, `test_render_done_*`
+
+Add imports:
+```rust
+use crate::terminal::{Span, TermEvent, Terminal};
+use crate::markdown::MarkdownEmitter;
+use crossterm::style::{Color, ContentStyle};
+#[cfg(unix)] use std::os::unix::io::RawFd;
 ```
-Grow and shrink are automatic: `AfterCursor` always clears the old extent;
-the scroll region is updated to the new height after each render.
-Resize: if `tw` changed since the last render, recompute `last_row_count` using
-the new width before the `Up()` — same logic as the existing `last_term_cols` fix.
 
-**`OwnedRegion::append_above(out, content)`** — what `TerminalRenderer` calls
-instead of writing directly. Saves cursor, jumps to `TerminalRenderer`'s tracked
-position at the bottom of the scroll region, writes, restores:
+_Step 3 — `RenderState` + `render_event`:_
+
+```rust
+struct RenderState {
+    trailing_newlines: u8,
+    in_thinking: bool,
+    assistant_header_shown: bool,
+    last_tool_args: Option<(String, serde_json::Value)>,
+}
 ```
-\x1b[?25l            hide cursor (prevent flicker during jump)
-\x1b[s               save cursor (in owned region)
-\x1b[{bottom};{col}H jump to TerminalRenderer's write-head position
-write content        \r\n at the scroll-region boundary causes scroll-up,
-                     owned rows are unaffected
-\x1b[u               restore cursor to input line
-\x1b[?25h            show cursor
+
+`render_event` is a free function:
+```rust
+fn render_event(
+    event: &ServerEvent,
+    state: &mut RenderState,
+    md: &mut MarkdownEmitter,
+    term: &mut Terminal,
+) -> io::Result<()>
 ```
-`TerminalRenderer` already tracks `col`; this determines the column for the jump.
-After each `append_above` call, `TerminalRenderer` updates its tracked position
-based on what it wrote.
 
-**Grow/shrink of owned region**: when input wraps to more lines or shrinks back,
-`render` handles it via `AfterCursor` + updated scroll region. No special cases.
+Port of `TerminalRenderer::render_event`:
+- `write_text(content)` → `md.push(content, term)?`
+- `write_thinking(content)` → `term.append` with dim/grey styled spans
+- `blank_line_sep()` → emit `\r\n` spans if `state.trailing_newlines < 2`
+- `hide_spinner()` / `show_spinner()` → `term.set_spinner_active(false/true)?`
+- `color::Fg(color::X)` → `ContentStyle { foreground_color: Some(Color::X), ..Default::default() }`
+- `style::Bold` → `ContentStyle { attributes: Attributes::from(Attribute::Bold), ..Default::default() }`
+- `write!(self.out, …)` → `term.append(&[Span::plain(…)])?; term.flush_append()?`
+- On `Done`: call `md.flush(term)?` before returning
+- `col` tracking removed entirely
 
----
+Make `SPINNER_INTERVAL` in `terminal.rs` `pub(crate)` so `render_event` / `process_message` can import it.
 
-#### Phase 1 — `OwnedRegion` + `Frame` (`agent-cli/src/owned_region.rs`)
+_Step 4 — `wait_for_wakeup`:_
 
-- [ ] Define `Frame { lines: Vec<String>, cursor: Option<(usize, usize)> }`
-      where `cursor` is `(row, col)` within `lines` (0-indexed)
-- [ ] Define `OwnedRegion { last_row_count: usize, last_term_cols: usize }`
-- [ ] Implement `OwnedRegion::setup(out)`:
-  - Print `initial_height` newlines to push content up and create owned-region
-    space; set initial scroll region; set `last_row_count = 0` (first `render`
-    call writes from scratch)
-- [ ] Implement `OwnedRegion::render(out, frame)`:
-  - Query `(tw, th)` from `termion::terminal_size()`
-  - If `tw != last_term_cols`: recompute `last_row_count` for the new width
-    before doing `Up()`
-  - `Up(last_row_count)` if > 0, then `\r` + `clear::AfterCursor`
-  - Write `frame.lines` separated by `\r\n` (no trailing newline on last line)
-  - Update scroll region: `write!(out, "\x1b[1;{}r", th - frame.lines.len())`
-  - Position cursor: `Up(bottom_row - cursor_row)` then `Right(cursor_col)`
-  - Store `last_row_count = frame.lines.len()`, `last_term_cols = tw`
-- [ ] Implement `OwnedRegion::append_above(out, content, write_col)`:
-  - `write_col` is `TerminalRenderer`'s current column (where to resume writing)
-  - Query `(_, th)` from `termion::terminal_size()`; `bottom = th - last_row_count`
-  - Emit: hide cursor, save, `\x1b[{bottom};{write_col+1}H`, content, restore,
-    show cursor
-- [ ] Implement `OwnedRegion::teardown(out)`:
-  - `Up(last_row_count)`, `\r` + `AfterCursor`, reset scroll region `\x1b[r`
+```rust
+#[cfg(unix)]
+fn wait_for_wakeup(ws_fds: &[RawFd], term: &mut Terminal, timeout: Duration) -> io::Result<Option<TermEvent>> {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::os::unix::io::BorrowedFd;
+    let stdin_fd = { use std::os::unix::io::AsRawFd; std::io::stdin().as_raw_fd() };
+    let pt = PollTimeout::try_from(timeout.as_millis().min(u16::MAX as u128) as u16)
+        .unwrap_or(PollTimeout::ZERO);
+    let mut fds: Vec<PollFd> = ws_fds.iter()
+        .map(|&fd| unsafe { PollFd::new(BorrowedFd::borrow_raw(fd), PollFlags::POLLIN) })
+        .chain(std::iter::once(unsafe {
+            PollFd::new(BorrowedFd::borrow_raw(stdin_fd), PollFlags::POLLIN)
+        }))
+        .collect();
+    let _ = poll(&mut fds, pt);
+    if fds.last().and_then(|f| f.revents()).map_or(false, |r| r.contains(PollFlags::POLLIN)) {
+        term.poll(Duration::ZERO)
+    } else {
+        Ok(None)
+    }
+}
 
-#### Phase 2 — `InputLine` becomes pure layout
+#[cfg(not(unix))]
+fn wait_for_wakeup(_ws_fds: &[RawFd], term: &mut Terminal, timeout: Duration) -> io::Result<Option<TermEvent>> {
+    term.poll(timeout)
+}
+```
 
-- [ ] Add `InputLine::layout(prompt: &str, tw: usize) -> (Vec<String>, (usize, usize))`:
-  - Returns the terminal lines the input occupies and `(cursor_row, cursor_col)`
-    within those lines; no terminal I/O
-  - Move all wrapping/row-count arithmetic from `redraw` here; reuse `vrows`
-    closure and pending-wrap cursor formula
-- [ ] Remove `InputLine::redraw`; remove `last_visual_line`, `total_visual_lines`,
-      `last_term_cols` from the struct (all owned by `OwnedRegion` now)
-- [ ] Every call site becomes:
-  `let (lines, cursor) = input.layout(prompt, tw);`
-  `region.render(out, Frame { lines, cursor: Some(cursor) });`
+The `ws_fds` parameter is `&[RawFd]` to handle the case of multiple concurrent WS connections to the same tree.
 
-#### Phase 3 — `StatusBar` component
+_Step 5 — `process_message` rewrite:_
 
-- [ ] Define `StatusBar { model: String, thinking_effort: Option<String>, prompt_tokens: u64, context_window: u64 }`
-- [ ] `StatusBar::render_line(tw: usize) -> String`:
-  - Format: `  <model>  thinking:<effort>  ctx: <used>/<limit>k (<pct>%)`
-  - Pad to `tw` with spaces; wrap in `\x1b[48;5;236m...\x1b[m`
-  - Omit thinking field when `thinking_effort` is `None`
-- [ ] Initialize from `agent_core::config::load_config()` inside `run_interactive`
+```rust
+fn process_message(
+    backend: &Backend,
+    tree_id: &str,
+    text: &str,
+    term: &mut Terminal,
+    md: &mut MarkdownEmitter,
+    stop: &AtomicBool,
+) -> io::Result<()>
+```
 
-#### Phase 4 — Frame assembly + wiring
+- `ws_fds`: `let ws_fds: Vec<RawFd> = session.as_raw_fd().into_iter().collect();`
+- `term.set_spinner_active(true)?` at start
+- Drain WS loop: call `render_event`, on `Done`/`Fatal` call `term.set_spinner_active(false)?` and return
+- Ctrl-C check: `stop.load` → append interrupted message
+- Wait: `wait_for_wakeup(&ws_fds, term, remaining_until_next_spinner_tick)?`
+  - On `TermEvent::Cancel`: append cancelling message, `session.send_stop()`, set `cancel_signalled`
+- Spinner advances automatically inside `Terminal`'s `render_owned_impl`; no manual `spin_frame`/`tick_spinner`
 
-- [ ] Add `fn build_frame(input: &InputLine, status: &StatusBar, prompt: &str, tw: usize) -> Frame`:
-  - `input.layout(prompt, tw)` → lines + cursor
-  - Push `status.render_line(tw)` as the final line
-  - Return `Frame { lines, cursor: Some(cursor) }`
-- [ ] Replace all `input.redraw(...)` call sites with `region.render(out, build_frame(...))`
-- [ ] Resize: `render` already handles it; no extra wiring needed
-- [ ] Handle `Entry::ModelSet` → update `status.model`, call `region.render`
-- [ ] Handle `ServerEvent::ContextUsage` → update `status.prompt_tokens`, call
-      `region.render`
+_Step 6 — `select_or_create_tree` / `create_tree_interactive`:_
 
-#### Phase 5 — `TerminalRenderer` uses `append_above`
+New signatures:
+```rust
+fn select_or_create_tree(term: &mut Terminal, backend: &Backend) -> Result<String, String>
+fn create_tree_interactive(term: &mut Terminal, backend: &Backend) -> Result<String, String>
+```
 
-- [ ] Add `write_col: usize` tracking to `TerminalRenderer` (it already tracks
-      `col`; this is the same value, just plumbed through to `append_above`)
-- [ ] Replace every `write!(self.out, ...)` in `TerminalRenderer` with calls to
-      `region.append_above(out, content, self.col)`, updating `self.col` after
-      each call as it does now
-- [ ] After `append_above`, call `region.render(out, build_frame(...))` to redraw
-      the owned region — this keeps the status bar and input box current after
-      every streaming event
-- [ ] Handle `ServerEvent::ContextUsage` and `Entry::ModelSet` in the streaming
-      event loop: update `status`, then `region.render`
+Input loop: `term.poll(Duration::from_millis(16))` matching on `Submit`/`Cancel`. Output via `term.append` + `flush_append`.
 
-#### Phase 6 — Config + worker plumbing (configurable context window)
+_Step 7 — `run_interactive` rewrite:_
 
-- [ ] Add `context_window: u64` (default `128_000`) to `SessionConfig` in
-      `agent-core/src/config.rs`; TOML key `session.context_window`
-- [ ] Add `context_window: u64` to `WorkerConfig` in `agent-core/src/rpc.rs`
-      (`#[serde(default)]`)
-- [ ] Add `ServerEvent::ContextUsage { prompt_tokens: u64 }` to
-      `agent-core/src/types.rs`
-- [ ] Pass `config.session.context_window` into `WorkerConfig` in
-      `agent-server/src/lifecycle.rs`
-- [ ] In `agent-worker/src/lib.rs`: pass `context_window` into `SessionConfig`
-- [ ] In `agent-worker/src/turn.rs`: replace hardcoded `128_000` with
-      `session_cfg.context_window`; emit `ContextUsage { prompt_tokens: estimated as u64 }`
-      right after `estimate_context_tokens()`
+```rust
+pub fn run_interactive(backend: &Backend, initial_repo_path: Option<String>, stop: &AtomicBool) -> Result<(), String>
+```
 
----
+- `Terminal::new("> ")` replaces `into_raw_mode` + `keys` + `InputLine`
+- `MarkdownEmitter::new()` for markdown rendering
+- `history: Vec<String>` + `history_idx: Option<usize>` replace `InputLine::history`
+- Main loop: `term.poll(Duration::from_millis(16))?` matching `Submit`/`Cancel`/`HistoryPrev`/`HistoryNext`/`Resize`
+- On `HistoryPrev`/`HistoryNext`: update `history_idx`, call `term.set_input(&history[i])?`
+- `process_message` called with `&mut term, &mut md`
+- `term.teardown()` on exit
+
+_Step 8 — helper functions:_
+
+`print_warning`, `print_error`, `print_help`, `print_tree_meta` are rewritten to accept `&mut Terminal` and use `term.append` + `ContentStyle` instead of `write!` + termion escapes. `normalize_for_raw` is not needed (Terminal handles `\n` → `\r\n`).
+
+_Step 9 — `Cargo.toml`:_
+
+Remove `termion` from `agent-cli/Cargo.toml`. Confirm `cargo build` succeeds and no termion references remain (`grep -r termion agent-cli/`).
 
 **Verify:**
-- Input wraps past terminal width: no duplicate lines, cursor correct
-- Resize mid-input: redraws correctly, no line above input disturbed
-- Input shrinks (backspace across wrap): extra row cleared cleanly
-- Status bar visible during input, streaming, and spinner
-- Context % updates after each turn; model name updates on `Entry::ModelSet`
-- `session.context_window = 32000` in config → bar shows `/ 32k`
-- Exit cleanly: status bar and owned region erased, scroll region reset
+
+```sh
+# No termion references remain
+grep -r termion agent-cli/src/
+
+# Builds clean
+cargo build -p agent-cli 2>&1 | grep -E "^error"
+
+# Tests pass
+cargo test -p agent-cli 2>&1 | tail -20
+
+# Smoke test: demo still works
+cargo run --bin terminal_demo
+```
