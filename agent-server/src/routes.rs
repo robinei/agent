@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::lifecycle;
+use crate::spawner;
 use agent_core::config::Config;
 use agent_core::types::{TreeMeta, TreeSandbox};
 
@@ -153,7 +153,7 @@ fn handle_update_tree(id: &str, body: &[u8]) -> (u16, Vec<u8>, &'static str) {
 }
 
 fn handle_stop_agent(id: &str) -> (u16, Vec<u8>, &'static str) {
-    match lifecycle::worker_stop(id) {
+    match spawner::worker_stop(id) {
         Ok(()) => json(200, &serde_json::json!({"status": "stopping"})),
         Err(e) => json(404, &serde_json::json!({"error": e})),
     }

@@ -68,7 +68,7 @@ This is the message the CLI shows when the worker subprocess died. **First place
 [worker abcd...] bwrap: Can't mkdir /home/user/.bash_history: Not a directory
 ```
 
-The hide list contained a file. `lifecycle.rs::build_bwrap_argv` emits `--bind /dev/null <path>` for files and `--tmpfs <path>` for directories; if you see this error in new code, the path classification is wrong.
+The hide list contained a file. `sandbox.rs::build_bwrap_argv` emits `--bind /dev/null <path>` for files and `--tmpfs <path>` for directories; if you see this error in new code, the path classification is wrong.
 
 ```
 [worker abcd...] bwrap: setting up uid map: Permission denied
@@ -129,7 +129,7 @@ If the WS connection drops immediately, the worker spawn failed — check the se
 
 ## SIGINT / clean shutdown
 
-`Ctrl-C` on the server triggers `signal_hook` → `shutting_down` flag → main accept loop breaks → `lifecycle::shutdown_all` walks active workers, sends `{"method":"stop"}` on each stdin, polls `try_wait` for up to 60s, escalates to `child.kill()` for stragglers, then `recover_tree` appends a linked synthetic `SessionEnd` (status `Aborted`) so the next session boundary is clean.
+`Ctrl-C` on the server triggers `signal_hook` → `shutting_down` flag → main accept loop breaks → `spawner::shutdown_all` walks active workers, sends `{"method":"stop"}` on each stdin, polls `try_wait` for up to 60s, escalates to `child.kill()` for stragglers, then `recover_tree` appends a linked synthetic `SessionEnd` (status `Aborted`) so the next session boundary is clean.
 
 If the server is killed with SIGKILL (no graceful shutdown), `--die-with-parent` on bwrap kills the workers, and on next startup `scan_unterminated` writes synthetic `SessionEnd`s for any tree whose last entry isn't one.
 
@@ -151,7 +151,7 @@ AGENT_TEST_STUB=1 ./target/debug/agent worker --tree-id <id> --config <path>
 
 | Tag | Source | What it means |
 |---|---|---|
-| `[lifecycle]` | server | worker spawn / shutdown / recover |
+| `[spawner]` | server | worker spawn / shutdown / recover |
 | `[proxy <id>]` | server stdout-proxy thread | worker stdout reader |
 | `[worker <id>]` | server stderr-demux thread | a line the worker wrote to stderr |
 | `[ws <id>]` | server WS session thread | per-connection events (pong timeout, etc.) |

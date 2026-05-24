@@ -12,8 +12,8 @@ pub use crate::worker_ctx::{PollHandler, WorkerCtx};
 pub use crate::ws_client::WsClient;
 
 use crate::handlers::{NotifyHandler, StderrHandler, StdoutHandler};
-use crate::lifecycle;
-use crate::lifecycle::WorkerMsg;
+use crate::spawner;
+use crate::spawner::WorkerMsg;
 
 pub fn run_event_loop(
     tree_id: String,
@@ -160,5 +160,5 @@ pub fn run_event_loop(
         });
     }
 
-    lifecycle::ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner()).remove(&tree_id);
+    spawner::ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner()).remove(&tree_id);
 }

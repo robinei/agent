@@ -3,7 +3,7 @@ use std::sync::Arc;
 use agent_core::config::Config;
 use agent_core::types::{TreeMeta, TreeSandbox};
 
-/// Handles tree CRUD and lifecycle operations by calling tree_io and lifecycle
+/// Handles tree CRUD and lifecycle operations by calling tree_io and spawner
 /// directly, bypassing HTTP entirely. Used by the embedded server path.
 pub struct LocalClient {
     pub config: Arc<Config>,
@@ -82,6 +82,6 @@ impl LocalClient {
     }
 
     pub fn stop_agent(&self, tree_id: &str) -> Result<(), String> {
-        agent_server::lifecycle::worker_stop(tree_id)
+        agent_server::spawner::worker_stop(tree_id)
     }
 }

@@ -11,7 +11,7 @@ This codebase is **almost entirely POSIX-compatible** — `nix::poll`, `nix::pip
 
 ### What breaks
 
-`agent-server/src/lifecycle.rs` has two code paths:
+`agent-server/src/spawner.rs` has two code paths:
 
 - **Sandboxed** (lines 149–170): builds bwrap argv via `build_bwrap_argv()`
   and wraps the worker command in `bwrap --ro-bind / / ... -- agent worker ...`.
@@ -115,7 +115,7 @@ Linux and be `sandbox_path` for cross-platform, or use a single key.
 
 ### What breaks
 
-`agent-server/src/lifecycle.rs:240`:
+`agent-server/src/spawner.rs`::
 
 ```rust
 // Run the event loop inline — this keeps the current thread alive
@@ -162,7 +162,8 @@ sandbox tests) should be gated with `#[cfg(target_os = "linux")]`.
 | File | Change |
 |------|--------|
 | `agent-core/src/config.rs` | Rename/add `sandbox_path` field; TOML parsing |
-| `agent-server/src/lifecycle.rs` | `build_sandbox_exec_argv()`; `build_sandbox_argv()` dispatcher; spawn path |
+| `agent-server/src/sandbox.rs` | `build_bwrap_argv()`; bwrap arg building and path resolution |
+| `agent-server/src/spawner.rs` | `spawn_worker()`, `worker_stop()`, `shutdown_all()`; worker lifecycle |
 | `agent-server/Cargo.toml` | No new deps (sandbox-exec is a system binary) |
 | `agent-worker/src/lib.rs` | Optional: I/O watchdog stdin timeout for crash-safety parity |
 

@@ -5,7 +5,8 @@ use agent_core::config::Config;
 
 pub mod handlers;
 pub mod http;
-pub mod lifecycle;
+pub mod sandbox;
+pub mod spawner;
 mod llm_handler;
 pub mod provider;
 mod routes;
@@ -57,7 +58,7 @@ pub fn serve(config: Arc<Config>, shutdown: Arc<AtomicBool>) {
         }
     }
 
-    lifecycle::shutdown_all();
+    spawner::shutdown_all();
     log::info!("[lifecycle] server stopped");
 }
 

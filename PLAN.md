@@ -45,7 +45,7 @@ Small things worth doing eventually; promote to a step when picked up.
   sites; `thiserror` enum (`StoreError`) for `Store` in `agent-worker`
   (matches existing pattern).
 - **Logging:** `log::info!` / `warn!` / `error!`. Prefix multi-component
-  logs with a bracketed tag like `[lifecycle]`, `[worker]`, `[ws]`.
+  logs with a bracketed tag like `[spawner]`, `[worker]`, `[ws]`.
 - **File I/O:** `std::fs::create_dir_all` before writes when the parent dir
   might not exist; atomic `rename` for any non-append write that must not
   be observed half-written.

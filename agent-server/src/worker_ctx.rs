@@ -10,7 +10,7 @@ use agent_core::rpc::PipeIn;
 use agent_core::types::ServerEvent;
 use nix::poll::PollFlags;
 
-use crate::lifecycle::WorkerMsg;
+use crate::spawner::WorkerMsg;
 use crate::ws_client::WsClient;
 
 pub trait PollHandler

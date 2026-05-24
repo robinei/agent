@@ -105,7 +105,7 @@ See `DEBUG.md` for env-var configuration and troubleshooting.
   tmpfs'd via `[sandbox.defaults]`.
 - Per-tree overrides in `TreeMeta.sandbox` (`TreeSandbox` struct): `writable`,
   `network: Option<bool>`, `hide`, `unhide`.
-- bwrap argv built in `agent-server/src/lifecycle.rs::build_bwrap_argv`.
+- bwrap argv built in `agent-server/src/sandbox.rs::build_bwrap_argv`.
 - Set `[sandbox] enabled = false` in `~/.agent/config.toml` for unsandboxed
   spawns (development).
 

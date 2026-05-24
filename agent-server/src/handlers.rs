@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use agent_core::rpc::PipeIn;
 use nix::poll::PollFlags;
 
-use crate::lifecycle::WorkerMsg;
+use crate::spawner::WorkerMsg;
 use crate::worker_ctx::{PollHandler, WorkerCtx};
 
 pub type StderrBuf = Arc<Mutex<VecDeque<String>>>;

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use agent_core::config::Config;
 
-use crate::lifecycle::{self, WorkerMsg};
+use crate::spawner::{self, WorkerMsg};
 use crate::worker_loop::WsClient;
 
 pub fn accept(
@@ -46,8 +46,8 @@ pub fn accept(
         return;
     }
 
-    if lifecycle::worker_get(&tree_id).is_none() {
-        if let Err(e) = lifecycle::spawn_worker(&tree_id, cfg.clone()) {
+    if spawner::worker_get(&tree_id).is_none() {
+        if let Err(e) = spawner::spawn_worker(&tree_id, cfg.clone()) {
             let mut ws = tungstenite::WebSocket::from_raw_socket(
                 stream,
                 tungstenite::protocol::Role::Server,
@@ -63,7 +63,7 @@ pub fn accept(
         }
     }
 
-    let entry = match lifecycle::worker_get(&tree_id) {
+    let entry = match spawner::worker_get(&tree_id) {
         Some(e) => e,
         None => return,
     };
