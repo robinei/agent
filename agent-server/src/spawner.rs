@@ -7,9 +7,46 @@ use std::sync::mpsc;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use agent_core::config::Config;
+use agent_core::tree_io::TreeIoError;
 use agent_core::types::{ServerEvent, TreeId};
 
 use crate::worker_loop;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    #[error("Worker already active for tree {0}")]
+    AlreadyActive(TreeId),
+    #[error("argv[0] missing")]
+    NoArgv0,
+    #[error("current_dir: {0}")]
+    CurrentDir(#[source] std::io::Error),
+    #[error("tree {0} not found")]
+    TreeNotFound(TreeId),
+    #[error("tree I/O error: {0}")]
+    TreeIo(#[from] TreeIoError),
+    #[error("pipe error: {0}")]
+    Pipe(#[source] nix::Error),
+    #[error("fcntl error: {0}")]
+    Fcntl(#[source] nix::Error),
+    #[error("bwrap sandbox error: {0}")]
+    Sandbox(#[from] crate::sandbox::SandboxError),
+    #[error("spawn worker: {0}")]
+    Spawn(#[source] std::io::Error),
+    #[error("send Stop failed: {0}")]
+    StopSend(String),
+    #[error("No active worker for tree {0}")]
+    NoWorker(TreeId),
+    #[error("worker keeper thread exited without signaling")]
+    KeeperExited,
+}
+
+impl From<nix::Error> for SpawnError {
+    fn from(e: nix::Error) -> Self {
+        SpawnError::Pipe(e)
+    }
+}
+
+pub type SpawnResult<T> = std::result::Result<T, SpawnError>;
 
 // ── WorkerMsg ──
 
@@ -40,7 +77,6 @@ pub fn worker_get(tree_id: &str) -> Option<Arc<Mutex<WorkerEntry>>> {
         .cloned()
 }
 
-/// Broadcast a MetaUpdate event by sending a message to the worker's event loop.
 pub fn broadcast_meta_update(tree_id: &str, title: Option<String>) {
     let entry = match worker_get(tree_id) {
         Some(e) => e,
@@ -57,40 +93,37 @@ fn agent_dir() -> PathBuf {
     agent_core::config::agent_dir()
 }
 
-pub fn spawn_worker(tree_id: &str, cfg: Arc<Config>) -> Result<(), String> {
-    let workers = ACTIVE_WORKERS.lock().map_err(|e| e.to_string())?;
+pub fn spawn_worker(tree_id: &str, cfg: Arc<Config>) -> SpawnResult<()> {
+    let workers = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
     if workers.contains_key(tree_id) {
-        return Err(format!("Worker already active for tree {}", tree_id));
+        return Err(SpawnError::AlreadyActive(tree_id.to_string()));
     }
     drop(workers);
 
     let exe = std::env::args()
         .next()
         .map(std::path::PathBuf::from)
-        .ok_or_else(|| "argv[0] missing".to_string())?;
+        .ok_or(SpawnError::NoArgv0)?;
     let exe = if exe.is_absolute() {
         exe
     } else {
         std::env::current_dir()
-            .map_err(|e| format!("current_dir: {e}"))?
+            .map_err(SpawnError::CurrentDir)?
             .join(exe)
     };
 
-    let meta = agent_core::tree_io::read_meta(&agent_dir(), tree_id)
-        .map_err(|e| format!("read_meta: {e}"))?
-        .ok_or_else(|| format!("tree {} not found", tree_id))?;
+    let meta = agent_core::tree_io::read_meta(&agent_dir(), tree_id)?
+        .ok_or_else(|| SpawnError::TreeNotFound(tree_id.to_string()))?;
 
     let (msg_tx, msg_rx) = mpsc::sync_channel::<WorkerMsg>(64);
     let (notify_read, notify_write) = {
-        let (r, w) = nix::unistd::pipe().map_err(|e| format!("pipe: {e}"))?;
-        // Read end must be non-blocking so NotifyHandler's drain loop gets EAGAIN
-        // when the pipe is empty, rather than blocking forever after the first byte.
+        let (r, w) = nix::unistd::pipe()?;
         use std::os::fd::AsRawFd;
         nix::fcntl::fcntl(
             r.as_raw_fd(),
             nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
         )
-        .map_err(|e| format!("notify_read set_nonblocking: {e}"))?;
+        .map_err(SpawnError::Fcntl)?;
         (
             unsafe { std::fs::File::from_raw_fd(r.into_raw_fd()) },
             unsafe { std::fs::File::from_raw_fd(w.into_raw_fd()) },
@@ -107,13 +140,12 @@ pub fn spawn_worker(tree_id: &str, cfg: Arc<Config>) -> Result<(), String> {
         let cfg = cfg.clone();
         let stderr_buf = stderr_buf.clone();
         move || {
-            // Spawn the subprocess (bwrap or direct)
             let mut child = if cfg.sandbox.enabled {
                 let bwrap_path = match crate::sandbox::resolve_bwrap_path(&cfg.sandbox.bwrap_path)
                 {
                     Ok(p) => p,
                     Err(e) => {
-                        let _ = spawn_tx.send(Err(e));
+                        let _ = spawn_tx.send(Err(e.to_string()));
                         return;
                     }
                 };
@@ -159,8 +191,6 @@ pub fn spawn_worker(tree_id: &str, cfg: Arc<Config>) -> Result<(), String> {
             let child_stdout = child.stdout.take().unwrap();
             let child_stderr = child.stderr.take().unwrap();
 
-            // Non-blocking so StdoutHandler can drain all buffered lines
-            // in a single on_ready call without blocking on an empty pipe.
             use std::os::fd::AsRawFd;
             nix::fcntl::fcntl(
                 child_stdout.as_raw_fd(),
@@ -168,8 +198,6 @@ pub fn spawn_worker(tree_id: &str, cfg: Arc<Config>) -> Result<(), String> {
             )
             .ok();
 
-            // Insert into ACTIVE_WORKERS before starting the stdin writer
-            // so worker_subscribe-like paths can find the entry immediately.
             let entry = Arc::new(Mutex::new(WorkerEntry {
                 pid,
                 msg_tx: msg_tx.clone(),
@@ -190,7 +218,6 @@ pub fn spawn_worker(tree_id: &str, cfg: Arc<Config>) -> Result<(), String> {
                 cfg.provider.enable_thinking
             );
 
-            // Send initial config as the first message on stdin.
             let worker_cfg = agent_core::rpc::WorkerConfig {
                 session_soft_cap_pct: cfg.session.soft_cap_pct,
                 session_hard_cap_pct: cfg.session.hard_cap_pct,
@@ -208,8 +235,6 @@ pub fn spawn_worker(tree_id: &str, cfg: Arc<Config>) -> Result<(), String> {
                 log::error!("[spawner] write worker config for {}: {}", tree_id_str, e);
             }
 
-            // Run the event loop inline — this keeps the current thread alive
-            // until the worker exits, which is what we need for bwrap's PDEATHSIG.
             worker_loop::run_event_loop(
                 tree_id_str,
                 child_stdin,
@@ -227,18 +252,18 @@ pub fn spawn_worker(tree_id: &str, cfg: Arc<Config>) -> Result<(), String> {
     });
 
     match spawn_rx.recv() {
-        Ok(result) => result,
-        Err(_) => Err("worker keeper thread exited without signaling".into()),
+        Ok(result) => result.map_err(|e| SpawnError::StopSend(e.to_string())),
+        Err(_) => Err(SpawnError::KeeperExited),
     }
 }
 
-pub fn worker_stop(tree_id: &str) -> Result<(), String> {
-    let entry = worker_get(tree_id).ok_or_else(|| format!("No active worker for tree {}", tree_id))?;
+pub fn worker_stop(tree_id: &str) -> SpawnResult<()> {
+    let entry = worker_get(tree_id).ok_or_else(|| SpawnError::NoWorker(tree_id.to_string()))?;
     let guard = entry.lock().unwrap_or_else(|e| e.into_inner());
     guard
         .msg_tx
         .send(WorkerMsg::Stop)
-        .map_err(|e| format!("Failed to send stop: {}", e))?;
+        .map_err(|e| SpawnError::StopSend(e.to_string()))?;
     let _ = nix::unistd::write(&guard.notify_write, b"\x00");
     Ok(())
 }

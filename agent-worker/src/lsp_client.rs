@@ -10,6 +10,26 @@ use nix::unistd::read;
 
 use agent_core::types::{Diagnostic, DiagnosticSeverity, DiagnosticsFile, LspServerConfig, Position, Range};
 
+#[derive(Debug, thiserror::Error)]
+pub enum LspError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("nix error: {0}")]
+    Nix(#[from] nix::Error),
+    #[error("spawn LSP {command}: {source}")]
+    Spawn { command: String, #[source] source: std::io::Error },
+    #[error("no stdin for LSP process")]
+    NoStdin,
+    #[error("no stdout for LSP process")]
+    NoStdout,
+    #[error("{0}")]
+    Other(String),
+}
+
+pub type LspResult<T> = std::result::Result<T, LspError>;
+
 pub struct LspFileResult {
     pub path: String,
     pub diagnostics: Vec<Diagnostic>,
@@ -53,20 +73,19 @@ impl LspClient {
         args: &[String],
         root_uri: &str,
         timeout_ms: u64,
-    ) -> Result<Self, String> {
+    ) -> LspResult<Self> {
         let mut child = Command::new(command)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("spawn LSP {}: {}", command, e))?;
+            .map_err(|e| LspError::Spawn { command: command.to_string(), source: e })?;
 
-        let stdin = child.stdin.take().ok_or("no stdin")?;
-        let stdout_fd = child.stdout.take().ok_or("no stdout")?.into_raw_fd();
+        let stdin = child.stdin.take().ok_or(LspError::NoStdin)?;
+        let stdout_fd = child.stdout.take().ok_or(LspError::NoStdout)?.into_raw_fd();
 
-        fcntl(stdout_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
-            .map_err(|e| format!("set nonblock: {}", e))?;
+        fcntl(stdout_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
 
         let mut client = LspClient {
             stdin,
@@ -103,17 +122,17 @@ impl LspClient {
         let mut buf = Vec::new();
         loop {
             if Instant::now() >= deadline {
-                return Err("LSP initialize timed out".into());
+                return Err(LspError::Other("LSP initialize timed out".into()));
             }
             let mut tmp = [0u8; 4096];
             match read(stdout_fd, &mut tmp) {
-                Ok(0) => return Err("LSP process exited during initialize".into()),
+                Ok(0) => return Err(LspError::Other("LSP process exited during initialize".into())),
                 Ok(n) => buf.extend(&tmp[..n]),
                 Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 }
-                Err(e) => return Err(format!("read error: {}", e)),
+                Err(e) => return Err(LspError::Other(format!("read error: {}", e))),
             }
 
             while let Some(frame) = Self::parse_frame(&mut buf) {

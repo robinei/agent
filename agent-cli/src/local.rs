@@ -1,7 +1,25 @@
 use std::sync::Arc;
 
 use agent_core::config::Config;
+use agent_core::tree_io::TreeIoError;
+use agent_core::types::ValidateRepoError;
 use agent_core::types::{TreeMeta, TreeSandbox};
+
+#[derive(Debug, thiserror::Error)]
+pub enum LocalClientError {
+    #[error(transparent)]
+    Io(#[from] TreeIoError),
+    #[error(transparent)]
+    Validation(#[from] ValidateRepoError),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for LocalClientError {
+    fn from(s: String) -> Self {
+        LocalClientError::Other(s)
+    }
+}
 
 /// Handles tree CRUD and lifecycle operations by calling tree_io and spawner
 /// directly, bypassing HTTP entirely. Used by the embedded server path.
@@ -18,8 +36,8 @@ impl LocalClient {
         agent_core::config::agent_dir()
     }
 
-    pub fn list_trees(&self) -> Result<Vec<TreeMeta>, String> {
-        agent_core::tree_io::list_trees(&self.agent_dir())
+    pub fn list_trees(&self) -> Result<Vec<TreeMeta>, LocalClientError> {
+        Ok(agent_core::tree_io::list_trees(&self.agent_dir())?)
     }
 
     pub fn create_tree(
@@ -31,7 +49,7 @@ impl LocalClient {
         network: Option<bool>,
         hide: &[std::path::PathBuf],
         unhide: &[std::path::PathBuf],
-    ) -> Result<TreeMeta, String> {
+    ) -> Result<TreeMeta, LocalClientError> {
         let tree_id = uuid::Uuid::new_v4().to_string();
 
         let sandbox = TreeSandbox {
@@ -44,14 +62,12 @@ impl LocalClient {
         let repo_path = match repo_path {
             Some(p) => {
                 let path = std::path::Path::new(p);
-                match agent_core::types::validate_repo_path(
+                let canon = agent_core::types::validate_repo_path(
                     path,
                     &self.config.sandbox.defaults.hide,
                     &sandbox,
-                ) {
-                    Ok(canon) => Some(canon),
-                    Err(e) => return Err(e),
-                }
+                )?;
+                Some(canon)
             }
             None => None,
         };
@@ -69,19 +85,18 @@ impl LocalClient {
             sandbox,
         };
 
-        // create_tree writes data.jsonl header + meta.json atomically.
-        // The worker will write SessionStart and ModelSet on connect.
         agent_core::tree_io::create_tree(&self.agent_dir(), &meta)?;
 
         Ok(meta)
     }
 
-    pub fn get_tree(&self, id: &str) -> Result<TreeMeta, String> {
+    pub fn get_tree(&self, id: &str) -> Result<TreeMeta, LocalClientError> {
         agent_core::tree_io::read_meta(&self.agent_dir(), id)?
-            .ok_or_else(|| format!("tree {} not found", id))
+            .ok_or_else(|| LocalClientError::Other(format!("tree {} not found", id)))
     }
 
-    pub fn stop_agent(&self, tree_id: &str) -> Result<(), String> {
+    pub fn stop_agent(&self, tree_id: &str) -> Result<(), LocalClientError> {
         agent_server::spawner::worker_stop(tree_id)
+            .map_err(|e| LocalClientError::Other(e.to_string()))
     }
 }

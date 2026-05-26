@@ -7,6 +7,34 @@ use ureq::http;
 
 use agent_core::types::TreeMeta;
 
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    #[error("HTTP error: {0}")]
+    Http(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("WebSocket error: {0}")]
+    Ws(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<tungstenite::Error> for ClientError {
+    fn from(e: tungstenite::Error) -> Self {
+        ClientError::Ws(e.to_string())
+    }
+}
+
+impl From<ureq::Error> for ClientError {
+    fn from(e: ureq::Error) -> Self {
+        ClientError::Http(e.to_string())
+    }
+}
+
+pub type ClientResult<T> = std::result::Result<T, ClientError>;
+
 /// Build a base URL from the server address string.
 fn base_url(server: &str) -> String {
     if server.starts_with("http://") || server.starts_with("https://") {
@@ -17,19 +45,18 @@ fn base_url(server: &str) -> String {
 }
 
 /// Extract error string from a response with status >= 400.
-fn extract_error(resp: http::Response<ureq::Body>) -> String {
+fn extract_error(resp: http::Response<ureq::Body>) -> ClientError {
     let status = resp.status().as_u16();
-    // Try reading the body for a JSON error message
     let body = resp
         .into_body()
         .read_to_string()
         .unwrap_or_else(|_| "unknown".to_string());
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
         if let Some(msg) = json.get("error").and_then(|v| v.as_str()) {
-            return format!("HTTP {}: {}", status, msg);
+            return ClientError::Http(format!("HTTP {}: {}", status, msg));
         }
     }
-    format!("HTTP {}: {}", status, body.lines().next().unwrap_or(""))
+    ClientError::Http(format!("HTTP {}: {}", status, body.lines().next().unwrap_or("")))
 }
 
 /// HTTP client for the agent-server.
@@ -40,7 +67,6 @@ pub struct AgentClient {
 }
 
 impl AgentClient {
-    /// Create a new client connected to the given server address.
     pub fn new(server: &str) -> Self {
         Self {
             base: base_url(server),
@@ -48,60 +74,45 @@ impl AgentClient {
         }
     }
 
-    /// Return the raw server address string (for WS connection construction).
     pub fn server_addr(&self) -> &str {
         &self.server
     }
 
-    fn get_json<T: for<'a> serde::Deserialize<'a>>(&self, path: &str) -> Result<T, String> {
+    fn get_json<T: for<'a> serde::Deserialize<'a>>(&self, path: &str) -> ClientResult<T> {
         let url = format!("{}{}", self.base, path);
-        let resp = ureq::get(&url)
-            .call()
-            .map_err(|e| format!("request failed: {}", e))?;
+        let resp = ureq::get(&url).call()?;
         if resp.status().as_u16() >= 400 {
             return Err(extract_error(resp));
         }
-        resp.into_body()
-            .read_json()
-            .map_err(|e| format!("failed to parse response: {}", e))
+        Ok(resp.into_body().read_json()?)
     }
 
     fn post_json<T: for<'a> serde::Deserialize<'a>>(
         &self,
         path: &str,
         body: &serde_json::Value,
-    ) -> Result<T, String> {
+    ) -> ClientResult<T> {
         let url = format!("{}{}", self.base, path);
-        let resp = ureq::post(&url)
-            .send_json(body)
-            .map_err(|e| format!("request failed: {}", e))?;
+        let resp = ureq::post(&url).send_json(body)?;
         if resp.status().as_u16() >= 400 {
             return Err(extract_error(resp));
         }
-        resp.into_body()
-            .read_json()
-            .map_err(|e| format!("failed to parse response: {}", e))
+        Ok(resp.into_body().read_json()?)
     }
 
-    fn post_empty(&self, path: &str) -> Result<(), String> {
+    fn post_empty(&self, path: &str) -> ClientResult<()> {
         let url = format!("{}{}", self.base, path);
-        let resp = ureq::post(&url)
-            .send_json(serde_json::json!({}))
-            .map_err(|e| format!("request failed: {}", e))?;
+        let resp = ureq::post(&url).send_json(serde_json::json!({}))?;
         if resp.status().as_u16() >= 400 {
             return Err(extract_error(resp));
         }
         Ok(())
     }
 
-    // ── Public API ──
-
-    /// List all trees from the server.
-    pub fn list_trees(&self) -> Result<Vec<TreeMeta>, String> {
+    pub fn list_trees(&self) -> ClientResult<Vec<TreeMeta>> {
         self.get_json("/trees")
     }
 
-    /// Create a new tree with optional title, repo_path, model, and sandbox config.
     pub fn create_tree(
         &self,
         title: Option<&str>,
@@ -111,7 +122,7 @@ impl AgentClient {
         network: Option<bool>,
         hide: &[std::path::PathBuf],
         unhide: &[std::path::PathBuf],
-    ) -> Result<TreeMeta, String> {
+    ) -> ClientResult<TreeMeta> {
         let mut body = serde_json::Map::new();
         if let Some(t) = title {
             body.insert("title".into(), serde_json::Value::String(t.to_string()));
@@ -132,34 +143,31 @@ impl AgentClient {
         self.post_json("/trees", &serde_json::Value::Object(body))
     }
 
-    /// Get a single tree by ID.
-    pub fn get_tree(&self, id: &str) -> Result<TreeMeta, String> {
+    pub fn get_tree(&self, id: &str) -> ClientResult<TreeMeta> {
         self.get_json(&format!("/trees/{}", id))
     }
 
-    /// Stop the active agent for a tree.
-    pub fn stop_agent(&self, tree_id: &str) -> Result<(), String> {
+    pub fn stop_agent(&self, tree_id: &str) -> ClientResult<()> {
         self.post_empty(&format!("/trees/{}/stop", tree_id))
     }
 }
 
 // ── WebSocket session for agent communication ──
 
-/// Parse host and port from a server string like "localhost:8080" or "http://localhost:8080".
-pub fn parse_host_port(server: &str) -> Result<(String, u16), String> {
+pub fn parse_host_port(server: &str) -> ClientResult<(String, u16)> {
     let s = server.strip_prefix("http://").or_else(|| server.strip_prefix("https://")).unwrap_or(server);
     let s = s.trim_end_matches('/');
-    let (host, port_str) = s.split_once(':').ok_or_else(|| format!("invalid server address '{}': expected host:port", server))?;
-    let port: u16 = port_str.parse().map_err(|e| format!("invalid port '{}': {}", port_str, e))?;
+    let (host, port_str) = s.split_once(':')
+        .ok_or_else(|| ClientError::Other(format!("invalid server address '{}': expected host:port", server)))?;
+    let port: u16 = port_str.parse()
+        .map_err(|e| ClientError::Other(format!("invalid port '{}': {}", port_str, e)))?;
     Ok((host.to_string(), port))
 }
 
-/// WebSocket session to an agent worker.
 pub struct AgentSession {
     ws: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
 }
 
-/// Result of a non-blocking WS read attempt.
 pub enum TryEvent {
     Event(agent_core::types::ServerEvent),
     WouldBlock,
@@ -168,31 +176,24 @@ pub enum TryEvent {
 }
 
 impl AgentSession {
-    /// Connect to a tree's WebSocket session.
-    pub fn connect(server: &str, tree_id: &str) -> Result<Self, String> {
+    pub fn connect(server: &str, tree_id: &str) -> ClientResult<Self> {
         let (host, port) = parse_host_port(server)?;
         let url = format!("ws://{}:{}/trees/{}/ws", host, port, tree_id);
-        let (ws, _resp) = tungstenite::connect(url).map_err(|e| format!("WS connect failed: {}", e))?;
+        let (ws, _resp) = tungstenite::connect(url)?;
         Ok(Self { ws })
     }
 
-    /// Perform a WebSocket client handshake over an already-connected stream.
-    /// Used for the in-process socketpair path; the stream need not be a real
-    /// TCP socket — any SOCK_STREAM fd cast as TcpStream works on Linux.
     pub fn from_stream(
         stream: std::net::TcpStream,
         tree_id: &str,
-    ) -> Result<Self, String> {
+    ) -> ClientResult<Self> {
         let url = format!("ws://localhost/trees/{}/ws", tree_id);
-        // Wrap in MaybeTlsStream so tungstenite::client returns the
-        // WebSocket<MaybeTlsStream<TcpStream>> type that the struct field expects.
         let stream = tungstenite::stream::MaybeTlsStream::Plain(stream);
         let (ws, _) = tungstenite::client(url, stream)
-            .map_err(|e| format!("WS handshake failed: {}", e))?;
+            .map_err(|e| ClientError::Ws(e.to_string()))?;
         Ok(Self { ws })
     }
 
-    /// Set the underlying TCP stream to blocking or non-blocking mode.
     pub fn set_nonblocking(&mut self, nb: bool) -> Result<(), String> {
         match self.ws.get_mut() {
             MaybeTlsStream::Plain(tcp) => {
@@ -202,7 +203,6 @@ impl AgentSession {
         }
     }
 
-    /// Expose the underlying raw file descriptor for polling.
     pub fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
         use std::os::unix::io::AsRawFd;
         match self.ws.get_ref() {
@@ -211,22 +211,21 @@ impl AgentSession {
         }
     }
 
-    /// Send a user message to the agent.
-    pub fn send_message(&mut self, text: &str) -> Result<(), String> {
+    pub fn send_message(&mut self, text: &str) -> ClientResult<()> {
         let cmd = agent_core::rpc::WsCommand::Message {
             params: agent_core::rpc::MessageParams { text: text.into() },
         };
-        let s = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
-        self.ws.send(tungstenite::Message::Text(s)).map_err(|e| e.to_string())
+        let s = serde_json::to_string(&cmd)?;
+        self.ws.send(tungstenite::Message::Text(s))?;
+        Ok(())
     }
 
-    /// Send a stop command to the agent.
-    pub fn send_stop(&mut self) -> Result<(), String> {
-        let s = serde_json::to_string(&agent_core::rpc::WsCommand::Stop).map_err(|e| e.to_string())?;
-        self.ws.send(tungstenite::Message::Text(s)).map_err(|e| e.to_string())
+    pub fn send_stop(&mut self) -> ClientResult<()> {
+        let s = serde_json::to_string(&agent_core::rpc::WsCommand::Stop)?;
+        self.ws.send(tungstenite::Message::Text(s))?;
+        Ok(())
     }
 
-    /// Try to read the next event without blocking. Returns `WouldBlock` if no data is ready.
     pub fn try_next_event(&mut self) -> TryEvent {
         match self.ws.read() {
             Ok(tungstenite::Message::Text(s)) => {
@@ -246,7 +245,6 @@ impl AgentSession {
         }
     }
 
-    /// Read the next event from the WebSocket. Returns None on close/error.
     pub fn next_event(&mut self) -> Option<Result<agent_core::types::ServerEvent, String>> {
         loop {
             match self.ws.read() {

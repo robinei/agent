@@ -720,9 +720,9 @@ fn process_message(
     md: &mut MarkdownEmitter,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    let mut session = backend.connect_session(tree_id)?;
+    let mut session = backend.connect_session(tree_id).map_err(|e| e.to_string())?;
     session.set_nonblocking(true)?;
-    session.send_message(text)?;
+    session.send_message(text).map_err(|e| e.to_string())?;
     let ws_fds: Vec<RawFd> = session.as_raw_fd().into_iter().collect();
 
     let mut state = RenderState {
@@ -844,7 +844,7 @@ fn select_or_create_tree(
     backend: &Backend,
 ) -> Result<String, String> {
     loop {
-        let trees = backend.list_trees()?;
+        let trees = backend.list_trees().map_err(|e| e.to_string())?;
 
         if !trees.is_empty() {
             let _ = term.append(&[Span::plain("\r\nYour trees:\r\n")]);
@@ -958,7 +958,8 @@ fn create_tree_interactive(
         None,
         &[],
         &[],
-    )?;
+    )
+    .map_err(|e| e.to_string())?;
     let short_id = if meta.id.len() > 8 {
         &meta.id[..8]
     } else {

@@ -12,20 +12,34 @@ mod local;
 pub mod markdown;
 pub mod terminal;
 
-use client::{AgentClient, AgentSession};
-use local::LocalClient;
+use client::{AgentClient, AgentSession, ClientError};
+use local::{LocalClient, LocalClientError};
 
 const EXIT_ERR: i32 = 1;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CliError {
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    #[error(transparent)]
+    Local(#[from] LocalClientError),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for CliError {
+    fn from(s: String) -> Self {
+        CliError::Other(s)
+    }
+}
 
 /// Agent CLI — talk to coding agents via a local server.
 #[derive(Parser)]
 #[command(name = "agent-cli", version = "0.1.0")]
 struct Cli {
-    /// Server address (e.g., "localhost:8080" or "http://192.168.1.5:8080")
     #[arg(long, short = 's', default_value = "localhost:8080")]
     server: String,
 
-    /// Repo path (opens interactive session in this directory)
     repo_path: Option<String>,
 
     #[command(subcommand)]
@@ -34,54 +48,40 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum SubCommand {
-    /// Start the server daemon
     Serve {
         #[arg(long, short = 'c')]
         config: Option<String>,
     },
-    /// List all trees
     Trees,
-    /// Create a new tree
     Create {
-        /// Tree title
         title: String,
         #[arg(long)]
         repo_path: Option<String>,
         #[arg(long)]
         model: Option<String>,
-        /// Additional writable paths (repeatable)
         #[arg(long, action = clap::ArgAction::Append)]
         writable: Vec<std::path::PathBuf>,
-        /// Disable network access
         #[arg(long, conflicts_with = "net")]
         no_net: bool,
-        /// Enable network access (explicit)
         #[arg(long, conflicts_with = "no_net")]
         net: bool,
-        /// Additional directories to hide (repeatable)
         #[arg(long, action = clap::ArgAction::Append)]
         hide: Vec<std::path::PathBuf>,
-        /// Directories to unhide from defaults (repeatable)
         #[arg(long, action = clap::ArgAction::Append)]
         unhide: Vec<std::path::PathBuf>,
     },
-    /// Send a message to an existing tree and stream the response
     Msg {
         tree_id: String,
         message: String,
     },
-    /// Stop an active agent
     Stop {
         tree_id: String,
     },
-    /// Create a tree, send a message, and auto-title (one-shot)
     Session {
         repo_path: String,
         message: String,
     },
 }
-
-// ── Backend enum (remote HTTP vs embedded local) ──
 
 enum Backend {
     Remote(AgentClient),
@@ -89,10 +89,10 @@ enum Backend {
 }
 
 impl Backend {
-    fn list_trees(&self) -> Result<Vec<agent_core::types::TreeMeta>, String> {
+    fn list_trees(&self) -> Result<Vec<agent_core::types::TreeMeta>, CliError> {
         match self {
-            Backend::Remote(c) => c.list_trees(),
-            Backend::Local(c) => c.list_trees(),
+            Backend::Remote(c) => Ok(c.list_trees()?),
+            Backend::Local(c) => Ok(c.list_trees()?),
         }
     }
 
@@ -105,34 +105,34 @@ impl Backend {
         network: Option<bool>,
         hide: &[std::path::PathBuf],
         unhide: &[std::path::PathBuf],
-    ) -> Result<agent_core::types::TreeMeta, String> {
+    ) -> Result<agent_core::types::TreeMeta, CliError> {
         match self {
-            Backend::Remote(c) => c.create_tree(title, repo_path, model, writable, network, hide, unhide),
-            Backend::Local(c) => c.create_tree(title, repo_path, model, writable, network, hide, unhide),
+            Backend::Remote(c) => Ok(c.create_tree(title, repo_path, model, writable, network, hide, unhide)?),
+            Backend::Local(c) => Ok(c.create_tree(title, repo_path, model, writable, network, hide, unhide)?),
         }
     }
 
-    fn get_tree(&self, id: &str) -> Result<agent_core::types::TreeMeta, String> {
+    fn get_tree(&self, id: &str) -> Result<agent_core::types::TreeMeta, CliError> {
         match self {
-            Backend::Remote(c) => c.get_tree(id),
-            Backend::Local(c) => c.get_tree(id),
+            Backend::Remote(c) => Ok(c.get_tree(id)?),
+            Backend::Local(c) => Ok(c.get_tree(id)?),
         }
     }
 
-    fn stop_agent(&self, tree_id: &str) -> Result<(), String> {
+    fn stop_agent(&self, tree_id: &str) -> Result<(), CliError> {
         match self {
-            Backend::Remote(c) => c.stop_agent(tree_id),
-            Backend::Local(c) => c.stop_agent(tree_id),
+            Backend::Remote(c) => Ok(c.stop_agent(tree_id)?),
+            Backend::Local(c) => Ok(c.stop_agent(tree_id)?),
         }
     }
 
-    fn connect_session(&self, tree_id: &str) -> Result<AgentSession, String> {
+    fn connect_session(&self, tree_id: &str) -> Result<AgentSession, CliError> {
         match self {
             Backend::Remote(c) => {
                 let (host, port) = client::parse_host_port(c.server_addr())?;
-                AgentSession::connect(&format!("{}:{}", host, port), tree_id)
+                Ok(AgentSession::connect(&format!("{}:{}", host, port), tree_id)?)
             }
-            Backend::Local(c) => embedded_session(tree_id, c.config.clone()),
+            Backend::Local(c) => Ok(embedded_session(tree_id, c.config.clone())?),
         }
     }
 }
@@ -163,10 +163,10 @@ fn resolve_backend(server: &str, explicit: bool) -> Backend {
     Backend::Local(LocalClient::new(config))
 }
 
-fn parse_server_addr(server: &str) -> Result<std::net::SocketAddr, String> {
+fn parse_server_addr(server: &str) -> Result<std::net::SocketAddr, CliError> {
     let s = server.strip_prefix("http://").or_else(|| server.strip_prefix("https://")).unwrap_or(server);
     let s = s.trim_end_matches('/');
-    s.parse().map_err(|e| format!("invalid server address '{}': {}", server, e))
+    s.parse().map_err(|e| CliError::Other(format!("invalid server address '{}': {}", server, e)))
 }
 
 fn default_server_addr() -> std::net::SocketAddr {
@@ -178,24 +178,21 @@ fn default_server_addr() -> std::net::SocketAddr {
 pub fn embedded_session(
     tree_id: &str,
     config: Arc<agent_core::config::Config>,
-) -> Result<AgentSession, String> {
-    // AF_UNIX SOCK_STREAM pair — both ends behave like a TcpStream fd on Linux.
+) -> Result<AgentSession, CliError> {
     let (client_fd, server_fd) = nix::sys::socket::socketpair(
         nix::sys::socket::AddressFamily::Unix,
         nix::sys::socket::SockType::Stream,
         None,
         nix::sys::socket::SockFlag::empty(),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| CliError::Other(e.to_string()))?;
     let server_stream = unsafe { TcpStream::from_raw_fd(server_fd.into_raw_fd()) };
     let client_stream = unsafe { TcpStream::from_raw_fd(client_fd.into_raw_fd()) };
-    // Server side: run the real HTTP+WS handler in a thread.
     let cfg_for_server = config.clone();
     std::thread::spawn(move || {
         agent_server::http::handle_connection(server_stream, cfg_for_server);
     });
-    // Client side: WS handshake over the socketpair.
-    AgentSession::from_stream(client_stream, tree_id)
+    Ok(AgentSession::from_stream(client_stream, tree_id)?)
 }
 
 use std::net::TcpStream;
@@ -247,7 +244,7 @@ pub fn run(args: Vec<String>) {
     }
 }
 
-fn exit_err(msg: &str) -> ! {
+fn exit_err(msg: impl std::fmt::Display) -> ! {
     eprintln!("Error: {}", msg);
     std::process::exit(EXIT_ERR);
 }

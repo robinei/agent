@@ -4,46 +4,58 @@ use log::warn;
 
 use crate::types::{TreeHeader, TreeMeta};
 
+#[derive(Debug, thiserror::Error)]
+pub enum TreeIoError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Other(String),
+}
+
+pub type TreeIoResult<T> = std::result::Result<T, TreeIoError>;
+
 /// Returns ~/.agent/trees/{id} (or base/trees/{id} in tests).
 pub fn tree_dir(base: &Path, tree_id: &str) -> PathBuf {
     base.join("trees").join(tree_id)
 }
 
 /// Read and parse meta.json. Returns None if the file doesn't exist.
-pub fn read_meta(base: &Path, tree_id: &str) -> Result<Option<TreeMeta>, String> {
+pub fn read_meta(base: &Path, tree_id: &str) -> TreeIoResult<Option<TreeMeta>> {
     let path = tree_dir(base, tree_id).join("meta.json");
     if !path.exists() {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("read meta.json: {}", e))?;
+    let content = std::fs::read_to_string(&path)?;
     serde_json::from_str(&content)
         .map(Some)
-        .map_err(|e| format!("parse meta.json: {}", e))
+        .map_err(TreeIoError::Json)
 }
 
 /// Write meta.json atomically (write to .tmp, rename over target).
 /// Creates the tree directory if it doesn't exist.
-pub fn write_meta(base: &Path, meta: &TreeMeta) -> Result<(), String> {
+pub fn write_meta(base: &Path, meta: &TreeMeta) -> TreeIoResult<()> {
     let dir = tree_dir(base, &meta.id);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create tree dir: {}", e))?;
+    std::fs::create_dir_all(&dir)?;
     let path = dir.join("meta.json");
     let tmp = path.with_extension("meta.tmp");
-    let content = serde_json::to_string_pretty(meta).map_err(|e| format!("serialize meta: {}", e))?;
-    std::fs::write(&tmp, &content).map_err(|e| format!("write meta tmp: {}", e))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename meta: {}", e))?;
+    let content = serde_json::to_string_pretty(meta).map_err(TreeIoError::Json)?;
+    std::fs::write(&tmp, &content)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
 /// Scan base/trees/*/meta.json and return all parseable TreeMetas,
 /// sorted by updated_at descending. Logs and skips corrupt files.
-pub fn list_trees(base: &Path) -> Result<Vec<TreeMeta>, String> {
+pub fn list_trees(base: &Path) -> TreeIoResult<Vec<TreeMeta>> {
     let dir = base.join("trees");
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut trees = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|e| format!("read trees dir: {}", e))? {
-        let entry = entry.map_err(|e| format!("dir entry: {}", e))?;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -66,22 +78,19 @@ pub fn list_trees(base: &Path) -> Result<Vec<TreeMeta>, String> {
 
 /// Create a new tree: mkdir base/trees/{id}, write the data.jsonl header
 /// line, write meta.json atomically.
-pub fn create_tree(base: &Path, meta: &TreeMeta) -> Result<(), String> {
+pub fn create_tree(base: &Path, meta: &TreeMeta) -> TreeIoResult<()> {
     let dir = tree_dir(base, &meta.id);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create tree dir: {}", e))?;
+    std::fs::create_dir_all(&dir)?;
 
-    // Write data.jsonl header
     let header = TreeHeader {
         kind: "meta".to_string(),
         version: 1,
         id: meta.id.clone(),
     };
-    let mut line = serde_json::to_string(&header).map_err(|e| format!("serialize header: {}", e))?;
+    let mut line = serde_json::to_string(&header).map_err(TreeIoError::Json)?;
     line.push('\n');
-    std::fs::write(&dir.join("data.jsonl"), line.as_bytes())
-        .map_err(|e| format!("write data.jsonl header: {}", e))?;
+    std::fs::write(dir.join("data.jsonl"), line.as_bytes())?;
 
-    // Write meta.json atomically
     write_meta(base, meta)
 }
 

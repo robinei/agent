@@ -5,14 +5,22 @@ use std::path::{Path, PathBuf};
 use agent_core::config::Config;
 use agent_core::types::TreeMeta;
 
-// ── bwrap path resolution ──
+#[derive(Debug, thiserror::Error)]
+pub enum SandboxError {
+    #[error("bwrap not found at configured path {0:?}")]
+    ConfigNotFound(PathBuf),
+    #[error("bwrap not found: install bubblewrap or set sandbox.enabled = false")]
+    NotFound,
+}
 
-pub(crate) fn resolve_bwrap_path(hint: &Option<PathBuf>) -> Result<PathBuf, String> {
+pub type SandboxResult<T> = std::result::Result<T, SandboxError>;
+
+pub(crate) fn resolve_bwrap_path(hint: &Option<PathBuf>) -> SandboxResult<PathBuf> {
     if let Some(p) = hint {
         if p.exists() {
             return Ok(p.clone());
         }
-        return Err(format!("bwrap not found at configured path {:?}", p));
+        return Err(SandboxError::ConfigNotFound(p.clone()));
     }
     for candidate in &["/usr/bin/bwrap", "/usr/local/bin/bwrap"] {
         if Path::new(candidate).exists() {
@@ -20,9 +28,7 @@ pub(crate) fn resolve_bwrap_path(hint: &Option<PathBuf>) -> Result<PathBuf, Stri
         }
     }
     log::warn!("[sandbox] bwrap not found on PATH, workers will run unsandboxed");
-    which("bwrap").ok_or_else(|| {
-        "bwrap not found: install bubblewrap or set sandbox.enabled = false".to_string()
-    })
+    which("bwrap").ok_or(SandboxError::NotFound)
 }
 
 fn which(name: &str) -> Option<PathBuf> {

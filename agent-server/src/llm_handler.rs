@@ -13,6 +13,24 @@ use rustls::pki_types::ServerName;
 
 use crate::worker_ctx::{PollHandler, WorkerCtx};
 
+#[derive(Debug, thiserror::Error)]
+pub enum LlmHandlerError {
+    #[error("bad base URL: {0}")]
+    BadUrl(String),
+    #[error("connect to {addr}: {source}")]
+    Connect { addr: String, #[source] source: std::io::Error },
+    #[error("set nonblocking: {0}")]
+    NonBlocking(#[source] std::io::Error),
+    #[error("bad hostname: {0}")]
+    BadHostname(String),
+    #[error("rustls connect: {0}")]
+    Rustls(#[source] rustls::Error),
+    #[error("json body: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+pub type LlmHandlerResult<T> = std::result::Result<T, LlmHandlerError>;
+
 // ── Transport ──
 
 #[allow(clippy::large_enum_variant)]
@@ -79,7 +97,7 @@ impl LlmHandler {
         req: LlmRequest,
         cfg: &Config,
         tls_config: Arc<rustls::ClientConfig>,
-    ) -> Result<Self, String> {
+    ) -> LlmHandlerResult<Self> {
         let base_url = cfg.provider.base_url.trim_end_matches('/');
         let (host, port, base_path) = parse_host_port_path(base_url)?;
         let addr = format!("{}:{}", host, port);
@@ -97,22 +115,24 @@ impl LlmHandler {
         );
         let path = format!("{}{}", base_path, prov.endpoint_path());
 
-        let tcp = TcpStream::connect(&addr).map_err(|e| format!("connect to {addr}: {e}"))?;
+        let tcp = TcpStream::connect(&addr)
+            .map_err(|e| LlmHandlerError::Connect { addr: addr.clone(), source: e })?;
         tcp.set_nonblocking(true)
-            .map_err(|e| format!("set nonblocking: {e}"))?;
+            .map_err(LlmHandlerError::NonBlocking)?;
 
         let transport = if is_tls {
             let server_name =
-                ServerName::try_from(host.clone()).map_err(|e| format!("bad hostname: {e}"))?;
+                ServerName::try_from(host.clone())
+                    .map_err(|e| LlmHandlerError::BadHostname(format!("{e}")))?;
             let conn = rustls::ClientConnection::new(tls_config, server_name)
-                .map_err(|e| format!("rustls connect: {e}"))?;
+                .map_err(LlmHandlerError::Rustls)?;
             LlmTransport::Tls { tcp, conn }
         } else {
             LlmTransport::Plain(tcp)
         };
 
         let body = prov.build_body(&req.messages, &req.tools, true);
-        let body_str = serde_json::to_string(&body).map_err(|e| format!("json body: {e}"))?;
+        let body_str = serde_json::to_string(&body)?;
         let auth_lines = prov.auth_header_lines();
         let request = format!(
             "POST {path} HTTP/1.1\r\n\
@@ -430,7 +450,7 @@ impl Drop for LlmHandler {
 
 // ── URL parsing ──
 
-fn parse_host_port_path(base_url: &str) -> Result<(String, u16, String), String> {
+fn parse_host_port_path(base_url: &str) -> LlmHandlerResult<(String, u16, String)> {
     let https = base_url.starts_with("https://");
     let rest = base_url
         .strip_prefix("https://")
@@ -443,7 +463,7 @@ fn parse_host_port_path(base_url: &str) -> Result<(String, u16, String), String>
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str
             .parse()
-            .map_err(|_| format!("bad port in base_url: {base_url}"))?;
+            .map_err(|_| LlmHandlerError::BadUrl(format!("bad port in base_url: {base_url}")))?;
         Ok((host.to_string(), port, path))
     } else {
         let port = if https { 443 } else { 80 };

@@ -20,7 +20,7 @@ use agent_core::rpc::{LlmResponse, PipeIn, WsCommand};
 use crate::store::Store;
 use agent_core::types::{Entry, LspConfig, Message, NotificationLevel, ServerEvent, SessionStatus, TreeMeta};
 use crate::turn::{begin_turn, cancel_turn, finish_response, process_chunk, resolve_lsp_wait_into, resolve_lsp_wait_with_timeout};
-use crate::util::{emit_notification, parse_tree_id, read_config, resolve_repo_path};
+use crate::util::{emit_notification, parse_tree_id, read_config, resolve_repo_path, WorkerError, WorkerResult};
 
 pub(crate) enum AgentState {
     Idle,
@@ -246,7 +246,7 @@ fn dispatch_pipe_in(
     }
 }
 
-fn startup_writes(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
+fn startup_writes(store: &Store) -> Result<(), WorkerError> {
     let tree_id = store.tree_id();
     let entries = store.read_all_entries().unwrap_or_default();
 
@@ -313,7 +313,7 @@ fn startup_writes(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run() -> WorkerResult<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
@@ -356,7 +356,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     nix::fcntl::fcntl(
         stdin_fd,
         nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-    ).map_err(|e| format!("stdin set_nonblock: {e}"))?;
+    )?;
 
     loop {
         // Always process any buffered stdin data before polling — this handles

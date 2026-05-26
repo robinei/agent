@@ -55,7 +55,7 @@ pub fn accept(
             );
             let _ = ws.send(tungstenite::Message::Text(
                 serde_json::to_string(&serde_json::json!({
-                    "type": "error", "message": e, "fatal": true,
+                    "type": "error", "message": e.to_string(), "fatal": true,
                 }))
                 .unwrap(),
             ));

@@ -5,7 +5,37 @@ use agent_core::types::{NotificationLevel, *};
 use log::{error, warn};
 use serde::Deserialize;
 
-use crate::store::Store;
+use crate::store::{Store, StoreError};
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorkerError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
+    #[error("stdin closed before Config")]
+    StdinClosed,
+    #[error("expected Config, got ch={0}")]
+    WrongChannel(String),
+    #[error("missing --tree-id value")]
+    MissingTreeId,
+    #[error("--tree-id is required")]
+    TreeIdRequired,
+    #[error("fcntl error: {0}")]
+    Fcntl(#[source] nix::Error),
+    #[error("{0}")]
+    Other(String),
+}
+
+pub type WorkerResult<T> = std::result::Result<T, WorkerError>;
+
+impl From<nix::Error> for WorkerError {
+    fn from(e: nix::Error) -> Self {
+        WorkerError::Fcntl(e)
+    }
+}
 
 #[derive(Deserialize)]
 struct ConfigEnvelope {
@@ -16,30 +46,28 @@ struct ConfigEnvelope {
 pub fn read_config(
     reader: &mut BufReader<std::io::Stdin>,
     buf: &mut String,
-) -> Result<WorkerConfig, String> {
-    let n = reader.read_line(buf).map_err(|e| format!("read stdin: {}", e))?;
+) -> WorkerResult<WorkerConfig> {
+    let n = reader.read_line(buf)?;
     if n == 0 {
-        return Err("stdin closed before Config".into());
+        return Err(WorkerError::StdinClosed);
     }
-    let env: ConfigEnvelope = serde_json::from_str(buf.trim_end())
-        .map_err(|e| format!("parse config envelope: {}", e))?;
+    let env: ConfigEnvelope = serde_json::from_str(buf.trim_end())?;
     if env.ch != "config" {
-        return Err(format!("expected Config, got ch={}", env.ch));
+        return Err(WorkerError::WrongChannel(env.ch));
     }
-    let cfg: WorkerConfig = serde_json::from_value(env.msg)
-        .map_err(|e| format!("parse WorkerConfig: {}", e))?;
+    let cfg: WorkerConfig = serde_json::from_value(env.msg)?;
     Ok(cfg)
 }
 
-pub fn parse_tree_id() -> Result<String, Box<dyn std::error::Error>> {
+pub fn parse_tree_id() -> WorkerResult<String> {
     let mut args = std::env::args().skip(1);
     let mut tree_id = None;
     while let Some(arg) = args.next() {
         if arg.as_str() == "--tree-id" {
-            tree_id = Some(args.next().ok_or("missing --tree-id value")?);
+            tree_id = Some(args.next().ok_or(WorkerError::MissingTreeId)?);
         }
     }
-    tree_id.ok_or_else(|| "--tree-id is required".into())
+    tree_id.ok_or(WorkerError::TreeIdRequired)
 }
 
 pub fn resolve_repo_path(store: &Store) -> std::path::PathBuf {

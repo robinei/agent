@@ -42,18 +42,31 @@ pub struct TreeMeta {
     pub sandbox: TreeSandbox,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ValidateRepoError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{:?} is not a directory", .0)]
+    NotADirectory(PathBuf),
+    #[error("repo_path {:?} is not allowed", .0)]
+    PathNotAllowed(PathBuf),
+    #[error("repo_path {:?} overlaps a hidden directory", .0)]
+    OverlapsHidden(PathBuf),
+}
+
+pub type ValidateRepoResult<T> = std::result::Result<T, ValidateRepoError>;
+
 /// Validate and canonicalize a repo_path for tree creation.
-/// Returns the canonical path on success, or an error string explaining why
+/// Returns the canonical path on success, or an error explaining why
 /// the path was rejected.
 pub fn validate_repo_path(
     repo_path: &std::path::Path,
     defaults_hide: &[PathBuf],
     sandbox: &TreeSandbox,
-) -> Result<PathBuf, String> {
-    let canon = std::fs::canonicalize(repo_path)
-        .map_err(|e| format!("canonicalize {:?}: {}", repo_path, e))?;
+) -> ValidateRepoResult<PathBuf> {
+    let canon = std::fs::canonicalize(repo_path)?;
     if !canon.is_dir() {
-        return Err(format!("{:?} is not a directory", canon));
+        return Err(ValidateRepoError::NotADirectory(canon));
     }
 
     let home = dirs_home();
@@ -64,10 +77,9 @@ pub fn validate_repo_path(
         &home.join(".config/agent"),
     ];
     if banned.iter().any(|b| canon == **b) {
-        return Err(format!("repo_path {:?} is not allowed", canon));
+        return Err(ValidateRepoError::PathNotAllowed(canon));
     }
 
-    // Reject if canon == any default-hide path (after applying unhide)
     let effective_hide: Vec<PathBuf> = defaults_hide
         .iter()
         .chain(sandbox.hide.iter())
@@ -75,10 +87,7 @@ pub fn validate_repo_path(
         .map(expand_tilde)
         .collect();
     if effective_hide.iter().any(|h| canon == *h || canon.starts_with(h)) {
-        return Err(format!(
-            "repo_path {:?} overlaps a hidden directory",
-            canon
-        ));
+        return Err(ValidateRepoError::OverlapsHidden(canon));
     }
     Ok(canon)
 }
@@ -548,15 +557,13 @@ mod tests {
     fn test_validate_repo_path_rejects_home() {
         let home = dirs_home();
         let result = validate_repo_path(&home, &[], &TreeSandbox::default());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not allowed"));
+        assert!(matches!(result, Err(ValidateRepoError::PathNotAllowed(_))));
     }
 
     #[test]
     fn test_validate_repo_path_rejects_root() {
         let result = validate_repo_path(std::path::Path::new("/"), &[], &TreeSandbox::default());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not allowed"));
+        assert!(matches!(result, Err(ValidateRepoError::PathNotAllowed(_))));
     }
 
     #[test]
@@ -571,8 +578,7 @@ mod tests {
             &[hidden_dir],
             &TreeSandbox::default(),
         );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("hidden"));
+        assert!(matches!(result, Err(ValidateRepoError::OverlapsHidden(_))));
     }
 
     #[test]

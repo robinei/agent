@@ -57,7 +57,7 @@ fn handle_list_trees() -> (u16, Vec<u8>, &'static str) {
     match agent_core::tree_io::list_trees(&agent_dir()) {
         Ok(trees) => json(200, &trees),
         Err(e) => {
-            json(500, &serde_json::json!({"error": e}))
+            json(500, &serde_json::json!({"error": e.to_string()}))
         }
     }
 }
@@ -79,7 +79,7 @@ fn handle_create_tree(body: &[u8], cfg: &Config) -> (u16, Vec<u8>, &'static str)
             let path = std::path::Path::new(p);
             match agent_core::types::validate_repo_path(path, &cfg.sandbox.defaults.hide, &sandbox) {
                 Ok(canon) => Some(canon),
-                Err(e) => return json(400, &serde_json::json!({"error": e})),
+                Err(e) => return json(400, &serde_json::json!({"error": e.to_string()})),
             }
         }
         None => None,
@@ -112,7 +112,7 @@ fn handle_get_tree(id: &str) -> (u16, Vec<u8>, &'static str) {
     match agent_core::tree_io::read_meta(&agent_dir(), id) {
         Ok(Some(meta)) => json(200, &meta),
         Ok(None) => json(404, &serde_json::json!({"error": format!("tree {} not found", id)})),
-        Err(e) => json(500, &serde_json::json!({"error": e})),
+        Err(e) => json(500, &serde_json::json!({"error": e.to_string()})),
     }
 }
 
@@ -130,7 +130,7 @@ fn handle_update_tree(id: &str, body: &[u8]) -> (u16, Vec<u8>, &'static str) {
             return json(404, &serde_json::json!({"error": format!("tree {} not found", id)}));
         }
         Err(e) => {
-            return json(500, &serde_json::json!({"error": e}));
+            return json(500, &serde_json::json!({"error": e.to_string()}));
         }
     };
 
@@ -155,7 +155,7 @@ fn handle_update_tree(id: &str, body: &[u8]) -> (u16, Vec<u8>, &'static str) {
 fn handle_stop_agent(id: &str) -> (u16, Vec<u8>, &'static str) {
     match spawner::worker_stop(id) {
         Ok(()) => json(200, &serde_json::json!({"status": "stopping"})),
-        Err(e) => json(404, &serde_json::json!({"error": e})),
+        Err(e) => json(404, &serde_json::json!({"error": e.to_string()})),
     }
 }
 
