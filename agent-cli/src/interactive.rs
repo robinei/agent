@@ -340,9 +340,9 @@ fn render_event(
                         _ => "[content blocks]".into(),
                     };
                     term.append(&[
-                        Span::styled("▸ ", green),
+                        Span::styled("> ", green),
                         Span::plain(t),
-                        Span::plain("\r\n"),
+                        Span::plain("\n"),
                     ])?;
                     state.trailing_newlines = 0;
                 }
@@ -721,11 +721,9 @@ fn process_message(
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let mut session = backend.connect_session(tree_id)?;
-    let ws_fds: Vec<RawFd> = session.as_raw_fd().into_iter().collect();
     session.set_nonblocking(true)?;
     session.send_message(text)?;
-
-    term.set_spinner_active(true).map_err(|e| e.to_string())?;
+    let ws_fds: Vec<RawFd> = session.as_raw_fd().into_iter().collect();
 
     let mut state = RenderState {
         trailing_newlines: 0,
@@ -733,6 +731,22 @@ fn process_message(
         assistant_header_shown: false,
         last_tool_args: None,
     };
+
+    // Render the user's message in the append area (matching Entry::Message format)
+    let green = ContentStyle {
+        foreground_color: Some(Color::Green),
+        ..Default::default()
+    };
+    let _ = term.append(&[
+        Span::styled("> ", green),
+        Span::plain(text.to_string()),
+        Span::plain("\n"),
+    ]);
+    let _ = term.flush_append();
+    state.trailing_newlines = 0;
+
+    term.set_spinner_active(true).map_err(|e| e.to_string())?;
+
     let mut cancel_signalled = false;
 
     loop {

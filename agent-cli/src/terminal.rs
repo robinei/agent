@@ -5,7 +5,7 @@ const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦
 pub(crate) const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 
 use crossterm::{
-    cursor::{self, Hide, MoveTo, Show},
+    cursor::{Hide, MoveTo, Show},
     event::{
         self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -109,7 +109,7 @@ impl Terminal {
             write!(term.stdout, "\r\n")?;
         }
         term.stdout.flush()?;
-        term.render_owned_impl(true)?;
+        term.render_owned_impl(true, term.th.saturating_sub(term.owned_height))?;
 
         Ok(term)
     }
@@ -143,9 +143,23 @@ impl Terminal {
         for line in self.input.split('\n') {
             let line_len = line.chars().count();
             if remaining <= line_len {
+                let col_in_row = remaining % cols;
+                let row_in_line = remaining / cols;
+                let line_rows = line_len.div_ceil(cols).max(1);
+                // When `remaining` lands exactly on a row boundary that is past the
+                // last display row of this line (cursor at end of a line whose length
+                // is an exact multiple of cols), the naive formula would advance to a
+                // non-existent row — which falls on the status bar. Clamp to the last
+                // column of the last real row instead.
+                if col_in_row == 0 && row_in_line > 0 && row_in_line >= line_rows {
+                    return (
+                        self.tw.saturating_sub(1),
+                        (display_row + row_in_line - 1) as u16,
+                    );
+                }
                 return (
-                    (prompt_cols + remaining % cols) as u16,
-                    (display_row + remaining / cols) as u16,
+                    (prompt_cols + col_in_row) as u16,
+                    (display_row + row_in_line) as u16,
                 );
             }
             display_row += line_len.div_ceil(cols).max(1);
@@ -186,7 +200,7 @@ impl Terminal {
         self.input.len()
     }
 
-    fn render_owned_impl(&mut self, show_cursor: bool) -> io::Result<()> {
+    fn render_owned_impl(&mut self, show_cursor: bool, old_top: u16) -> io::Result<()> {
         let prompt_cols = self.prompt_cols();
         let cols = self.cols_per_row() as usize;
         let margin = " ".repeat(prompt_cols as usize);
@@ -205,7 +219,6 @@ impl Terminal {
         };
 
         let new_owned_height = self.input_display_rows() + 1; // +1 for status bar
-        let old_top = self.th.saturating_sub(self.owned_height);
 
         if new_owned_height > self.owned_height {
             // Owned region growing upward: scroll append content up to preserve it.
@@ -222,20 +235,23 @@ impl Terminal {
         queue!(self.stdout, MoveTo(0, clear_from), Clear(ClearType::FromCursorDown))?;
         queue!(self.stdout, MoveTo(0, top))?;
 
-        // Render each logical line; wrap each at cols_per_row with a continuation margin.
-        let mut first_row = true;
+        // Render each logical line; wrap each at cols_per_row with a continuation
+        // margin.  Use MoveTo for every display row instead of \\r\\n so that
+        // re-renders (e.g. on resize) don't commit lines to the scrollback.
+        let mut display_row = 0u16;
         for line in self.input.split('\n') {
             let line_chars: Vec<char> = line.chars().collect();
             let n = line_chars.len();
             let row_count = n.div_ceil(cols).max(1);
             for r in 0..row_count {
                 let chunk: String = line_chars[r * cols..((r + 1) * cols).min(n)].iter().collect();
-                if first_row {
+                queue!(self.stdout, MoveTo(0, top + display_row))?;
+                if r == 0 {
                     queue!(self.stdout, Print(format!("{}{}", prompt_display, chunk)))?;
-                    first_row = false;
                 } else {
-                    queue!(self.stdout, Print(format!("\r\n{}{}", margin, chunk)))?;
+                    queue!(self.stdout, Print(format!("{}{}", margin, chunk)))?;
                 }
+                display_row += 1;
             }
         }
 
@@ -277,7 +293,7 @@ impl Terminal {
     }
 
     fn render_owned(&mut self) -> io::Result<()> {
-        self.render_owned_impl(true)
+        self.render_owned_impl(true, self.th.saturating_sub(self.owned_height))
     }
 
     fn advance_row(&mut self) -> io::Result<()> {
@@ -288,7 +304,7 @@ impl Terminal {
             queue!(self.stdout, ScrollUp(1))?;
             // ScrollUp moves owned-region content into write_row; clear it.
             queue!(self.stdout, MoveTo(0, self.write_row), Clear(ClearType::CurrentLine))?;
-            self.render_owned_impl(false)?;
+            self.render_owned_impl(false, self.th.saturating_sub(self.owned_height))?;
             // write_row stays at boundary-1: freshly cleared, ready for content.
         } else {
             self.write_row += 1;
@@ -324,26 +340,26 @@ impl Terminal {
         // Queue Hide first; it reaches the terminal on the same flush as the first
         // Print, so the cursor is never visible at the write position.
         queue!(self.stdout, Hide)?;
-        let boundary = self.th.saturating_sub(self.owned_height);
 
-        // Split all spans on '\n' into a list of lines. Each line is a sequence of
-        // (text, style) chunks that are printed consecutively on the same row.
-        let mut lines: Vec<Vec<(String, ContentStyle)>> = vec![Vec::new()];
+        // Split all spans on '\n' into logical lines. Each line is a sequence of
+        // (text, style) chunks printed consecutively; the terminal wraps them at tw.
+        let mut logical_lines: Vec<Vec<(String, ContentStyle)>> = vec![Vec::new()];
         for span in spans {
             let parts: Vec<&str> = span.text.split('\n').collect();
             for (i, part) in parts.iter().enumerate() {
                 if i > 0 {
-                    lines.push(Vec::new());
+                    logical_lines.push(Vec::new());
                 }
                 if !part.is_empty() {
-                    lines.last_mut().unwrap().push((part.to_string(), span.style));
+                    logical_lines.last_mut().unwrap().push((part.to_string(), span.style));
                 }
             }
         }
 
-        let n = lines.len();
-        for (i, line) in lines.iter().enumerate() {
+        let n = logical_lines.len();
+        for (i, line) in logical_lines.iter().enumerate() {
             let has_content = !line.is_empty();
+
             // Realize a deferred newline only when non-empty content follows, or when
             // another \n follows immediately (consecutive blank lines).
             if self.pending_newline && (has_content || i < n - 1) {
@@ -352,18 +368,37 @@ impl Terminal {
             }
 
             if has_content {
-                // Must flush before cursor::position() so the terminal has processed
-                // the Print. Hide goes out with this flush too.
-                queue!(self.stdout, MoveTo(self.write_col, self.write_row))?;
+                // Enable line wrapping so the terminal wraps content naturally and
+                // can reflow on resize. The owned region runs with DisableLineWrap.
+                let total_chars: usize = line.iter().map(|(t, _)| t.chars().count()).sum();
+                // Number of terminal display rows this content consumes (ceil division).
+                // The terminal handles wrapping at self.tw; we track rows for overflow.
+                let combined = self.write_col as usize + total_chars;
+                let tw = self.tw as usize;
+                let display_rows = if combined == 0 { 1u16 } else { combined.div_ceil(tw) as u16 };
+
+                queue!(
+                    self.stdout,
+                    EnableLineWrap,
+                    MoveTo(self.write_col, self.write_row),
+                )?;
                 for chunk in line {
                     queue!(self.stdout, SetStyle(chunk.1), Print(&chunk.0), ResetColor)?;
                 }
-                self.stdout.flush()?;
-                let (c, r) = cursor::position()?;
-                self.write_col = c;
-                self.write_row = r;
+                queue!(self.stdout, DisableLineWrap)?;
 
-                // Handle a very long segment wrapping past the boundary without a \n.
+                // Cursor after terminal wrapping:
+                // col = (write_col + total_chars) % tw
+                // row = write_row + display_rows - 1   (the last row consumed)
+                let final_col =
+                    ((self.write_col as usize + total_chars) % self.tw as usize) as u16;
+                self.write_col = final_col;
+                self.write_row = self
+                    .write_row
+                    .saturating_add(display_rows.saturating_sub(1));
+
+                // If wrapping pushed us into the owned region, scroll.
+                let boundary = self.th.saturating_sub(self.owned_height);
                 if self.write_row >= boundary {
                     let overflow = self.write_row - boundary + 1;
                     queue!(self.stdout, ScrollUp(overflow))?;
@@ -373,7 +408,7 @@ impl Terminal {
                         MoveTo(0, self.write_row),
                         Clear(ClearType::CurrentLine),
                     )?;
-                    self.render_owned_impl(false)?;
+                    self.render_owned_impl(false, self.th.saturating_sub(self.owned_height))?;
                     self.write_col = 0;
                 }
             }
@@ -599,9 +634,19 @@ impl Terminal {
                 _ => Ok(None),
             },
             Event::Resize(tw, th) => {
+                // Save the real old top before updating dimensions, so
+                // render_owned_impl can correctly clear the old owned region.
+                let old_top = self.th.saturating_sub(self.owned_height);
                 self.tw = tw;
                 self.th = th;
-                self.render_owned()?;
+                self.render_owned_impl(true, old_top)?;
+                // Past content was printed at a different width; its visual
+                // position is stale.  Reset write_row to just above the owned
+                // region so the next append starts at a known-safe position
+                // instead of potentially overwriting reflowed history lines.
+                self.write_row =
+                    self.th.saturating_sub(self.owned_height).saturating_sub(1);
+                self.write_col = 0;
                 Ok(Some(TermEvent::Resize))
             }
             _ => Ok(None),
