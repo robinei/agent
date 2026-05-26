@@ -319,6 +319,8 @@ impl Entry {
 pub struct Message {
     pub role: MessageRole,
     pub content: MessageContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]

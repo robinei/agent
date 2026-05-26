@@ -317,6 +317,58 @@ fn stop_agent(backend: &Backend, tree_id: &str) {
     }
 }
 
+fn print_entry_oneshot(entry: &agent_core::types::Entry) {
+    let lines = render_entry_lines(entry);
+    for line in lines {
+        println!("{}", line);
+    }
+}
+
+/// Render an entry to plain text lines (no terminal styling).
+/// Returns one or more lines ready for printing.
+pub fn render_entry_lines(entry: &agent_core::types::Entry) -> Vec<String> {
+    use agent_core::types::*;
+    let mut out = Vec::new();
+    match entry {
+        Entry::Message { message, .. } => {
+            let content = match &message.content {
+                MessageContent::Text(t) => t.clone(),
+                _ => "[content blocks]".into(),
+            };
+            if let Some(ref thinking) = message.thinking {
+                if !thinking.is_empty() {
+                    out.push(thinking.clone());
+                }
+            }
+            match message.role {
+                MessageRole::User => out.push(format!("> {}", content)),
+                _ => out.push(content.clone()),
+            }
+        }
+        Entry::GoalSet { goal, .. } => out.push(format!("🎯  {}", goal)),
+        Entry::ModelSet { model, .. } => out.push(format!("🤖  Model: {}", model)),
+        Entry::SessionEnd { summary, status, .. } => {
+            let s = summary.as_deref().unwrap_or("");
+            if s.is_empty() {
+                out.push(format!("📝 Session ended ({:?})", status));
+            } else {
+                out.push(format!("📝 Session ended ({:?}): {}", status, s));
+            }
+        }
+        Entry::BashExec { command, output, exit_code, .. } => {
+            out.push(format!("  🛠  bash: {}", command));
+            out.push(format!("  bash (exit: {})", exit_code));
+            if !output.is_empty() {
+                for line in output.lines() {
+                    out.push(format!("    │ {}", line));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 fn send_and_stream(backend: &Backend, tree_id: &str, message: &str, stop: &AtomicBool) {
     use agent_core::types::{DiagnosticSeverity, NotificationLevel, ServerEvent};
     let mut session = backend.connect_session(tree_id).unwrap_or_else(|e| exit_err(&e));
@@ -331,7 +383,8 @@ fn send_and_stream(backend: &Backend, tree_id: &str, message: &str, stop: &Atomi
                 print!("{content}");
                 io::stdout().flush().ok();
             }
-            Some(Ok(ServerEvent::Done { .. })) => { println!(); break; }
+            Some(Ok(ServerEvent::Done { status })) if status != "history" => { println!(); break; }
+            Some(Ok(ServerEvent::Done { .. })) => {} // history done, ignore
             Some(Ok(ServerEvent::Notification { level, message })) => {
                 if level == NotificationLevel::Fatal { exit_err(&message); }
                 else { eprintln!("{message}"); }
@@ -347,6 +400,9 @@ fn send_and_stream(backend: &Backend, tree_id: &str, message: &str, stop: &Atomi
                         eprintln!("[{}] {}:{}  {}: {}", source, file.path, diag.range.start.line + 1, sev, diag.message);
                     }
                 }
+            }
+            Some(Ok(ServerEvent::Entry(entry))) => {
+                print_entry_oneshot(&entry);
             }
             Some(Err(e)) => { eprintln!("Parse error: {e}"); break; }
             _ => {}
@@ -391,7 +447,8 @@ fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &
                 print!("{content}");
                 io::stdout().flush().ok();
             }
-            Some(Ok(ServerEvent::Done { .. })) => { println!(); break; }
+            Some(Ok(ServerEvent::Done { status })) if status != "history" => { println!(); break; }
+            Some(Ok(ServerEvent::Done { .. })) => {} // history done, ignore
             Some(Ok(ServerEvent::Notification { level, message })) => {
                 if level == NotificationLevel::Fatal { exit_err(&message); }
                 else { eprintln!("{message}"); }
@@ -408,6 +465,9 @@ fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &
                         eprintln!("[{}] {}:{}  {}: {}", source, file.path, diag.range.start.line + 1, sev, diag.message);
                     }
                 }
+            }
+            Some(Ok(ServerEvent::Entry(entry))) => {
+                print_entry_oneshot(&entry);
             }
             Some(Err(e)) => { eprintln!("Parse error: {e}"); break; }
             _ => {}

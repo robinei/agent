@@ -293,6 +293,7 @@ mod tests {
                 usage: None,
                 stop_reason: None,
                 is_error: None,
+                thinking: None,
             };
             let entry = Entry::Message {
                 id: "aaaa0001".into(),
@@ -326,6 +327,7 @@ mod tests {
                 usage: None,
                 stop_reason: None,
                 is_error: None,
+                thinking: None,
             };
             let entry = Entry::Message {
                 id: "bbbb0001".into(),
@@ -360,6 +362,7 @@ mod tests {
                 usage: None,
                 stop_reason: None,
                 is_error: None,
+                thinking: None,
             },
         };
         let json = serde_json::to_string(&entry).unwrap();

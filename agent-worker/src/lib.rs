@@ -28,6 +28,7 @@ pub(crate) enum AgentState {
         messages: Vec<Message>,
         leaf_id: Option<String>,
         response_text: String,
+        thinking_text: String,
         in_thinking: bool,
         saw_reasoning_field: bool,
         thinking_phase_done: bool,
@@ -55,6 +56,7 @@ impl AgentState {
             messages,
             leaf_id,
             response_text: String::new(),
+            thinking_text: String::new(),
             in_thinking: false,
             saw_reasoning_field: false,
             thinking_phase_done: false,
@@ -145,6 +147,7 @@ fn dispatch_pipe_in(
             for entry in to_emit {
                 crate::util::emit_event(out, ServerEvent::Entry(entry.clone()));
             }
+            crate::util::emit_event(out, ServerEvent::Done { status: "history".into() });
             out.flush().ok();
         }
         PipeIn::Cmd(WsCommand::AutoTitle) => {
@@ -173,6 +176,7 @@ fn dispatch_pipe_in(
                 usage: None,
                 stop_reason: None,
                 is_error: None,
+                thinking: None,
             });
             *req_id += 1;
             let llm_req = agent_core::rpc::LlmRequest { id: *req_id, messages, tools: vec![] };
@@ -279,10 +283,15 @@ fn startup_writes(store: &Store) -> Result<(), WorkerError> {
         None
     };
 
-    // Write a new SessionStart
+    // Write a new SessionStart, linked to the previous entry so
+    // build_context can walk the parent chain across sessions.
+    let session_start_parent = match &recovery_parent {
+        Some(recovery) => Some(recovery.id().to_string()),
+        None => entries.last().map(|e| e.id().to_string()),
+    };
     let session_start = Entry::SessionStart {
         id: agent_core::util::generate_entry_id(),
-        parent_id: None,
+        parent_id: session_start_parent,
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
     store.append_entry(&session_start)?;

@@ -877,6 +877,7 @@ pub fn generate_continuation_brief(
         usage: None,
         stop_reason: None,
         is_error: None,
+        thinking: None,
     };
 
     let mut brief_messages = vec![summary_prompt];
@@ -960,6 +961,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let json = p.serialize_message(&msg);
         assert_eq!(json["role"], "user");
@@ -984,6 +986,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let json = p.serialize_message(&msg);
         assert_eq!(json["role"], "assistant");
@@ -1004,6 +1007,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let json = p.serialize_message(&msg);
         assert_eq!(json["role"], "tool");
@@ -1024,6 +1028,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let body = p.build_body(&[msg], &[], true);
         assert_eq!(body["model"], "test-model");
@@ -1047,6 +1052,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let tools = vec![ToolDefinition {
             name: "read".into(),
@@ -1149,6 +1155,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let body = p.build_body(&[msg], &[], true);
         assert_eq!(body["model"], "claude-3-5-sonnet-20241022");
@@ -1171,6 +1178,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let user = Message {
             role: MessageRole::User,
@@ -1181,6 +1189,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let body = p.build_body(&[sys, user], &[], true);
         assert_eq!(body["system"], "Be helpful.");
@@ -1203,6 +1212,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let body = p.build_body(&[msg], &[], false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -1224,6 +1234,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let tools = vec![ToolDefinition {
             name: "read".into(),

@@ -237,6 +237,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let entry2 = Entry::Message {
             id: "00000002".into(),

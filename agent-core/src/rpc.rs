@@ -169,6 +169,36 @@ mod tests {
     }
 
     #[test]
+    fn test_entry_serde_roundtrip() {
+        let entry = crate::types::Entry::Message {
+            id: "msg1".to_string(),
+            parent_id: Some("parent1".to_string()),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            message: crate::types::Message {
+                role: crate::types::MessageRole::User,
+                content: crate::types::MessageContent::Text("hello".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                tool_name: None,
+                usage: None,
+                stop_reason: None,
+                is_error: None,
+                thinking: None,
+            },
+        };
+        let ev = ServerEvent::Entry(entry);
+        let json = serde_json::to_string(&ev).unwrap();
+        let deserialized: ServerEvent = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            ServerEvent::Entry(e) => {
+                assert_eq!(e.id(), "msg1");
+                assert_eq!(e.parent_id(), Some("parent1"));
+            }
+            _ => panic!("Expected Entry variant"),
+        }
+    }
+
+    #[test]
     fn test_pipe_out_llm_roundtrip() {
         let req = LlmRequest {
             id: 0,

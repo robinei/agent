@@ -367,24 +367,29 @@ fn render_event(
                     state.trailing_newlines = 0;
                 }
                 Entry::Message { message, .. } => {
+                    if let Some(ref thinking) = message.thinking {
+                        if !thinking.is_empty() {
+                            if !state.in_thinking {
+                                state.in_thinking = true;
+                                term.append(&[Span::styled("\r\n", dim_style)])?;
+                                state.trailing_newlines = 0;
+                            }
+                            term.append(&[Span::styled(thinking.clone(), dim_style)])?;
+                        }
+                    }
                     let t = match &message.content {
                         agent_core::types::MessageContent::Text(t) => t.clone(),
                         _ => "[content blocks]".into(),
                     };
                     if !t.is_empty() {
-                        let role_label = match message.role {
-                            agent_core::types::MessageRole::Assistant => "Assistant",
-                            agent_core::types::MessageRole::System => "System",
-                            agent_core::types::MessageRole::Tool => "Tool",
-                            _ => "",
-                        };
-                        if !role_label.is_empty() {
-                            term.append(&[
-                                Span::styled(format!("  {}:", role_label), cyan),
-                                Span::plain("\r\n"),
-                            ])?;
+                        if state.in_thinking {
+                            state.in_thinking = false;
+                            term.append(&[Span::styled("\r\n", bold_style)])?;
+                            state.assistant_header_shown = true;
                         }
-                        term.append(&[Span::plain(format!("{}\r\n", t))])?;
+                        let tw = term.cols() as usize;
+                        md.push(&t, &mut |spans| term.append(spans), tw)?;
+                        md.flush(&mut |spans| term.append(spans), tw)?;
                         state.trailing_newlines = 0;
                     }
                 }
@@ -558,7 +563,7 @@ fn render_event(
                 term.append(&[Span::plain("\r\n")])?;
             }
             match status.as_str() {
-                "stop" | "complete" | "error" => {}
+                "stop" | "complete" | "error" | "history" => {}
                 "length" => {
                     term.append(&[Span::styled(
                         "  ⚠ Stopped at length limit\r\n",
@@ -732,19 +737,6 @@ fn process_message(
         last_tool_args: None,
     };
 
-    // Render the user's message in the append area (matching Entry::Message format)
-    let green = ContentStyle {
-        foreground_color: Some(Color::Green),
-        ..Default::default()
-    };
-    let _ = term.append(&[
-        Span::styled("> ", green),
-        Span::plain(text.to_string()),
-        Span::plain("\n"),
-    ]);
-    let _ = term.flush_append();
-    state.trailing_newlines = 0;
-
     term.set_spinner_active(true).map_err(|e| e.to_string())?;
 
     let mut cancel_signalled = false;
@@ -754,12 +746,9 @@ fn process_message(
         loop {
             match session.try_next_event() {
                 TryEvent::Event(ev) => {
-                    if matches!(&ev, ServerEvent::Entry(_)) {
-                        continue;
-                    }
                     render_event(&ev, &mut state, md, term)
                         .map_err(|e| e.to_string())?;
-                    let done = matches!(&ev, ServerEvent::Done { .. });
+                    let is_real_done = matches!(&ev, ServerEvent::Done { status } if status != "history");
                     let fatal = matches!(
                         &ev,
                         ServerEvent::Notification {
@@ -771,7 +760,7 @@ fn process_message(
                         let tw = term.cols() as usize;
                         md.flush(&mut |spans| term.append(spans), tw).map_err(|e| e.to_string())?;
                     }
-                    if done || fatal {
+                    if is_real_done || fatal {
                         term.set_spinner_active(false)
                             .map_err(|e| e.to_string())?;
                         return Ok(());
@@ -977,6 +966,57 @@ fn create_tree_interactive(
     Ok(meta.id)
 }
 
+// ── History replay ──
+
+fn replay_entries(
+    backend: &Backend,
+    tree_id: &str,
+    term: &mut Terminal,
+    md: &mut MarkdownEmitter,
+) -> Result<(), String> {
+    let mut session = backend.connect_session(tree_id).map_err(|e| e.to_string())?;
+    session.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let ws_fds: Vec<RawFd> = session.as_raw_fd().into_iter().collect();
+
+    let mut state = RenderState {
+        trailing_newlines: 0,
+        in_thinking: false,
+        assistant_header_shown: false,
+        last_tool_args: None,
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    loop {
+        loop {
+            match session.try_next_event() {
+                TryEvent::Event(ServerEvent::Done { status }) if status == "history" => {
+                    return Ok(());
+                }
+                TryEvent::Event(ev) => {
+                    render_event(&ev, &mut state, md, term)
+                        .map_err(|e| e.to_string())?;
+                }
+                TryEvent::WouldBlock => break,
+                TryEvent::Closed | TryEvent::Err(_) => return Ok(()),
+            }
+        }
+
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+
+        let timeout = std::cmp::min(
+            deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u64,
+            200u64,
+        );
+        wait_for_wakeup(&ws_fds, term, std::time::Duration::from_millis(timeout))
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
 // ── Prompt loop ──
 
 /// Run the interactive TUI.
@@ -1054,6 +1094,10 @@ pub fn run_interactive(
                 Err(e) => print_warning(&mut term, &format!("Failed to load tree: {}", e)),
             }
             show_header = false;
+
+            if let Err(e) = replay_entries(backend, &current_tree_id, &mut term, &mut md) {
+                print_warning(&mut term, &format!("Failed to load history: {}", e));
+            }
         }
 
         // Prompt for input

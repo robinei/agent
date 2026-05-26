@@ -16,7 +16,7 @@ use crate::store::Store;
 use crate::AgentState;
 use crate::tools::ToolOutput;
 
-fn make_assistant_message(text: String, tool_calls: Option<Vec<ToolCall>>) -> Message {
+fn make_assistant_message(text: String, tool_calls: Option<Vec<ToolCall>>, thinking: Option<String>) -> Message {
     Message {
         role: MessageRole::Assistant,
         content: MessageContent::Text(text),
@@ -26,6 +26,7 @@ fn make_assistant_message(text: String, tool_calls: Option<Vec<ToolCall>>) -> Me
         usage: None,
         stop_reason: None,
         is_error: None,
+        thinking,
     }
 }
 
@@ -39,6 +40,7 @@ fn make_user_message(text: String) -> Message {
         usage: None,
         stop_reason: None,
         is_error: None,
+        thinking: None,
     }
 }
 
@@ -56,6 +58,7 @@ pub fn make_tool_result_message(tool_call_id: &str, tool_name: &str, result: &Re
         usage: None,
         stop_reason: None,
         is_error,
+        thinking: None,
     }
 }
 
@@ -83,6 +86,7 @@ fn check_context_cap(
     session_cfg: &SessionConfig,
     store: &Store,
     out: &mut BufWriter<std::io::Stdout>,
+    leaf_id: Option<&str>,
 ) -> Result<(), ()> {
     let context_window: usize = 128_000;
     let soft_cap = (session_cfg.soft_cap_pct as usize) * context_window / 100;
@@ -109,7 +113,7 @@ fn check_context_cap(
         if estimated >= hard_cap {
             warn!("Hard cap reached for tree {} (est. {} tokens)", store.tree_id(), estimated);
             emit_notification(out, NotificationLevel::Error, "Hard context cap reached. Ending session.".into());
-            write_session_end(store, out, SessionStatus::Continuing, None);
+            write_session_end(store, out, SessionStatus::Continuing, None, leaf_id.as_deref());
             return Err(());
         }
     }
@@ -183,11 +187,12 @@ pub fn begin_turn(
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         },
     );
 
     let estimated = crate::agent::estimate_context_tokens(&messages);
-    if check_context_cap(estimated, session_cfg, store, out).is_err() {
+    if check_context_cap(estimated, session_cfg, store, out, leaf_id.as_deref()).is_err() {
         return AgentState::Idle;
     }
 
@@ -334,6 +339,7 @@ pub fn process_chunk(
 
     if let AgentState::Streaming {
         ref mut response_text,
+        ref mut thinking_text,
         ref mut in_thinking,
         ref mut saw_reasoning_field,
         ref mut thinking_phase_done,
@@ -345,6 +351,7 @@ pub fn process_chunk(
         if let Some(rc) = &chunk.delta_reasoning {
             if !rc.is_empty() {
                 *saw_reasoning_field = true;
+                thinking_text.push_str(rc);
                 emit_event(out, ServerEvent::ThinkingChunk { content: rc.clone() });
             }
         }
@@ -359,6 +366,7 @@ pub fn process_chunk(
                     for segment in split_thinking_chunks(delta, in_thinking) {
                         match segment {
                             ThinkingSegment::Thinking(t) => {
+                                thinking_text.push_str(&t);
                                 emit_event(out, ServerEvent::ThinkingChunk { content: t });
                             }
                             ThinkingSegment::Text(t) if !t.is_empty() => {
@@ -413,6 +421,7 @@ pub fn finish_response(
         mut messages,
         mut leaf_id,
         response_text,
+        thinking_text,
         in_thinking: _,
         saw_reasoning_field: _,
         thinking_phase_done: _,
@@ -440,8 +449,9 @@ pub fn finish_response(
                 .collect();
 
             let msg_id = agent_core::util::generate_entry_id();
+            let thinking = if thinking_text.is_empty() { None } else { Some(thinking_text.clone()) };
             let assistant_msg =
-                make_assistant_message(response_text.clone(), Some(completed_calls.clone()));
+                make_assistant_message(response_text.clone(), Some(completed_calls.clone()), thinking);
 
             write_message_entry(store, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
             leaf_id = Some(msg_id);
@@ -624,7 +634,8 @@ pub fn finish_response(
                 let initial_wait_ms = 1000u64.min(timeout_ms);
                 return AgentState::Streaming {
                     messages, leaf_id,
-                    response_text: String::new(), in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
+                    response_text: String::new(), thinking_text: String::new(),
+                    in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
                     tool_calls_buf: vec![], finish_reason: None,
                     tool_call_round, tool_calls_this_turn, consecutive_failures,
                     lsp_wait: Some(LspWaitState {
@@ -654,7 +665,8 @@ pub fn finish_response(
 
             if !response_text.is_empty() {
                 let msg_id = agent_core::util::generate_entry_id();
-                let assistant_msg = make_assistant_message(response_text.clone(), None);
+                let thinking = if thinking_text.is_empty() { None } else { Some(thinking_text.clone()) };
+                let assistant_msg = make_assistant_message(response_text.clone(), None, thinking);
                 write_message_entry(store, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
                 leaf_id = Some(msg_id);
             }
@@ -770,7 +782,8 @@ pub fn resolve_lsp_wait_with_timeout(
         AgentState::Streaming {
             messages, leaf_id, tool_call_round,
             tool_calls_this_turn, consecutive_failures,
-            response_text: String::new(), in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
+            response_text: String::new(), thinking_text: String::new(),
+            in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
             tool_calls_buf: vec![], finish_reason: None,
             lsp_wait: Some(LspWaitState {
                 pending_tool_requests: vec![],
@@ -790,13 +803,15 @@ pub fn cancel_turn(
 ) -> AgentState {
     if let AgentState::Streaming {
         response_text,
+        thinking_text,
         leaf_id,
         ..
     } = &state
     {
         if !response_text.is_empty() {
             let msg_id = agent_core::util::generate_entry_id();
-            let assistant_msg = make_assistant_message(response_text.clone(), None);
+            let thinking = if thinking_text.is_empty() { None } else { Some(thinking_text.clone()) };
+            let assistant_msg = make_assistant_message(response_text.clone(), None, thinking);
             write_message_entry(store, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
         }
     }

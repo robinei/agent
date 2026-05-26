@@ -51,6 +51,7 @@ pub fn build_context(entries: &[Entry], leaf_id: &str) -> Vec<Message> {
                             usage: None,
                             stop_reason: None,
                             is_error: None,
+                            thinking: None,
                         });
                     }
                 }
@@ -82,6 +83,7 @@ pub fn build_context(entries: &[Entry], leaf_id: &str) -> Vec<Message> {
                 usage: None,
                 stop_reason: None,
                 is_error: None,
+                thinking: None,
             },
         );
     }
@@ -142,6 +144,7 @@ mod tests {
                 usage: None,
                 stop_reason: None,
                 is_error: None,
+                thinking: None,
             },
         }
     }
@@ -265,6 +268,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             is_error: None,
+            thinking: None,
         };
         let est = estimate_context_tokens(&[msg]);
         assert_eq!(est, estimate_tokens("hello"));

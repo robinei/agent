@@ -163,11 +163,12 @@ pub fn write_session_end(
     out: &mut BufWriter<std::io::Stdout>,
     status: SessionStatus,
     continuation_brief: Option<String>,
+    parent_id: Option<&str>,
 ) {
     let tree_id = store.tree_id();
     let entry = Entry::SessionEnd {
         id: agent_core::util::generate_entry_id(),
-        parent_id: None,
+        parent_id: parent_id.map(|s| s.to_string()),
         timestamp: chrono::Utc::now().to_rfc3339(),
         summary: None,
         status,
