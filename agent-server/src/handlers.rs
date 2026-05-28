@@ -187,6 +187,10 @@ impl PollHandler for NotifyHandler {
                     ctx.send_pipe_in(&PipeIn::Cmd(
                         agent_core::rpc::WsCommand::GetEntries { count: None },
                     ));
+                    ctx.broadcast(agent_core::types::ServerEvent::MetaUpdate {
+                        title: None,
+                        model: Some(ctx.cfg.provider.model.clone()),
+                    });
                 }
                 Ok(WorkerMsg::InjectEvent(ev)) => {
                     ctx.broadcast(ev);

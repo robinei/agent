@@ -15,7 +15,8 @@ use std::time::Duration;
 use crossterm::style::{Attribute, Color, ContentStyle};
 
 use agent_core::types::{
-    DiagnosticSeverity, Entry, NotificationLevel, ServerEvent, TreeMeta, lang_display,
+    ContextStatus, DiagnosticSeverity, Entry, NotificationLevel, ServerEvent, TreeMeta,
+    lang_display,
 };
 
 use crate::client::TryEvent;
@@ -224,11 +225,65 @@ fn format_tool_args(tool: &str, input: &serde_json::Value) -> String {
 
 // ── RenderState and render_event ──
 
+#[derive(Default)]
 struct RenderState {
     trailing_newlines: u8,
     in_thinking: bool,
     assistant_header_shown: bool,
     last_tool_args: Option<(String, serde_json::Value)>,
+    model: Option<String>,
+    input_rate: f64,
+    output_rate: f64,
+    context_pct: Option<u8>,
+    context_estimated: u64,
+    cum_prompt_tokens: u64,
+    cum_completion_tokens: u64,
+    cum_cached_tokens: u64,
+    cache_supported: bool,
+    last_turn_cache_pct: Option<u8>,
+}
+
+fn model_pricing(model: &str) -> (f64, f64) {
+    if model.contains("deepseek") || model.contains("gpt-4o-mini") {
+        (0.15e-6, 0.60e-6)
+    } else if model.contains("claude") {
+        (3.00e-6, 15.00e-6)
+    } else if model.contains("gpt-4") {
+        (10.00e-6, 30.00e-6)
+    } else {
+        (0.15e-6, 0.60e-6)
+    }
+}
+
+fn render_status_bar(term: &mut Terminal, state: &RenderState) {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("🤖 {}", state.model.as_deref().unwrap_or("—")));
+    let ctx_pct = state.context_pct.unwrap_or(0);
+    parts.push(format!("📊 {}k ({}%)", state.context_estimated / 1000, ctx_pct));
+    if state.model.is_some() {
+        let cost = state.cum_prompt_tokens as f64 * state.input_rate
+            + state.cum_completion_tokens as f64 * state.output_rate;
+        parts.push(format!("💰 ${:.4}", cost));
+    } else {
+        parts.push("💰 ?".into());
+    }
+    let session_rate = if state.cum_prompt_tokens > 0 {
+        state.cum_cached_tokens as f64 / state.cum_prompt_tokens as f64 * 100.0
+    } else {
+        0.0
+    };
+    match (state.cache_supported, state.last_turn_cache_pct) {
+        (true, Some(last)) => parts.push(format!("💾 {:.0}% (last {:.0}%)", session_rate, last)),
+        (true, None) => parts.push(format!("💾 {:.0}%", session_rate)),
+        (false, _) => parts.push("💾 ?".into()),
+    }
+    let text = parts.join("  ");
+    let style = ContentStyle {
+        foreground_color: Some(Color::White),
+        background_color: Some(Color::DarkGrey),
+        ..Default::default()
+    };
+    let _ = term.set_status(&[Span::styled(text, style)]);
 }
 
 fn render_event(
@@ -236,6 +291,7 @@ fn render_event(
     state: &mut RenderState,
     md: &mut MarkdownEmitter,
     term: &mut Terminal,
+    persistent: &mut RenderState,
 ) -> io::Result<()> {
     let bold_style = ContentStyle {
         attributes: Attribute::Bold.into(),
@@ -247,10 +303,6 @@ fn render_event(
     };
     let green = ContentStyle {
         foreground_color: Some(Color::Green),
-        ..Default::default()
-    };
-    let cyan = ContentStyle {
-        foreground_color: Some(Color::Cyan),
         ..Default::default()
     };
     let yellow = ContentStyle {
@@ -417,9 +469,20 @@ fn render_event(
             }
             term.flush_append()?;
         }
-        ServerEvent::CapWarning { level, pct } => {
-            print_warning(term, &format!("Context at {}% ({})", pct, level));
-            state.trailing_newlines = 1;
+        ServerEvent::ContextUpdate { status, pct, estimated } => {
+            match status {
+                ContextStatus::Warning | ContextStatus::Critical => {
+                    print_warning(term, &format!("Context at {}% ({:?})", pct, status));
+                    state.trailing_newlines = 1;
+                }
+                _ => {}
+            }
+            let changed = state.context_pct != Some(*pct) || state.context_estimated != *estimated;
+            state.context_pct = Some(*pct);
+            state.context_estimated = *estimated;
+            if changed {
+                render_status_bar(term, state);
+            }
         }
         ServerEvent::Notification { level, message } => {
             if state.in_thinking {
@@ -552,7 +615,35 @@ fn render_event(
             state.trailing_newlines = 1;
             term.flush_append()?;
         }
-        ServerEvent::Done { status } => {
+        ServerEvent::Done { status, usage } => {
+            if let Some(u) = usage {
+                state.cum_prompt_tokens += u.prompt_tokens;
+                state.cum_completion_tokens += u.completion_tokens;
+                let turn_cached = u.cached_prompt_tokens.unwrap_or(0);
+                if u.prompt_tokens > 0 {
+                    state.last_turn_cache_pct =
+                        Some((turn_cached as f64 / u.prompt_tokens as f64 * 100.0).round() as u8);
+                }
+                if let Some(cached) = u.cached_prompt_tokens {
+                    state.cum_cached_tokens += cached;
+                    state.cache_supported = true;
+                } else if state.cache_supported && state.cum_prompt_tokens > 0 {
+                    let prev = state.cum_prompt_tokens - u.prompt_tokens;
+                    let rate = if prev > 0 { state.cum_cached_tokens as f64 / prev as f64 } else { 0.0 };
+                    state.cum_cached_tokens += (u.prompt_tokens as f64 * rate).round() as u64;
+                }
+                persistent.cum_prompt_tokens = state.cum_prompt_tokens;
+                persistent.cum_completion_tokens = state.cum_completion_tokens;
+                persistent.cum_cached_tokens = state.cum_cached_tokens;
+                persistent.cache_supported = state.cache_supported;
+                persistent.last_turn_cache_pct = state.last_turn_cache_pct;
+                if let Some(ref m) = state.model {
+                    persistent.model = Some(m.clone());
+                    persistent.input_rate = state.input_rate;
+                    persistent.output_rate = state.output_rate;
+                }
+                render_status_bar(term, state);
+            }
             let tw = term.cols() as usize;
             md.flush(&mut |spans| term.append(spans), tw)?;
             if state.in_thinking {
@@ -593,7 +684,7 @@ fn render_event(
             state.trailing_newlines = 0;
             term.flush_append()?;
         }
-        ServerEvent::MetaUpdate { title } => {
+        ServerEvent::MetaUpdate { title, model } => {
             if let Some(t) = title {
                 term.append(&[Span::styled(
                     format!("\r\n  Title: {}\r\n", t),
@@ -601,6 +692,15 @@ fn render_event(
                 )])?;
                 state.trailing_newlines = 0;
                 term.flush_append()?;
+            }
+            if let Some(m) = model {
+                state.model = Some(m.clone());
+                state.input_rate = model_pricing(&m).0;
+                state.output_rate = model_pricing(&m).1;
+                persistent.model = Some(m.clone());
+                persistent.input_rate = state.input_rate;
+                persistent.output_rate = state.output_rate;
+                render_status_bar(term, state);
             }
         }
     }
@@ -724,6 +824,7 @@ fn process_message(
     term: &mut Terminal,
     md: &mut MarkdownEmitter,
     stop: &AtomicBool,
+    persistent: &mut RenderState,
 ) -> Result<(), String> {
     let mut session = backend.connect_session(tree_id).map_err(|e| e.to_string())?;
     session.set_nonblocking(true)?;
@@ -731,12 +832,18 @@ fn process_message(
     let ws_fds: Vec<RawFd> = session.as_raw_fd().into_iter().collect();
 
     let mut state = RenderState {
-        trailing_newlines: 0,
-        in_thinking: false,
-        assistant_header_shown: false,
-        last_tool_args: None,
+        model: persistent.model.clone(),
+        input_rate: persistent.input_rate,
+        output_rate: persistent.output_rate,
+        cum_prompt_tokens: persistent.cum_prompt_tokens,
+        cum_completion_tokens: persistent.cum_completion_tokens,
+        cum_cached_tokens: persistent.cum_cached_tokens,
+        cache_supported: persistent.cache_supported,
+        last_turn_cache_pct: persistent.last_turn_cache_pct,
+        ..Default::default()
     };
 
+    render_status_bar(term, &state);
     term.set_spinner_active(true).map_err(|e| e.to_string())?;
 
     let mut cancel_signalled = false;
@@ -746,9 +853,9 @@ fn process_message(
         loop {
             match session.try_next_event() {
                 TryEvent::Event(ev) => {
-                    render_event(&ev, &mut state, md, term)
+                    render_event(&ev, &mut state, md, term, persistent)
                         .map_err(|e| e.to_string())?;
-                    let is_real_done = matches!(&ev, ServerEvent::Done { status } if status != "history");
+                    let is_real_done = matches!(&ev, ServerEvent::Done { status, .. } if status != "history");
                     let fatal = matches!(
                         &ev,
                         ServerEvent::Notification {
@@ -978,23 +1085,19 @@ fn replay_entries(
     session.set_nonblocking(true).map_err(|e| e.to_string())?;
     let ws_fds: Vec<RawFd> = session.as_raw_fd().into_iter().collect();
 
-    let mut state = RenderState {
-        trailing_newlines: 0,
-        in_thinking: false,
-        assistant_header_shown: false,
-        last_tool_args: None,
-    };
+    let mut state = RenderState::default();
+    let mut replay_sticky = RenderState::default();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
 
     loop {
         loop {
             match session.try_next_event() {
-                TryEvent::Event(ServerEvent::Done { status }) if status == "history" => {
+                TryEvent::Event(ServerEvent::Done { status, .. }) if status == "history" => {
                     return Ok(());
                 }
                 TryEvent::Event(ev) => {
-                    render_event(&ev, &mut state, md, term)
+                    render_event(&ev, &mut state, md, term, &mut replay_sticky)
                         .map_err(|e| e.to_string())?;
                 }
                 TryEvent::WouldBlock => break,
@@ -1060,6 +1163,7 @@ pub fn run_interactive(
         select_or_create_tree(&mut term, backend)?
     };
     let mut show_header = true;
+    let mut persistent_state = RenderState::default();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -1289,6 +1393,7 @@ pub fn run_interactive(
                     &mut term,
                     &mut md,
                     stop,
+                    &mut persistent_state,
                 )?;
             }
         }

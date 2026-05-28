@@ -85,7 +85,7 @@ pub fn broadcast_meta_update(tree_id: &str, title: Option<String>) {
     let guard = entry.lock().unwrap_or_else(|e| e.into_inner());
     let _ = guard
         .msg_tx
-        .send(WorkerMsg::InjectEvent(ServerEvent::MetaUpdate { title }));
+        .send(WorkerMsg::InjectEvent(ServerEvent::MetaUpdate { title, model: None }));
     let _ = nix::unistd::write(&guard.notify_write, b"\x00");
 }
 

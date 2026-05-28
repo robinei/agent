@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // ── Identifiers ──
 
@@ -422,6 +423,17 @@ pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_prompt_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    pub fn cached_from_openai_json(usage: &Value) -> Option<u64> {
+        usage.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64())
+            .or_else(|| usage.get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64()))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -475,6 +487,14 @@ pub enum NotificationLevel {
     Fatal,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextStatus {
+    Ok,
+    Warning,
+    Critical,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum ServerEvent {
@@ -498,21 +518,33 @@ pub enum ServerEvent {
     #[serde(rename = "entry")]
     Entry(Entry),
     /// Runtime advisory only (never stored).
-    #[serde(rename = "cap_warning")]
-    CapWarning { level: String, pct: u8 },
+    #[serde(rename = "context_update")]
+    ContextUpdate {
+        status: ContextStatus,
+        pct: u8,
+        estimated: u64,
+    },
     /// User-visible notification from the worker (info / warning / error / fatal).
     #[serde(rename = "notification")]
     Notification { level: NotificationLevel, message: String },
     /// Turn complete — CLI shows prompt.
     #[serde(rename = "done")]
-    Done { status: String },
+    Done {
+        status: String,
+        #[serde(default)]
+        usage: Option<TokenUsage>,
+    },
     /// External file change — PWA file view.
     #[serde(rename = "file_changed")]
     FileChanged { path: String, kind: String },
     /// Meta field update (e.g., auto-title result). Broadcast by server;
     /// never persisted in the event stream.
     #[serde(rename = "meta_update")]
-    MetaUpdate { title: Option<String> },
+    MetaUpdate {
+        title: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+    },
     /// Reasoning/thinking token from models that expose extended thinking.
     /// Never stored. Rendered in dimmed color during streaming.
     #[serde(rename = "thinking_chunk")]

@@ -157,6 +157,7 @@ pub fn run_event_loop(
         });
         ctx.broadcast(agent_core::types::ServerEvent::Done {
             status: "aborted".into(),
+            usage: None,
         });
     }
 

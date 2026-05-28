@@ -383,7 +383,7 @@ fn send_and_stream(backend: &Backend, tree_id: &str, message: &str, stop: &Atomi
                 print!("{content}");
                 io::stdout().flush().ok();
             }
-            Some(Ok(ServerEvent::Done { status })) if status != "history" => { println!(); break; }
+            Some(Ok(ServerEvent::Done { status, .. })) if status != "history" => { println!(); break; }
             Some(Ok(ServerEvent::Done { .. })) => {} // history done, ignore
             Some(Ok(ServerEvent::Notification { level, message })) => {
                 if level == NotificationLevel::Fatal { exit_err(&message); }
@@ -447,7 +447,7 @@ fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &
                 print!("{content}");
                 io::stdout().flush().ok();
             }
-            Some(Ok(ServerEvent::Done { status })) if status != "history" => { println!(); break; }
+            Some(Ok(ServerEvent::Done { status, .. })) if status != "history" => { println!(); break; }
             Some(Ok(ServerEvent::Done { .. })) => {} // history done, ignore
             Some(Ok(ServerEvent::Notification { level, message })) => {
                 if level == NotificationLevel::Fatal { exit_err(&message); }
@@ -483,7 +483,7 @@ fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &
             break;
         }
         match session.try_next_event() {
-            TryEvent::Event(ServerEvent::MetaUpdate { title: Some(t) }) => {
+            TryEvent::Event(ServerEvent::MetaUpdate { title: Some(t), .. }) => {
                 println!("\nTitle: {}", t);
                 break;
             }

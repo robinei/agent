@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use agent_core::config::Config;
 use agent_core::rpc::{LlmRequest, LlmResponse, PipeIn};
+use serde_json::json;
 
 use crate::provider::{self, Provider, StreamEvent};
 use nix::poll::PollFlags;
@@ -90,6 +91,7 @@ pub struct LlmHandler {
     chunk_decode: ChunkDecode,
     chunk_size_buf: Vec<u8>,
     provider: Box<dyn Provider>,
+    got_done: bool,
 }
 
 impl LlmHandler {
@@ -131,7 +133,11 @@ impl LlmHandler {
             LlmTransport::Plain(tcp)
         };
 
-        let body = prov.build_body(&req.messages, &req.tools, true);
+        let mut body = prov.build_body(&req.messages, &req.tools, true);
+        // Set user for routing affinity so cache is consistent across requests.
+        if let Some(ref rid) = req.routing_id {
+            body["user"] = json!(rid);
+        }
         let body_str = serde_json::to_string(&body)?;
         let auth_lines = prov.auth_header_lines();
         let request = format!(
@@ -157,6 +163,7 @@ impl LlmHandler {
             chunk_decode: ChunkDecode::Size,
             chunk_size_buf: Vec::new(),
             provider: prov,
+            got_done: false,
         })
     }
 
@@ -209,7 +216,7 @@ impl LlmHandler {
                 log::debug!(
                     "[worker_loop {}] sending ChatChunk -> worker: {}",
                     ctx.tree_id,
-                    data.chars().take(120).collect::<String>()
+                    data.chars().take(500).collect::<String>()
                 );
                 ctx.send_pipe_in(&PipeIn::Llm(LlmResponse::Chunk {
                     id: self.req_id,
@@ -219,11 +226,11 @@ impl LlmHandler {
             }
             StreamEvent::Done => {
                 log::debug!(
-                    "[worker_loop {}] SSE done -> sending Llm::Done",
+                    "[worker_loop {}] SSE done (deferred)",
                     ctx.tree_id
                 );
-                send_llm_done(ctx, self.req_id);
-                false
+                self.got_done = true;
+                true // keep reading — usage data may follow [DONE]
             }
             StreamEvent::Skip => true,
         }
@@ -419,10 +426,23 @@ impl PollHandler for LlmHandler {
                         }
                         Ok(n) => {
                             if !self.feed_bytes(ctx, &tmp[..n]) {
+                                // feed_bytes only returns false on error;
+                                // [DONE] no longer stops processing via handle_sse_line.
+                                // If the connection closed mid-parse, handle above.
+                            }
+                            if self.got_done {
+                                // All available data has been consumed — send Done now.
+                                send_llm_done(ctx, self.req_id);
                                 return false;
                             }
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if self.got_done {
+                                send_llm_done(ctx, self.req_id);
+                                return false;
+                            }
+                            break;
+                        }
                         Err(e) => {
                             if !self.line_buf.is_empty() {
                                 let line = std::mem::take(&mut self.line_buf);

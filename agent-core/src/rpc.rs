@@ -25,6 +25,8 @@ pub struct LlmRequest {
     pub id: u64,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_id: Option<String>,
 }
 
 // Carried in PipeIn::Llm — server streams completion back to worker
@@ -119,6 +121,7 @@ mod tests {
             id: 42,
             messages: vec![],
             tools: vec![],
+            routing_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: LlmRequest = serde_json::from_str(&json).unwrap();
@@ -204,6 +207,7 @@ mod tests {
             id: 0,
             messages: vec![],
             tools: vec![],
+            routing_id: None,
         };
         let pipe = PipeOut::Llm(req);
         let json = serde_json::to_string(&pipe).unwrap();

@@ -50,11 +50,11 @@ impl WorkerCtx {
                     format!("ToolResult({}, exit={})", tool, exit)
                 }
                 ServerEvent::Entry(e) => format!("Entry({})", e.id()),
-                ServerEvent::CapWarning { level, pct } => format!("CapWarning({},{}%)", level, pct),
+                ServerEvent::ContextUpdate { status, pct, .. } => format!("ContextUpdate({:?},{}%)", status, pct),
                 ServerEvent::Notification { level, message } => {
                     format!("Notification({:?}, {})", level, message)
                 }
-                ServerEvent::Done { status } => format!("Done({})", status),
+                ServerEvent::Done { status, .. } => format!("Done({})", status),
                 ServerEvent::FileChanged { path, kind } => format!("FileChanged({},{})", kind, path),
                 ServerEvent::MetaUpdate { .. } => "MetaUpdate".into(),
                 ServerEvent::Diagnostics { source, files } => {

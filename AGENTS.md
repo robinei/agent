@@ -94,7 +94,7 @@ See `DEBUG.md` for env-var configuration and troubleshooting.
   JSON object: `{"method":"message","params":{"text":"..."}}` or
   `{"method":"stop"}`.
 - **Server events:** `ServerEvent` enum in `agent-core/src/types.rs` —
-  `TextChunk`, `ToolStart`, `ToolResult`, `Entry(...)`, `CapWarning`,
+  `TextChunk`, `ToolStart`, `ToolResult`, `Entry(...)`, `ContextUpdate`,
   `MetaUpdate`, `Done`, `Error`. The worker writes these to stdout as JSON
   lines; the server's `StdoutHandler` fans them out to WS clients.
 
@@ -137,7 +137,7 @@ See `DEBUG.md` for env-var configuration and troubleshooting.
   strips `<think>…</think>` spans from streamed chunks; thinking content is
   suppressed from the stored transcript and WS output.
 - **Token heuristic:** `ceil(len / 3.5)` for context estimation; emit
-  `CapWarning` at soft cap, force `session_end` at hard cap.
+  `ContextUpdate` on every turn (status: Ok/Warning/Critical), force `session_end` at hard cap.
 - **Stop:** the server sends `PipeIn::Cmd(Stop)` on the worker's stdin.
   The worker's main loop checks the `stop` atomic before starting a new
   tool call round; mid-stream, the server can also drop the LLM connection.

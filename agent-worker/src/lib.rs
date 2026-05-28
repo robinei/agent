@@ -38,6 +38,10 @@ pub(crate) enum AgentState {
         tool_calls_this_turn: usize,
         consecutive_failures: usize,
         lsp_wait: Option<crate::lsp_client::LspWaitState>,
+        cum_prompt_tokens: u64,
+        cum_completion_tokens: u64,
+        cum_cached_tokens: u64,
+        seen_cached_tokens: bool,
     },
     AutoTitling {
         accumulated: String,
@@ -66,6 +70,10 @@ impl AgentState {
             tool_calls_this_turn,
             consecutive_failures,
             lsp_wait: None,
+            cum_prompt_tokens: 0,
+            cum_completion_tokens: 0,
+            cum_cached_tokens: 0,
+            seen_cached_tokens: false,
         }
     }
 }
@@ -147,7 +155,7 @@ fn dispatch_pipe_in(
             for entry in to_emit {
                 crate::util::emit_event(out, ServerEvent::Entry(entry.clone()));
             }
-            crate::util::emit_event(out, ServerEvent::Done { status: "history".into() });
+            crate::util::emit_event(out, ServerEvent::Done { status: "history".into(), usage: None });
             out.flush().ok();
         }
         PipeIn::Cmd(WsCommand::AutoTitle) => {
@@ -179,7 +187,7 @@ fn dispatch_pipe_in(
                 thinking: None,
             });
             *req_id += 1;
-            let llm_req = agent_core::rpc::LlmRequest { id: *req_id, messages, tools: vec![] };
+            let llm_req = agent_core::rpc::LlmRequest { id: *req_id, messages, tools: vec![], routing_id: None };
             agent_core::rpc::write_json_line(out, &agent_core::rpc::PipeOut::Llm(llm_req))
                 .ok();
             out.flush().ok();
@@ -222,7 +230,7 @@ fn dispatch_pipe_in(
                             meta.title = Some(title.clone());
                             let _ = store.save_tree_meta(&meta);
                         }
-                        crate::util::emit_event(out, ServerEvent::MetaUpdate { title: Some(title) });
+                        crate::util::emit_event(out, ServerEvent::MetaUpdate { title: Some(title), model: None });
                         out.flush().ok();
                     }
                     *state = AgentState::Idle;
@@ -408,7 +416,7 @@ pub fn run() -> WorkerResult<()> {
 
         if SIGTERM_RECEIVED.load(Ordering::Relaxed) {
             if matches!(state, AgentState::Streaming { .. }) {
-                crate::util::emit_event(&mut out, agent_core::types::ServerEvent::Done { status: "aborted".into() });
+                crate::util::emit_event(&mut out, agent_core::types::ServerEvent::Done { status: "aborted".into(), usage: None });
             }
             break;
         }
@@ -481,10 +489,10 @@ pub fn run() -> WorkerResult<()> {
             let tools_done = wait.pending_tool_requests.is_empty();
             if tools_done && (now >= wait.silence_until || now >= wait.deadline) {
                 let old = std::mem::replace(&mut state, AgentState::Idle);
-                state = resolve_lsp_wait_into(old, &mut ctx.lsp_clients, &mut out, &tools, &mut req_id);
+                state = resolve_lsp_wait_into(old, &mut ctx.lsp_clients, &mut out, &tools, &mut req_id, Some(store.tree_id().to_string()));
             } else if !tools_done && now >= wait.deadline {
                 let old = std::mem::replace(&mut state, AgentState::Idle);
-                state = resolve_lsp_wait_with_timeout(old, &mut ctx, &mut out, &tools, &mut req_id);
+                state = resolve_lsp_wait_with_timeout(old, &mut ctx, &mut out, &tools, &mut req_id, Some(store.tree_id().to_string()));
             }
         }
 

@@ -97,25 +97,27 @@ fn check_context_cap(
         estimated, soft_cap, hard_cap
     );
 
-    if estimated >= soft_cap {
-        let pct = (estimated * 100 / context_window) as u8;
-        emit_event(
-            out,
-            ServerEvent::CapWarning {
-                level: if estimated >= hard_cap {
-                    "hard".into()
-                } else {
-                    "soft".into()
-                },
-                pct,
+    let pct = (estimated * 100 / context_window) as u8;
+    emit_event(
+        out,
+        ServerEvent::ContextUpdate {
+            status: if estimated >= hard_cap {
+                agent_core::types::ContextStatus::Critical
+            } else if estimated >= soft_cap {
+                agent_core::types::ContextStatus::Warning
+            } else {
+                agent_core::types::ContextStatus::Ok
             },
-        );
-        if estimated >= hard_cap {
-            warn!("Hard cap reached for tree {} (est. {} tokens)", store.tree_id(), estimated);
-            emit_notification(out, NotificationLevel::Error, "Hard context cap reached. Ending session.".into());
-            write_session_end(store, out, SessionStatus::Continuing, None, leaf_id.as_deref());
-            return Err(());
-        }
+            pct,
+            estimated: estimated as u64,
+        },
+    );
+
+    if estimated >= hard_cap {
+        warn!("Hard cap reached for tree {} (est. {} tokens)", store.tree_id(), estimated);
+        emit_notification(out, NotificationLevel::Error, "Hard context cap reached. Ending session.".into());
+        write_session_end(store, out, SessionStatus::Continuing, None, leaf_id.as_deref());
+        return Err(());
     }
     Ok(())
 }
@@ -198,7 +200,8 @@ pub fn begin_turn(
 
     let definitions = collect_tool_definitions(tools);
     *req_id += 1;
-    send_llm_request(out, messages.clone(), definitions, *req_id);
+    let routing_id = Some(store.tree_id().to_string());
+    send_llm_request(out, messages.clone(), definitions, *req_id, routing_id);
 
     AgentState::new_streaming(messages, leaf_id, 0, 0, 0)
 }
@@ -319,7 +322,7 @@ pub fn process_chunk(
     let trimmed = data.trim();
     log::debug!(
         "process_chunk data: {}",
-        trimmed.chars().take(160).collect::<String>()
+        trimmed.chars().take(500).collect::<String>()
     );
     if trimmed.is_empty() {
         return;
@@ -345,6 +348,10 @@ pub fn process_chunk(
         ref mut thinking_phase_done,
         ref mut tool_calls_buf,
         ref mut finish_reason,
+        ref mut cum_prompt_tokens,
+        ref mut cum_completion_tokens,
+        ref mut cum_cached_tokens,
+        ref mut seen_cached_tokens,
         ..
     } = state
     {
@@ -403,6 +410,15 @@ pub fn process_chunk(
         if let Some(reason) = chunk.finish_reason {
             *finish_reason = Some(reason);
         }
+
+        if let Some(usage) = &chunk.usage {
+            *cum_prompt_tokens += usage.prompt_tokens;
+            *cum_completion_tokens += usage.completion_tokens;
+            *seen_cached_tokens |= usage.cached_prompt_tokens.is_some();
+            if let Some(cached) = usage.cached_prompt_tokens {
+                *cum_cached_tokens += cached;
+            }
+        }
     }
 }
 
@@ -431,6 +447,10 @@ pub fn finish_response(
         mut tool_calls_this_turn,
         mut consecutive_failures,
         lsp_wait: _,
+        cum_prompt_tokens,
+        cum_completion_tokens,
+        cum_cached_tokens,
+        seen_cached_tokens,
     } = state
     else {
         return AgentState::Idle;
@@ -467,7 +487,7 @@ pub fn finish_response(
                 if tool_calls_this_turn > max_per_turn {
                     warn!("Max tool calls per turn reached for tree {}", tree_id);
                     emit_notification(out, NotificationLevel::Error, format!("Max tool calls per turn ({}) reached", max_per_turn));
-                    emit_event(out, ServerEvent::Done { status: "error".into() });
+                    emit_event(out, ServerEvent::Done { status: "error".into(), usage: None });
                     return AgentState::Idle;
                 }
 
@@ -496,7 +516,7 @@ pub fn finish_response(
                         if consecutive_failures >= 3 {
                             warn!("3 consecutive tool failures for tree {}", tree_id);
                             emit_notification(out, NotificationLevel::Error, "3 consecutive tool failures, aborting turn".into());
-                            emit_event(out, ServerEvent::Done { status: "error".into() });
+                            emit_event(out, ServerEvent::Done { status: "error".into(), usage: None });
                             return AgentState::Idle;
                         }
                         continue;
@@ -520,7 +540,7 @@ pub fn finish_response(
                         if consecutive_failures >= 3 {
                             warn!("3 consecutive tool failures for tree {}", tree_id);
                             emit_notification(out, NotificationLevel::Error, "3 consecutive tool failures, aborting turn".into());
-                            emit_event(out, ServerEvent::Done { status: "error".into() });
+                            emit_event(out, ServerEvent::Done { status: "error".into(), usage: None });
                             return AgentState::Idle;
                         }
                         continue;
@@ -539,7 +559,7 @@ pub fn finish_response(
                             if consecutive_failures >= 3 {
                                 warn!("3 consecutive tool failures for tree {}", tree_id);
                                 emit_notification(out, NotificationLevel::Error, "3 consecutive tool failures, aborting turn".into());
-                                emit_event(out, ServerEvent::Done { status: "error".into() });
+                                emit_event(out, ServerEvent::Done { status: "error".into(), usage: None });
                                 return AgentState::Idle;
                             }
                         } else {
@@ -614,7 +634,7 @@ pub fn finish_response(
                         max_per_turn, tree_id
                     );
                     emit_notification(out, NotificationLevel::Error, format!("Max tool call rounds ({}) reached", max_per_turn));
-                    emit_event(out, ServerEvent::Done { status: "error".into() });
+                    emit_event(out, ServerEvent::Done { status: "error".into(), usage: None });
                 }
                 return AgentState::Idle;
             }
@@ -638,6 +658,7 @@ pub fn finish_response(
                     in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
                     tool_calls_buf: vec![], finish_reason: None,
                     tool_call_round, tool_calls_this_turn, consecutive_failures,
+                    cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
                     lsp_wait: Some(LspWaitState {
                         deadline,
                         silence_until: now + std::time::Duration::from_millis(initial_wait_ms),
@@ -649,19 +670,37 @@ pub fn finish_response(
             }
 
             if crate::SIGTERM_RECEIVED.load(Ordering::Relaxed) {
-                emit_event(out, ServerEvent::Done { status: "aborted".into() });
+                emit_event(out, ServerEvent::Done { status: "aborted".into(), usage: None });
                 return AgentState::Idle;
             }
 
             let definitions = collect_tool_definitions(tools);
             *req_id += 1;
-            send_llm_request(out, messages.clone(), definitions, *req_id);
+            send_llm_request(out, messages.clone(), definitions, *req_id, Some(store.tree_id().to_string()));
 
-            AgentState::new_streaming(messages, leaf_id, tool_call_round, tool_calls_this_turn, consecutive_failures)
+            AgentState::Streaming {
+                messages, leaf_id,
+                response_text: String::new(), thinking_text: String::new(),
+                in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
+                tool_calls_buf: vec![], finish_reason: None,
+                tool_call_round, tool_calls_this_turn, consecutive_failures,
+                cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
+                lsp_wait: None,
+            }
         }
         reason @ (StopReason::Stop | StopReason::Length) => {
             let status = if matches!(reason, StopReason::Length) { "length" } else { "stop" };
-            emit_event(out, ServerEvent::Done { status: status.into() });
+            let usage = if cum_prompt_tokens > 0 || cum_completion_tokens > 0 {
+                Some(agent_core::types::TokenUsage {
+                    prompt_tokens: cum_prompt_tokens,
+                    completion_tokens: cum_completion_tokens,
+                    total_tokens: cum_prompt_tokens + cum_completion_tokens,
+                    cached_prompt_tokens: Some(cum_cached_tokens),
+                })
+            } else {
+                None
+            };
+            emit_event(out, ServerEvent::Done { status: status.into(), usage });
 
             if !response_text.is_empty() {
                 let msg_id = agent_core::util::generate_entry_id();
@@ -681,7 +720,7 @@ pub fn finish_response(
         }
         reason => {
             warn!("Unhandled finish reason {:?} for tree {}", reason, tree_id);
-            emit_event(out, ServerEvent::Done { status: "stop".into() });
+            emit_event(out, ServerEvent::Done { status: "stop".into(), usage: None });
             AgentState::Idle
         }
     }
@@ -693,10 +732,13 @@ pub fn resolve_lsp_wait_into(
     out: &mut BufWriter<std::io::Stdout>,
     tools: &[Box<dyn crate::tools::Tool>],
     req_id: &mut u64,
+    routing_id: Option<String>,
 ) -> AgentState {
     let AgentState::Streaming {
         mut messages, leaf_id, tool_call_round,
-        tool_calls_this_turn, consecutive_failures, lsp_wait, ..
+        tool_calls_this_turn, consecutive_failures, lsp_wait,
+        cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
+        ..
     } = state else { return state };
 
     let dirty_by_call = lsp_wait.map(|w| w.dirty_by_call).unwrap_or_default();
@@ -754,8 +796,16 @@ pub fn resolve_lsp_wait_into(
     }
     let definitions = tools.iter().map(|t| t.definition()).collect();
     *req_id += 1;
-    send_llm_request(out, messages.clone(), definitions, *req_id);
-    AgentState::new_streaming(messages, leaf_id, tool_call_round, tool_calls_this_turn, consecutive_failures)
+    send_llm_request(out, messages.clone(), definitions, *req_id, routing_id);
+    AgentState::Streaming {
+        messages, leaf_id,
+        response_text: String::new(), thinking_text: String::new(),
+        in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
+        tool_calls_buf: vec![], finish_reason: None,
+        tool_call_round, tool_calls_this_turn, consecutive_failures,
+        cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
+        lsp_wait: None,
+    }
 }
 
 pub fn resolve_lsp_wait_with_timeout(
@@ -764,10 +814,13 @@ pub fn resolve_lsp_wait_with_timeout(
     out: &mut BufWriter<std::io::Stdout>,
     tools: &[Box<dyn crate::tools::Tool>],
     req_id: &mut u64,
+    routing_id: Option<String>,
 ) -> AgentState {
     let AgentState::Streaming {
         mut messages, leaf_id, tool_call_round,
-        tool_calls_this_turn, consecutive_failures, lsp_wait: Some(wait), ..
+        tool_calls_this_turn, consecutive_failures, lsp_wait: Some(wait),
+        cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
+        ..
     } = state else { return state };
 
     for pending in &wait.pending_tool_requests {
@@ -785,13 +838,14 @@ pub fn resolve_lsp_wait_with_timeout(
             response_text: String::new(), thinking_text: String::new(),
             in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
             tool_calls_buf: vec![], finish_reason: None,
+            cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
             lsp_wait: Some(LspWaitState {
                 pending_tool_requests: vec![],
                 dirty_by_call: wait.dirty_by_call,
                 ..wait
             }),
         },
-        &mut ctx.lsp_clients, out, tools, req_id,
+        &mut ctx.lsp_clients, out, tools, req_id, routing_id,
     )
 }
 
@@ -816,7 +870,7 @@ pub fn cancel_turn(
         }
     }
 
-    emit_event(out, ServerEvent::Done { status: "cancelled".into() });
+    emit_event(out, ServerEvent::Done { status: "cancelled".into(), usage: None });
     ctx.stop.store(false, Ordering::Relaxed);
     AgentState::Idle
 }

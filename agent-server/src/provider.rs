@@ -284,17 +284,23 @@ impl Provider for OpenAiProvider {
             Err(_) => return StreamEvent::Skip,
         };
 
-        let choice = match openai["choices"].as_array().and_then(|a| a.first()) {
-            Some(c) => c,
-            None => return StreamEvent::Skip,
-        };
+        let usage = openai["usage"].as_object().map(|u| {
+            TokenUsage {
+                prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                completion_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                cached_prompt_tokens: TokenUsage::cached_from_openai_json(&openai["usage"]),
+            }
+        });
 
-        let delta = &choice["delta"];
+        let choice = openai["choices"].as_array().and_then(|a| a.first());
 
         let chunk = ChatChunk {
-            delta_text: delta.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            delta_reasoning: delta.get("reasoning").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            tool_call_delta: delta["tool_calls"]
+            delta_text: choice.and_then(|c| c["delta"].get("content"))
+                .and_then(|v| v.as_str()).map(|s| s.to_string()),
+            delta_reasoning: choice.and_then(|c| c["delta"].get("reasoning"))
+                .and_then(|v| v.as_str()).map(|s| s.to_string()),
+            tool_call_delta: choice.map(|c| c["delta"]["tool_calls"]
                 .as_array()
                 .map(|arr| {
                     arr.iter()
@@ -308,8 +314,9 @@ impl Provider for OpenAiProvider {
                         })
                         .collect()
                 })
+                .unwrap_or_default())
                 .unwrap_or_default(),
-            finish_reason: choice["finish_reason"]
+            finish_reason: choice.and_then(|c| c["finish_reason"]
                 .as_str()
                 .and_then(|s| match s {
                     "stop" => Some(StopReason::Stop),
@@ -317,14 +324,8 @@ impl Provider for OpenAiProvider {
                     "tool_calls" => Some(StopReason::ToolCalls),
                     "content_filter" => Some(StopReason::ContentFilter),
                     _ => None,
-                }),
-            usage: openai["usage"]
-                .as_object()
-                .map(|u| TokenUsage {
-                    prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                    completion_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                    total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                }),
+                })),
+            usage,
         };
 
         StreamEvent::Chunk(chunk)
@@ -342,6 +343,7 @@ impl Provider for OpenAiProvider {
             prompt_tokens: json["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
             completion_tokens: json["usage"]["completion_tokens"].as_u64().unwrap_or(0),
             total_tokens: json["usage"]["total_tokens"].as_u64().unwrap_or(0),
+            cached_prompt_tokens: TokenUsage::cached_from_openai_json(&json["usage"]),
         };
 
         let tool_calls = json["choices"][0]["message"]["tool_calls"]
@@ -643,6 +645,7 @@ impl Provider for AnthropicProvider {
                     completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                     total_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
                         + u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                    cached_prompt_tokens: None,
                 });
                 StreamEvent::Chunk(ChatChunk {
                     delta_text: None,
@@ -747,6 +750,7 @@ impl Provider for AnthropicProvider {
                     prompt_tokens: 0, // not in message_delta for Anthropic
                     completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                     total_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                    cached_prompt_tokens: None,
                 });
                 StreamEvent::Chunk(ChatChunk {
                     delta_text: None,
@@ -829,6 +833,7 @@ impl Provider for AnthropicProvider {
             completion_tokens: json["usage"]["output_tokens"].as_u64().unwrap_or(0),
             total_tokens: json["usage"]["input_tokens"].as_u64().unwrap_or(0)
                 + json["usage"]["output_tokens"].as_u64().unwrap_or(0),
+            cached_prompt_tokens: None,
         };
 
         Ok(ChatResponse {
@@ -1075,6 +1080,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
+                cached_prompt_tokens: None,
             }),
         };
         let json = serde_json::to_string(&chunk).unwrap();
