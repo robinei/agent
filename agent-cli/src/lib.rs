@@ -6,11 +6,12 @@ use std::os::unix::io::{FromRawFd, IntoRawFd};
 
 use clap::Parser;
 
+mod app;
 mod client;
 mod interactive;
 mod local;
 pub mod markdown;
-pub mod terminal;
+mod tui;
 
 use client::{AgentClient, AgentSession, ClientError};
 use local::{LocalClient, LocalClientError};

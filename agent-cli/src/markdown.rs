@@ -1,9 +1,10 @@
 use std::io;
 
-use crossterm::style::{Attribute, Color, ContentStyle};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span as RSpan;
 use unicode_width::UnicodeWidthStr;
 
-use crate::terminal::Span;
+type Span = RSpan<'static>;
 
 /// Streaming markdown renderer. Feed LLM tokens via `push`; call `flush` at
 /// end-of-turn to drain any content held back waiting for a closing marker.
@@ -74,7 +75,7 @@ impl FormatKind {
             FormatKind::Strikethrough => "~~",
         }
     }
-    fn style(&self) -> ContentStyle {
+    fn style(&self) -> Style {
         match self {
             FormatKind::Bold => bold_style(),
             FormatKind::Italic => italic_style(),
@@ -111,18 +112,14 @@ impl InlineParser {
     fn flush_segment(&mut self) {
         if !self.segment.is_empty() {
             let s = std::mem::take(&mut self.segment);
-            self.spans.push(Span::plain(s));
+            self.spans.push(Span::raw(s));
         }
     }
 
     /// Combined style from all active formats on the stack
     /// (innermost attributes ORed over outer ones).
-    fn cumulative_style(&self) -> ContentStyle {
-        let mut style = ContentStyle::default();
-        for f in &self.formats {
-            style.attributes = style.attributes | f.kind.style().attributes;
-        }
-        style
+    fn cumulative_style(&self) -> Style {
+        self.formats.iter().fold(Style::default(), |acc, f| acc.patch(f.kind.style()))
     }
 
     /// Open a new format: flush any trailing plain text, then push the frame.
@@ -231,8 +228,7 @@ impl InlineParser {
             InlineState::InlineCode { mut buf } => match c {
                 '`' => {
                     self.flush_segment();
-                    let mut style = inline_code_style();
-                    style.attributes = style.attributes | self.cumulative_style().attributes;
+                    let style = inline_code_style().patch(self.cumulative_style());
                     self.spans.push(Span::styled(buf, style));
                     self.state = InlineState::Normal;
                 }
@@ -428,15 +424,15 @@ impl MarkdownEmitter {
             State::PendingTable { cells, cell } => {
                 self.segment.push('|');
                 for cell_spans in &cells {
-                    for span in cell_spans { self.segment.push_str(&span.text); }
+                    for span in cell_spans { self.segment.push_str(&span.content); }
                     self.segment.push('|');
                 }
-                for span in &cell.finish() { self.segment.push_str(&span.text); }
+                for span in &cell.finish() { self.segment.push_str(&span.content); }
             }
             State::PendingTableSep { header_cells, sep_buf } => {
                 self.segment.push('|');
                 for cell_spans in &header_cells {
-                    for span in cell_spans { self.segment.push_str(&span.text); }
+                    for span in cell_spans { self.segment.push_str(&span.content); }
                     self.segment.push('|');
                 }
                 self.segment.push('\n');
@@ -459,7 +455,7 @@ impl MarkdownEmitter {
         }
         let s = std::mem::take(&mut self.segment);
         if !s.is_empty() {
-            emit(&[Span::plain(s)])?;
+            emit(&[Span::raw(s)])?;
         }
         Ok(())
     }
@@ -471,7 +467,7 @@ impl MarkdownEmitter {
             return Ok(());
         }
         let s = std::mem::take(&mut self.segment);
-        emit(&[Span::plain(s)])
+        emit(&[Span::raw(s)])
     }
 
     fn flush_code_segment(&mut self, emit: &mut impl FnMut(&[Span]) -> io::Result<()>) -> io::Result<()> {
@@ -680,7 +676,7 @@ impl MarkdownEmitter {
     ) -> io::Result<()> {
         match c {
             '\n' => {
-                emit(&[Span::styled(buf, header_style(level)), Span::plain("\n")])?;
+                emit(&[Span::styled(buf, header_style(level)), Span::raw("\n")])?;
                 self.state = State::Normal;
                 self.line_start = true;
             }
@@ -767,7 +763,7 @@ impl MarkdownEmitter {
         } else {
             self.segment.push('|');
             for cell_spans in &header_cells {
-                for span in cell_spans { self.segment.push_str(&span.text); }
+                for span in cell_spans { self.segment.push_str(&span.content); }
                 self.segment.push('|');
             }
             self.segment.push('\n');
@@ -807,7 +803,7 @@ impl MarkdownEmitter {
             // Non-pipe, non-blank: multi-line cell continuation.
             if let Some(last_row) = rows.last_mut() {
                 if let Some(last_cell) = last_row.last_mut() {
-                    last_cell.push(Span::plain("\n".to_string()));
+                    last_cell.push(Span::raw("\n".to_string()));
                 }
             }
             self.line_start = false;
@@ -900,7 +896,7 @@ fn render_border_row(
     fill: char,
     mid: char,
     right: char,
-    style: ContentStyle,
+    style: Style,
     emit: &mut impl FnMut(&[Span]) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut line = String::new();
@@ -918,7 +914,7 @@ fn render_data_row(
     cells: &[Vec<Span>],
     col_widths: &[usize],
     is_header: bool,
-    sep_style: ContentStyle,
+    sep_style: Style,
     emit: &mut impl FnMut(&[Span]) -> io::Result<()>,
 ) -> io::Result<()> {
     let empty: Vec<Span> = Vec::new();
@@ -937,20 +933,17 @@ fn render_data_row(
             let actual_len = cell_char_len(&line);
             if is_header {
                 for span in &line {
-                    let style = ContentStyle {
-                        attributes: span.style.attributes | Attribute::Bold,
-                        ..span.style
-                    };
-                    emit(&[Span::styled(span.text.clone(), style)])?;
+                    let style = span.style.add_modifier(Modifier::BOLD);
+                    emit(&[Span::styled(span.content.as_ref().to_string(), style)])?;
                 }
             } else {
                 emit(&line)?;
             }
             let pad = col_widths[col].saturating_sub(actual_len);
             if pad > 0 {
-                emit(&[Span::plain(" ".repeat(pad))])?;
+                emit(&[Span::raw(" ".repeat(pad))])?;
             }
-            emit(&[Span::plain(" ")])?;
+            emit(&[Span::raw(" ")])?;
         }
         emit(&[Span::styled("│\n", sep_style)])?;
     }
@@ -998,7 +991,7 @@ fn distribute_widths(natural: &[usize], available: usize) -> Vec<usize> {
 }
 
 fn wrap_cell(spans: &[Span], max_width: usize) -> Vec<Vec<Span>> {
-    let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+    let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
     let hard_lines: Vec<&str> = text.split('\n').collect();
 
     // Single hard line that fits — keep original styled spans
@@ -1009,11 +1002,11 @@ fn wrap_cell(spans: &[Span], max_width: usize) -> Vec<Vec<Span>> {
     let mut result: Vec<Vec<Span>> = Vec::new();
     for hard_line in &hard_lines {
         if hard_line.is_empty() {
-            result.push(vec![Span::plain(String::new())]);
+            result.push(vec![Span::raw(String::new())]);
             continue;
         }
         if hard_line.width() <= max_width {
-            result.push(vec![Span::plain(hard_line.to_string())]);
+            result.push(vec![Span::raw(hard_line.to_string())]);
             continue;
         }
         let words: Vec<&str> = hard_line.split(' ').collect();
@@ -1025,17 +1018,17 @@ fn wrap_cell(spans: &[Span], max_width: usize) -> Vec<Vec<Span>> {
                 current.push(' ');
                 current.push_str(word);
             } else {
-                result.push(vec![Span::plain(current)]);
+                result.push(vec![Span::raw(current)]);
                 current = word.to_string();
             }
         }
         if !current.is_empty() {
-            result.push(vec![Span::plain(current)]);
+            result.push(vec![Span::raw(current)]);
         }
     }
 
     if result.is_empty() {
-        result.push(vec![Span::plain(String::new())]);
+        result.push(vec![Span::raw(String::new())]);
     }
 
     result
@@ -1072,52 +1065,51 @@ fn parse_separator(sep: &str) -> Option<Vec<Alignment>> {
 
 fn trim_cell_spans(mut spans: Vec<Span>) -> Vec<Span> {
     if let Some(first) = spans.first_mut() {
-        first.text = first.text.trim_start().to_string();
+        let trimmed = first.content.trim_start().to_string();
+        first.content = trimmed.into();
     }
     if let Some(last) = spans.last_mut() {
-        last.text = last.text.trim_end().to_string();
+        let trimmed = last.content.trim_end().to_string();
+        last.content = trimmed.into();
     }
-    spans.retain(|s| !s.text.is_empty());
+    spans.retain(|s| !s.content.is_empty());
     spans
 }
 
 fn cell_char_len(spans: &[Span]) -> usize {
-    let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+    let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
     text.split('\n').map(|l| l.width()).max().unwrap_or(0)
 }
 
 // ── Style helpers ──────────────────────────────────────────────────────────
 
-fn code_style() -> ContentStyle {
-    ContentStyle { foreground_color: Some(Color::DarkGrey), ..ContentStyle::default() }
+fn code_style() -> Style {
+    Style::new().fg(Color::DarkGray)
 }
 
-fn inline_code_style() -> ContentStyle {
-    ContentStyle { foreground_color: Some(Color::Cyan), ..ContentStyle::default() }
+fn inline_code_style() -> Style {
+    Style::new().fg(Color::Cyan)
 }
 
-fn header_style(level: u8) -> ContentStyle {
-    let mut s = ContentStyle { foreground_color: Some(Color::White), ..ContentStyle::default() };
-    if level <= 2 {
-        s.attributes = Attribute::Bold.into();
-    }
-    s
+fn header_style(level: u8) -> Style {
+    let s = Style::new().fg(Color::White);
+    if level <= 2 { s.add_modifier(Modifier::BOLD) } else { s }
 }
 
-fn bold_style() -> ContentStyle {
-    ContentStyle { attributes: Attribute::Bold.into(), ..ContentStyle::default() }
+fn bold_style() -> Style {
+    Style::new().add_modifier(Modifier::BOLD)
 }
 
-fn italic_style() -> ContentStyle {
-    ContentStyle { attributes: Attribute::Italic.into(), ..ContentStyle::default() }
+fn italic_style() -> Style {
+    Style::new().add_modifier(Modifier::ITALIC)
 }
 
-fn strikethrough_style() -> ContentStyle {
-    ContentStyle { attributes: Attribute::CrossedOut.into(), ..ContentStyle::default() }
+fn strikethrough_style() -> Style {
+    Style::new().add_modifier(Modifier::CROSSED_OUT)
 }
 
-fn table_sep_style() -> ContentStyle {
-    ContentStyle { foreground_color: Some(Color::DarkGrey), ..ContentStyle::default() }
+fn table_sep_style() -> Style {
+    Style::new().fg(Color::DarkGray)
 }
 
 #[cfg(test)]
@@ -1136,9 +1128,9 @@ mod tests {
     fn test_br_tag_newline() {
         let spans = collect_spans("a<br>b", 80);
         assert_eq!(spans, vec![
-            Span::plain("a"),
-            Span::plain("\n"),
-            Span::plain("b"),
+            Span::raw("a"),
+            Span::raw("\n"),
+            Span::raw("b"),
         ]);
     }
 
@@ -1146,9 +1138,9 @@ mod tests {
     fn test_br_slash_tag_newline() {
         let spans = collect_spans("a<br/>b", 80);
         assert_eq!(spans, vec![
-            Span::plain("a"),
-            Span::plain("\n"),
-            Span::plain("b"),
+            Span::raw("a"),
+            Span::raw("\n"),
+            Span::raw("b"),
         ]);
     }
 
@@ -1156,9 +1148,9 @@ mod tests {
     fn test_br_space_slash_tag_newline() {
         let spans = collect_spans("a<br />b", 80);
         assert_eq!(spans, vec![
-            Span::plain("a"),
-            Span::plain("\n"),
-            Span::plain("b"),
+            Span::raw("a"),
+            Span::raw("\n"),
+            Span::raw("b"),
         ]);
     }
 
@@ -1167,8 +1159,8 @@ mod tests {
         let spans = collect_spans("a<br", 80);
         // `<` at the start opens a tag; `<br` stays as PendingTag; flush emits `<br`.
         assert_eq!(spans, vec![
-            Span::plain("a"),
-            Span::plain("<br"),
+            Span::raw("a"),
+            Span::raw("<br"),
         ]);
     }
 
@@ -1178,9 +1170,9 @@ mod tests {
         // `<` triggers tag parsing; `<d` doesn't match br prefix → flushed as literal.
         // `>` resumes normal; `</` again triggers tag parsing, fails to match, flushed.
         assert_eq!(spans, vec![
-            Span::plain("a"),
-            Span::plain("<div>b"),
-            Span::plain("</div>c"),
+            Span::raw("a"),
+            Span::raw("<div>b"),
+            Span::raw("</div>c"),
         ]);
     }
 
@@ -1188,15 +1180,15 @@ mod tests {
     fn test_br_at_end_of_input() {
         let spans = collect_spans("a<br>", 80);
         assert_eq!(spans, vec![
-            Span::plain("a"),
-            Span::plain("\n"),
+            Span::raw("a"),
+            Span::raw("\n"),
         ]);
     }
 
     #[test]
     fn test_br_in_table_cell() {
         let spans = collect_spans("| a<br>b | c |\n| --- | --- |\n| d | e |\n", 80);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("a"), "text: {:?}", text);
         assert!(text.contains("b"), "text: {:?}", text);
         let a_pos = text.find('a').unwrap();
@@ -1210,7 +1202,7 @@ mod tests {
             "| A | B |\n| --- | --- |\n| x | y\nz | w |\n",
             80,
         );
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains('x'), "text: {:?}", text);
         assert!(text.contains('y'), "text: {:?}", text);
         assert!(text.contains('z'), "text: {:?}", text);
@@ -1236,14 +1228,14 @@ mod tests {
     fn test_horizontal_rule() {
         let spans = collect_spans("---\n", 80);
         assert_eq!(spans.len(), 1);
-        assert!(spans[0].text.chars().all(|c| c == '─'));
-        assert_eq!(spans[0].text.chars().count(), 80);
+        assert!(spans[0].content.as_ref().chars().all(|c| c == '─'));
+        assert_eq!(spans[0].content.as_ref().chars().count(), 80);
     }
 
     #[test]
     fn test_short_dash_not_hr() {
         let spans = collect_spans("--\n", 80);
-        assert_eq!(spans, vec![Span::plain("--\n")]);
+        assert_eq!(spans, vec![Span::raw("--\n")]);
     }
 
     #[test]
@@ -1255,7 +1247,7 @@ mod tests {
     #[test]
     fn test_single_tilde_not_strikethrough() {
         let spans = collect_spans("~not~", 80);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "~not~");
     }
 
@@ -1266,7 +1258,7 @@ mod tests {
         let spans = collect_spans("# Hello\n", 80);
         assert_eq!(spans, vec![
             Span::styled("Hello", header_style(1)),
-            Span::plain("\n"),
+            Span::raw("\n"),
         ]);
     }
 
@@ -1275,7 +1267,7 @@ mod tests {
         let spans = collect_spans("###### Hello\n", 80);
         assert_eq!(spans, vec![
             Span::styled("Hello", header_style(6)),
-            Span::plain("\n"),
+            Span::raw("\n"),
         ]);
     }
 
@@ -1284,7 +1276,7 @@ mod tests {
         let spans = collect_spans("## Hello\n", 80);
         assert_eq!(spans, vec![
             Span::styled("Hello", header_style(2)),
-            Span::plain("\n"),
+            Span::raw("\n"),
         ]);
     }
 
@@ -1293,7 +1285,7 @@ mod tests {
         let spans = collect_spans("### Hello\n", 80);
         assert_eq!(spans, vec![
             Span::styled("Hello", header_style(3)),
-            Span::plain("\n"),
+            Span::raw("\n"),
         ]);
     }
 
@@ -1302,7 +1294,7 @@ mod tests {
         let spans = collect_spans("#### Hello\n", 80);
         assert_eq!(spans, vec![
             Span::styled("Hello", header_style(4)),
-            Span::plain("\n"),
+            Span::raw("\n"),
         ]);
     }
 
@@ -1311,7 +1303,7 @@ mod tests {
         let spans = collect_spans("##### Hello\n", 80);
         assert_eq!(spans, vec![
             Span::styled("Hello", header_style(5)),
-            Span::plain("\n"),
+            Span::raw("\n"),
         ]);
     }
 
@@ -1320,31 +1312,31 @@ mod tests {
         let spans = collect_spans("# One\n## Two\n### Three\n", 80);
         assert_eq!(spans, vec![
             Span::styled("One", header_style(1)),
-            Span::plain("\n"),
+            Span::raw("\n"),
             Span::styled("Two", header_style(2)),
-            Span::plain("\n"),
+            Span::raw("\n"),
             Span::styled("Three", header_style(3)),
-            Span::plain("\n"),
+            Span::raw("\n"),
         ]);
     }
 
     #[test]
     fn test_header_no_space_not_a_header() {
         let spans = collect_spans("#NoSpace\n", 80);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "#NoSpace\n");
     }
 
     #[test]
     fn test_header_empty() {
         let spans = collect_spans("#\n", 80);
-        assert_eq!(spans, vec![Span::plain("#\n")]);
+        assert_eq!(spans, vec![Span::raw("#\n")]);
     }
 
     #[test]
     fn test_header_excessive_hashes() {
         let spans = collect_spans("#######\n", 80);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "#######\n");
     }
 
@@ -1388,7 +1380,7 @@ mod tests {
     fn test_fenced_code_block() {
         let spans = collect_spans("```\ncode\n```\n", 80);
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].text, "code\n");
+        assert_eq!(spans[0].content.as_ref(), "code\n");
         assert!(spans[0].style == code_style(), "expected code style, got {:?}", spans[0].style);
     }
 
@@ -1396,7 +1388,7 @@ mod tests {
     fn test_code_block_with_lang() {
         let spans = collect_spans("```rust\nfn main() {}\n```\n", 80);
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].text, "fn main() {}\n");
+        assert_eq!(spans[0].content.as_ref(), "fn main() {}\n");
         assert!(spans[0].style == code_style(), "expected code style, got {:?}", spans[0].style);
     }
 
@@ -1404,7 +1396,7 @@ mod tests {
     fn test_nested_fences() {
         let spans = collect_spans("```\n``\n```\n", 80);
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].text, "``\n");
+        assert_eq!(spans[0].content.as_ref(), "``\n");
         assert!(spans[0].style == code_style(), "expected code style, got {:?}", spans[0].style);
     }
 
@@ -1419,8 +1411,8 @@ mod tests {
         let spans = collect_spans("```\nline1\nline2\n```\n", 80);
         // Code block content streams line-by-line; each line is a separate styled span
         assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0].text, "line1\n");
-        assert_eq!(spans[1].text, "line2\n");
+        assert_eq!(spans[0].content.as_ref(), "line1\n");
+        assert_eq!(spans[1].content.as_ref(), "line2\n");
         assert!(spans[0].style == code_style(), "expected code style, got {:?}", spans[0].style);
     }
 
@@ -1431,7 +1423,7 @@ mod tests {
         let spans = collect_spans("---text\n", 80);
         // The `---` fallback is flushed as a separate span, then the text is an inline segment
         assert!(spans.len() >= 2);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "---text\n");
     }
 
@@ -1440,7 +1432,7 @@ mod tests {
     #[test]
     fn test_basic_table() {
         let spans = collect_spans("| A | B |\n| --- | --- |\n| 1 | 2 |\n", 80);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.starts_with('┌'), "expected table border, got: {:?}", text);
         assert!(text.contains("│ A │"), "expected header cell A, got: {:?}", text);
         assert!(text.contains("│ 1 │"), "expected data cell 1, got: {:?}", text);
@@ -1450,7 +1442,7 @@ mod tests {
     #[test]
     fn test_table_empty_cells() {
         let spans = collect_spans("| A |\n| --- |\n| |\n", 80);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.starts_with('┌'), "expected table border, got: {:?}", text);
         assert!(text.contains('A'));
     }
@@ -1458,7 +1450,7 @@ mod tests {
     #[test]
     fn test_table_invalid_separator_fallback() {
         let spans = collect_spans("| A | B |\n| x | x |\n", 80);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains('┌'), "expected plain fallback, got: {:?}", text);
         assert!(text.contains('|'));
     }
@@ -1466,7 +1458,7 @@ mod tests {
     #[test]
     fn test_table_fallback_then_text_ordering() {
         let spans = collect_spans("| A | B |\n| x | x |\nhello\n", 80);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         // Fallback content should appear BEFORE subsequent text
         let pipe_pos = text.find('|').unwrap();
         let hello_pos = text.find("hello").unwrap();
@@ -1477,7 +1469,7 @@ mod tests {
     #[test]
     fn test_table_no_separator_fallback() {
         let spans = collect_spans("| A | B |\n| 1 | 2 |\n", 80);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains('┌'), "expected plain fallback, got: {:?}", text);
         assert!(text.contains('|'));
     }
@@ -1487,25 +1479,25 @@ mod tests {
     #[test]
     fn test_unclosed_bold_flushed() {
         let spans = collect_spans("**unclosed", 80);
-        assert_eq!(spans, vec![Span::plain("**unclosed")]);
+        assert_eq!(spans, vec![Span::raw("**unclosed")]);
     }
 
     #[test]
     fn test_unclosed_italic_flushed() {
         let spans = collect_spans("*unclosed", 80);
-        assert_eq!(spans, vec![Span::plain("*unclosed")]);
+        assert_eq!(spans, vec![Span::raw("*unclosed")]);
     }
 
     #[test]
     fn test_unclosed_inline_code_flushed() {
         let spans = collect_spans("`unclosed", 80);
-        assert_eq!(spans, vec![Span::plain("`unclosed")]);
+        assert_eq!(spans, vec![Span::raw("`unclosed")]);
     }
 
     #[test]
     fn test_unclosed_strikethrough_flushed() {
         let spans = collect_spans("~~unclosed", 80);
-        assert_eq!(spans, vec![Span::plain("~~unclosed")]);
+        assert_eq!(spans, vec![Span::raw("~~unclosed")]);
     }
 
     // ── Edge cases ──────────────────────────────────────────────────────────
@@ -1515,9 +1507,9 @@ mod tests {
         let spans = collect_spans("**bold** and *italic* and `code`", 80);
         assert_eq!(spans, vec![
             Span::styled("bold", bold_style()),
-            Span::plain(" and "),
+            Span::raw(" and "),
             Span::styled("italic", italic_style()),
-            Span::plain(" and "),
+            Span::raw(" and "),
             Span::styled("code", inline_code_style()),
         ]);
     }
@@ -1532,21 +1524,21 @@ mod tests {
     fn test_multiline_plain_text() {
         let spans = collect_spans("hello\nworld\n", 80);
         assert_eq!(spans, vec![
-            Span::plain("hello\n"),
-            Span::plain("world\n"),
+            Span::raw("hello\n"),
+            Span::raw("world\n"),
         ]);
     }
 
     #[test]
     fn test_plain_text_no_trailing_newline() {
         let spans = collect_spans("hello", 80);
-        assert_eq!(spans, vec![Span::plain("hello")]);
+        assert_eq!(spans, vec![Span::raw("hello")]);
     }
 
     #[test]
     fn test_multiple_hrs() {
         let spans = collect_spans("---\n\n---\n", 80);
-        let hr_count = spans.iter().filter(|s| s.text.contains('─')).count();
+        let hr_count = spans.iter().filter(|s| s.content.contains('─')).count();
         assert_eq!(hr_count, 2, "should have 2 horizontal rules");
     }
 
@@ -1555,7 +1547,7 @@ mod tests {
         let spans = collect_spans("**bold** and more", 80);
         assert_eq!(spans, vec![
             Span::styled("bold", bold_style()),
-            Span::plain(" and more"),
+            Span::raw(" and more"),
         ]);
     }
 
@@ -1564,7 +1556,7 @@ mod tests {
         // Known behavior: _mid-word_ triggers italic (not GFM-compliant)
         let spans = collect_spans("a_b_", 80);
         assert_eq!(spans, vec![
-            Span::plain("a"),
+            Span::raw("a"),
             Span::styled("b", italic_style()),
         ]);
     }
@@ -1585,7 +1577,7 @@ mod tests {
         let spans = collect_spans("# H1 #\n", 80);
         assert_eq!(spans, vec![
             Span::styled("H1 #", header_style(1)),
-            Span::plain("\n"),
+            Span::raw("\n"),
         ]);
     }
 
@@ -1595,7 +1587,7 @@ mod tests {
             "A <br> tag inserts a newline: line one\nline two<br />line three<br/>done.\n\nNow for a **code block** with a language tag:  ",
             80,
         );
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
 
         // Each <br> variant inserts a newline
         assert!(text.contains("A \n tag"), "br should insert newline in: {:?}", text);
@@ -1656,10 +1648,7 @@ mod tests {
             80,
         );
         // Nested italic inside bold: "bold and " is bold, "italic" is bold+italic.
-        let bold_italic = ContentStyle {
-            attributes: bold_style().attributes | italic_style().attributes,
-            ..ContentStyle::default()
-        };
+        let bold_italic = Style::new().add_modifier(Modifier::BOLD | Modifier::ITALIC);
         assert_eq!(spans, vec![
             Span::styled("bold and ", bold_style()),
             Span::styled("italic", bold_italic),
@@ -1668,23 +1657,16 @@ mod tests {
 
     // ── Nested inline formatting ────────────────────────────────────────────
 
-    fn bold_italic_style() -> ContentStyle {
-        ContentStyle {
-            attributes: bold_style().attributes | italic_style().attributes,
-            ..ContentStyle::default()
-        }
+    fn bold_italic_style() -> Style {
+        Style::new().add_modifier(Modifier::BOLD | Modifier::ITALIC)
     }
 
-    fn italic_bold_style() -> ContentStyle {
-        // Same as bold_italic — both attributes combined
+    fn italic_bold_style() -> Style {
         bold_italic_style()
     }
 
-    fn bold_strikethrough_style() -> ContentStyle {
-        ContentStyle {
-            attributes: bold_style().attributes | strikethrough_style().attributes,
-            ..ContentStyle::default()
-        }
+    fn bold_strikethrough_style() -> Style {
+        Style::new().add_modifier(Modifier::BOLD | Modifier::CROSSED_OUT)
     }
 
     #[test]
@@ -1712,10 +1694,7 @@ mod tests {
         let spans = collect_spans("~~strike *italic* text~~", 80);
         assert_eq!(spans, vec![
             Span::styled("strike ", strikethrough_style()),
-            Span::styled("italic", ContentStyle {
-                attributes: strikethrough_style().attributes | italic_style().attributes,
-                ..ContentStyle::default()
-            }),
+            Span::styled("italic", Style::new().add_modifier(Modifier::CROSSED_OUT | Modifier::ITALIC)),
             Span::styled(" text", strikethrough_style()),
         ]);
     }
@@ -1743,10 +1722,7 @@ mod tests {
     fn test_deep_nesting() {
         let spans = collect_spans("**bold *italic ~~strike~~* text**", 80);
         let bold_italic = bold_italic_style();
-        let strike_inside = ContentStyle {
-            attributes: bold_style().attributes | italic_style().attributes | strikethrough_style().attributes,
-            ..ContentStyle::default()
-        };
+        let strike_inside = Style::new().add_modifier(Modifier::BOLD | Modifier::ITALIC | Modifier::CROSSED_OUT);
         assert_eq!(spans, vec![
             Span::styled("bold ", bold_style()),
             Span::styled("italic ", bold_italic),
@@ -1762,10 +1738,10 @@ mod tests {
         let bold_italic = bold_italic_style();
         // "italic" closes properly, then bold drains as literal at end
         assert_eq!(spans, vec![
-            Span::plain("text "),
+            Span::raw("text "),
             Span::styled("bold ", bold_style()),
             Span::styled("italic", bold_italic),
-            Span::plain("**"),
+            Span::raw("**"),
         ]);
     }
 
@@ -1786,10 +1762,7 @@ mod tests {
     fn test_inline_code_grandparent_style() {
         // Code inside bold inside strikethrough must inherit all ancestor attributes.
         let spans = collect_spans("~~**`code`**~~", 80);
-        let expected = ContentStyle {
-            attributes: bold_style().attributes | strikethrough_style().attributes,
-            ..inline_code_style()
-        };
+        let expected = inline_code_style().add_modifier(Modifier::BOLD | Modifier::CROSSED_OUT);
         assert_eq!(spans, vec![Span::styled("code", expected)]);
     }
 
@@ -1800,7 +1773,7 @@ mod tests {
         let spans = collect_spans("**a *b", 80);
         assert_eq!(spans, vec![
             Span::styled("a ", bold_style()),
-            Span::plain("***b"),
+            Span::raw("***b"),
         ]);
     }
 
@@ -1820,7 +1793,7 @@ mod tests {
             &["text <thi", "nk>more text"],
             80,
         );
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "text <think>more text");
     }
 
@@ -1835,7 +1808,7 @@ mod tests {
             ],
             80,
         );
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("A \n tag:"), "<br> not converted: {:?}", text);
         assert!(!text.contains("**bo"), "bold markers visible: {:?}", text);
         assert!(!text.contains("*it"), "italic markers visible: {:?}", text);
@@ -1887,7 +1860,7 @@ Table:
 | a | b | c |
 ";
         let spans = collect_spans(input, 80);
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
 
         // All header levels present, markers consumed
         assert!(!text.contains("###### H6"), "H6 raw markers: {:?}", text);
@@ -1929,7 +1902,7 @@ Table:
         assert!(text.contains('┌'), "no table border: {:?}", text);
 
         // HR count: 1 horizontal rule, plus table borders
-        let hr_chars: usize = spans.iter().map(|s| s.text.chars().filter(|&c| c == '─').count()).sum();
+        let hr_chars: usize = spans.iter().map(|s| s.content.chars().filter(|&c| c == '─').count()).sum();
         assert!(hr_chars > 0, "no ─ characters found");
     }
 
