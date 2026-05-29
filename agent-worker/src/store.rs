@@ -59,7 +59,10 @@ impl Store {
     }
 
     fn jsonl_path(&self) -> PathBuf {
-        self.base_dir.join("trees").join(&self.tree_id).join("data.jsonl")
+        self.base_dir
+            .join("trees")
+            .join(&self.tree_id)
+            .join("data.jsonl")
     }
 
     // ── Tree metadata I/O ──
@@ -140,7 +143,10 @@ impl Store {
             Some(Ok(line)) => {
                 if let Ok(header) = serde_json::from_str::<TreeHeader>(&line) {
                     if header.kind != "meta" {
-                        warn!("Tree {} header has unexpected kind: {}", self.tree_id, header.kind);
+                        warn!(
+                            "Tree {} header has unexpected kind: {}",
+                            self.tree_id, header.kind
+                        );
                     }
                 }
             }
@@ -201,8 +207,14 @@ mod tests {
         store.save_tree_meta(&meta).unwrap();
 
         let tree_dir = dir.path().join("trees").join(tree_id);
-        assert!(tree_dir.join("data.jsonl").exists(), "data.jsonl should exist in tree subdir");
-        assert!(tree_dir.join("meta.json").exists(), "meta.json should exist in tree subdir");
+        assert!(
+            tree_dir.join("data.jsonl").exists(),
+            "data.jsonl should exist in tree subdir"
+        );
+        assert!(
+            tree_dir.join("meta.json").exists(),
+            "meta.json should exist in tree subdir"
+        );
     }
 
     #[test]

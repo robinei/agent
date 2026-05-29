@@ -24,7 +24,9 @@ impl SearchMessagesTool {
         let mut results = Vec::new();
         let mut _file_count = 0usize;
 
-        for entry in fs::read_dir(&trees_dir).map_err(|e| format!("Cannot read trees dir: {}", e))? {
+        for entry in
+            fs::read_dir(&trees_dir).map_err(|e| format!("Cannot read trees dir: {}", e))?
+        {
             let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
             let path = entry.path();
 
@@ -170,10 +172,7 @@ impl Tool for SearchMessagesTool {
     }
 
     fn execute(&self, params: &serde_json::Value, _ctx: &mut ToolContext) -> ToolOutput {
-        let query = match params
-            .get("query")
-            .and_then(|v| v.as_str())
-        {
+        let query = match params.get("query").and_then(|v| v.as_str()) {
             Some(q) => q,
             None => return ToolOutput::Done(Err("Missing required field: query".to_string())),
         };
@@ -194,14 +193,13 @@ impl Tool for SearchMessagesTool {
             return ToolOutput::Done(Ok(format!(
                 "No messages found matching '{}'{}.\n",
                 query,
-                tree_id.map(|t| format!(" in tree {}", t)).unwrap_or_default()
+                tree_id
+                    .map(|t| format!(" in tree {}", t))
+                    .unwrap_or_default()
             )));
         }
 
-        let mut content = format!(
-            "Found {} matching messages:\n\n",
-            results.len()
-        );
+        let mut content = format!("Found {} matching messages:\n\n", results.len());
         for (i, m) in results.iter().enumerate() {
             content.push_str(&format!(
                 "{}. [{}] {} (tree: {})\n   Snippet: {}\n\n",
@@ -226,7 +224,6 @@ struct SearchMatch {
     snippet: String,
     timestamp: String,
 }
-
 
 // ── Tests ──
 
@@ -259,7 +256,11 @@ mod tests {
         ToolContext::new(PathBuf::from("/tmp"))
     }
 
-    fn run_ok(tool: &SearchMessagesTool, params: serde_json::Value, ctx: &mut ToolContext) -> String {
+    fn run_ok(
+        tool: &SearchMessagesTool,
+        params: serde_json::Value,
+        ctx: &mut ToolContext,
+    ) -> String {
         match tool.execute(&params, ctx) {
             ToolOutput::Done(Ok(c)) => c,
             ToolOutput::Done(Err(e)) => panic!("search failed: {}", e),
@@ -339,10 +340,14 @@ mod tests {
 
             let tool = SearchMessagesTool;
             let mut ctx = make_ctx();
-            let result = run_ok(&tool, serde_json::json!({
-                "query": "secret",
-                "tree_id": "wrong-tree-id"
-            }), &mut ctx);
+            let result = run_ok(
+                &tool,
+                serde_json::json!({
+                    "query": "secret",
+                    "tree_id": "wrong-tree-id"
+                }),
+                &mut ctx,
+            );
             assert!(result.contains("No messages found"));
         });
     }

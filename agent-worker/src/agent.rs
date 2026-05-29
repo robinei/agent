@@ -177,7 +177,7 @@ mod tests {
         }
     }
 
-#[test]
+    #[test]
     fn test_build_context_empty_tree() {
         let entries = vec![make_session_start("1", None)];
         let messages = build_context(&entries, "1");
@@ -235,7 +235,6 @@ mod tests {
             matches!(&m.content, MessageContent::Text(t) if t.contains("Refactor auth"))
         }));
     }
-
 
     #[test]
     fn test_estimate_tokens_short() {

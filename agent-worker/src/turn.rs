@@ -6,17 +6,23 @@ use agent_core::types::*;
 use log::{error, info, warn};
 
 use crate::lsp_client::{
-    default_server, detect_language, format_diagnostics, binary_exists,
-    LspClient, LspWaitState, PendingLspTool,
+    binary_exists, default_server, detect_language, format_diagnostics, LspClient, LspWaitState,
+    PendingLspTool,
 };
-use crate::thinking::{split_thinking_chunks, ThinkingSegment};
-use agent_core::types::NotificationLevel;
-use crate::util::{emit_notification, emit_event, send_llm_request, write_message_entry, write_session_end};
 use crate::store::Store;
-use crate::AgentState;
+use crate::thinking::{split_thinking_chunks, ThinkingSegment};
 use crate::tools::ToolOutput;
+use crate::util::{
+    emit_event, emit_notification, send_llm_request, write_message_entry, write_session_end,
+};
+use crate::AgentState;
+use agent_core::types::NotificationLevel;
 
-fn make_assistant_message(text: String, tool_calls: Option<Vec<ToolCall>>, thinking: Option<String>) -> Message {
+fn make_assistant_message(
+    text: String,
+    tool_calls: Option<Vec<ToolCall>>,
+    thinking: Option<String>,
+) -> Message {
     Message {
         role: MessageRole::Assistant,
         content: MessageContent::Text(text),
@@ -44,7 +50,11 @@ fn make_user_message(text: String) -> Message {
     }
 }
 
-pub fn make_tool_result_message(tool_call_id: &str, tool_name: &str, result: &Result<String, String>) -> Message {
+pub fn make_tool_result_message(
+    tool_call_id: &str,
+    tool_name: &str,
+    result: &Result<String, String>,
+) -> Message {
     let (content, is_error) = match result {
         Ok(c) => (c.clone(), None),
         Err(e) => (format!("Error: {}", e), Some(true)),
@@ -76,7 +86,11 @@ fn build_system_prompt(repo_path: &std::path::Path, context_section: &str) -> St
          \n\
          {}",
         repo_path.display(),
-        if is_git { "git" } else { "none — this is not a git repository, do not run git commands" },
+        if is_git {
+            "git"
+        } else {
+            "none — this is not a git repository, do not run git commands"
+        },
         context_section
     )
 }
@@ -114,9 +128,23 @@ fn check_context_cap(
     );
 
     if estimated >= hard_cap {
-        warn!("Hard cap reached for tree {} (est. {} tokens)", store.tree_id(), estimated);
-        emit_notification(out, NotificationLevel::Error, "Hard context cap reached. Ending session.".into());
-        write_session_end(store, out, SessionStatus::Continuing, None, leaf_id.as_deref());
+        warn!(
+            "Hard cap reached for tree {} (est. {} tokens)",
+            store.tree_id(),
+            estimated
+        );
+        emit_notification(
+            out,
+            NotificationLevel::Error,
+            "Hard context cap reached. Ending session.".into(),
+        );
+        write_session_end(
+            store,
+            out,
+            SessionStatus::Continuing,
+            None,
+            leaf_id.as_deref(),
+        );
         return Err(());
     }
     Ok(())
@@ -149,7 +177,11 @@ pub fn begin_turn(
         Ok(e) => e,
         Err(e) => {
             error!("Failed to read entries for tree {}: {}", tree_id, e);
-            emit_notification(out, NotificationLevel::Fatal, format!("Failed to read entries: {}", e));
+            emit_notification(
+                out,
+                NotificationLevel::Fatal,
+                format!("Failed to read entries: {}", e),
+            );
             return AgentState::Idle;
         }
     };
@@ -245,7 +277,10 @@ fn notify_lsp_saves(
         std::collections::HashMap::new();
     for path in dirty {
         if let Some(lang_id) = detect_language(path) {
-            lang_groups.entry(lang_id.to_string()).or_default().push(path.clone());
+            lang_groups
+                .entry(lang_id.to_string())
+                .or_default()
+                .push(path.clone());
         }
     }
 
@@ -261,7 +296,9 @@ fn notify_lsp_saves(
             continue;
         }
 
-        let server_cfg = lsp_cfg.servers.iter()
+        let server_cfg = lsp_cfg
+            .servers
+            .iter()
             .find(|s| s.language == lang_id)
             .cloned()
             .or_else(|| default_server(&lang_id));
@@ -272,16 +309,30 @@ fn notify_lsp_saves(
         };
 
         if !binary_exists(&cfg.command) {
-            emit_notification(out, NotificationLevel::Warning,
-                format!("LSP: '{}' not found — skipping diagnostics for {}", cfg.command, lang_display(&lang_id)));
+            emit_notification(
+                out,
+                NotificationLevel::Warning,
+                format!(
+                    "LSP: '{}' not found — skipping diagnostics for {}",
+                    cfg.command,
+                    lang_display(&lang_id)
+                ),
+            );
             continue;
         }
 
         let root_uri = format!("file://{}", ctx.cwd.display());
         match LspClient::spawn(&lang_id, &cfg.command, &cfg.args, &root_uri, cfg.timeout_ms) {
             Ok(client) => {
-                emit_notification(out, NotificationLevel::Info,
-                    format!("LSP: started {} for {}", cfg.command, lang_display(&lang_id)));
+                emit_notification(
+                    out,
+                    NotificationLevel::Info,
+                    format!(
+                        "LSP: started {} for {}",
+                        cfg.command,
+                        lang_display(&lang_id)
+                    ),
+                );
                 max_timeout = max_timeout.max(cfg.timeout_ms);
                 max_silence = max_silence.max(cfg.silence_ms);
                 ctx.lsp_clients.insert(lang_id.clone(), client);
@@ -291,14 +342,24 @@ fn notify_lsp_saves(
                     }
                 }
             }
-            Err(e) => emit_notification(out, NotificationLevel::Warning,
-                format!("LSP: failed to start {} for {}: {}", cfg.command, lang_display(&lang_id), e)),
+            Err(e) => emit_notification(
+                out,
+                NotificationLevel::Warning,
+                format!(
+                    "LSP: failed to start {} for {}: {}",
+                    cfg.command,
+                    lang_display(&lang_id),
+                    e
+                ),
+            ),
         }
     }
 
     for lang_id in &resolved_lang_ids {
         if ctx.lsp_clients.contains_key(lang_id) {
-            let cfg = lsp_cfg.servers.iter()
+            let cfg = lsp_cfg
+                .servers
+                .iter()
                 .find(|s| s.language == *lang_id)
                 .cloned()
                 .or_else(|| default_server(lang_id));
@@ -312,12 +373,10 @@ fn notify_lsp_saves(
     (max_timeout, max_silence)
 }
 
-pub fn process_chunk(
-    data: &str,
-    state: &mut AgentState,
-    out: &mut BufWriter<std::io::Stdout>,
-) {
-    let AgentState::Streaming { .. } = state else { return };
+pub fn process_chunk(data: &str, state: &mut AgentState, out: &mut BufWriter<std::io::Stdout>) {
+    let AgentState::Streaming { .. } = state else {
+        return;
+    };
 
     let trimmed = data.trim();
     log::debug!(
@@ -359,7 +418,12 @@ pub fn process_chunk(
             if !rc.is_empty() {
                 *saw_reasoning_field = true;
                 thinking_text.push_str(rc);
-                emit_event(out, ServerEvent::ThinkingChunk { content: rc.clone() });
+                emit_event(
+                    out,
+                    ServerEvent::ThinkingChunk {
+                        content: rc.clone(),
+                    },
+                );
             }
         }
 
@@ -367,7 +431,12 @@ pub fn process_chunk(
             if !delta.is_empty() {
                 if *saw_reasoning_field || *thinking_phase_done {
                     response_text.push_str(delta);
-                    emit_event(out, ServerEvent::TextChunk { content: delta.clone() });
+                    emit_event(
+                        out,
+                        ServerEvent::TextChunk {
+                            content: delta.clone(),
+                        },
+                    );
                 } else {
                     let was_thinking = *in_thinking;
                     for segment in split_thinking_chunks(delta, in_thinking) {
@@ -469,9 +538,16 @@ pub fn finish_response(
                 .collect();
 
             let msg_id = agent_core::util::generate_entry_id();
-            let thinking = if thinking_text.is_empty() { None } else { Some(thinking_text.clone()) };
-            let assistant_msg =
-                make_assistant_message(response_text.clone(), Some(completed_calls.clone()), thinking);
+            let thinking = if thinking_text.is_empty() {
+                None
+            } else {
+                Some(thinking_text.clone())
+            };
+            let assistant_msg = make_assistant_message(
+                response_text.clone(),
+                Some(completed_calls.clone()),
+                thinking,
+            );
 
             write_message_entry(store, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
             leaf_id = Some(msg_id);
@@ -486,8 +562,18 @@ pub fn finish_response(
                 tool_calls_this_turn += 1;
                 if tool_calls_this_turn > max_per_turn {
                     warn!("Max tool calls per turn reached for tree {}", tree_id);
-                    emit_notification(out, NotificationLevel::Error, format!("Max tool calls per turn ({}) reached", max_per_turn));
-                    emit_event(out, ServerEvent::Done { status: "error".into(), usage: None });
+                    emit_notification(
+                        out,
+                        NotificationLevel::Error,
+                        format!("Max tool calls per turn ({}) reached", max_per_turn),
+                    );
+                    emit_event(
+                        out,
+                        ServerEvent::Done {
+                            status: "error".into(),
+                            usage: None,
+                        },
+                    );
                     return AgentState::Idle;
                 }
 
@@ -503,20 +589,44 @@ pub fn finish_response(
                 let tool = match tool {
                     Some(t) => t,
                     None => {
-                        emit_event(out, ServerEvent::ToolResult {
-                            tool: call.name.clone(), exit: 1,
-                            output: format!("Unknown tool '{}'", call.name),
-                        });
-                        let err_msg = make_tool_result_message(&call.id, &call.name, &Err(format!("Unknown tool '{}'", call.name)));
+                        emit_event(
+                            out,
+                            ServerEvent::ToolResult {
+                                tool: call.name.clone(),
+                                exit: 1,
+                                output: format!("Unknown tool '{}'", call.name),
+                            },
+                        );
+                        let err_msg = make_tool_result_message(
+                            &call.id,
+                            &call.name,
+                            &Err(format!("Unknown tool '{}'", call.name)),
+                        );
                         let result_msg_id = agent_core::util::generate_entry_id();
-                        write_message_entry(store, out, &result_msg_id, leaf_id.as_deref(), &err_msg);
+                        write_message_entry(
+                            store,
+                            out,
+                            &result_msg_id,
+                            leaf_id.as_deref(),
+                            &err_msg,
+                        );
                         leaf_id = Some(result_msg_id);
                         messages.push(err_msg);
                         consecutive_failures += 1;
                         if consecutive_failures >= 3 {
                             warn!("3 consecutive tool failures for tree {}", tree_id);
-                            emit_notification(out, NotificationLevel::Error, "3 consecutive tool failures, aborting turn".into());
-                            emit_event(out, ServerEvent::Done { status: "error".into(), usage: None });
+                            emit_notification(
+                                out,
+                                NotificationLevel::Error,
+                                "3 consecutive tool failures, aborting turn".into(),
+                            );
+                            emit_event(
+                                out,
+                                ServerEvent::Done {
+                                    status: "error".into(),
+                                    usage: None,
+                                },
+                            );
                             return AgentState::Idle;
                         }
                         continue;
@@ -524,23 +634,49 @@ pub fn finish_response(
                 };
 
                 let pre_dirty_len = ctx.lsp_dirty.len();
-                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.execute(&call.arguments, ctx))) {
+                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tool.execute(&call.arguments, ctx)
+                })) {
                     Ok(output) => output,
                     Err(_) => {
-                        emit_event(out, ServerEvent::ToolResult {
-                            tool: call.name.clone(), exit: 1,
-                            output: format!("Tool '{}' panicked", call.name),
-                        });
-                        let err_msg = make_tool_result_message(&call.id, &call.name, &Err(format!("Tool '{}' panicked", call.name)));
+                        emit_event(
+                            out,
+                            ServerEvent::ToolResult {
+                                tool: call.name.clone(),
+                                exit: 1,
+                                output: format!("Tool '{}' panicked", call.name),
+                            },
+                        );
+                        let err_msg = make_tool_result_message(
+                            &call.id,
+                            &call.name,
+                            &Err(format!("Tool '{}' panicked", call.name)),
+                        );
                         let result_msg_id = agent_core::util::generate_entry_id();
-                        write_message_entry(store, out, &result_msg_id, leaf_id.as_deref(), &err_msg);
+                        write_message_entry(
+                            store,
+                            out,
+                            &result_msg_id,
+                            leaf_id.as_deref(),
+                            &err_msg,
+                        );
                         leaf_id = Some(result_msg_id);
                         messages.push(err_msg);
                         consecutive_failures += 1;
                         if consecutive_failures >= 3 {
                             warn!("3 consecutive tool failures for tree {}", tree_id);
-                            emit_notification(out, NotificationLevel::Error, "3 consecutive tool failures, aborting turn".into());
-                            emit_event(out, ServerEvent::Done { status: "error".into(), usage: None });
+                            emit_notification(
+                                out,
+                                NotificationLevel::Error,
+                                "3 consecutive tool failures, aborting turn".into(),
+                            );
+                            emit_event(
+                                out,
+                                ServerEvent::Done {
+                                    status: "error".into(),
+                                    usage: None,
+                                },
+                            );
                             return AgentState::Idle;
                         }
                         continue;
@@ -558,8 +694,18 @@ pub fn finish_response(
                             consecutive_failures += 1;
                             if consecutive_failures >= 3 {
                                 warn!("3 consecutive tool failures for tree {}", tree_id);
-                                emit_notification(out, NotificationLevel::Error, "3 consecutive tool failures, aborting turn".into());
-                                emit_event(out, ServerEvent::Done { status: "error".into(), usage: None });
+                                emit_notification(
+                                    out,
+                                    NotificationLevel::Error,
+                                    "3 consecutive tool failures, aborting turn".into(),
+                                );
+                                emit_event(
+                                    out,
+                                    ServerEvent::Done {
+                                        status: "error".into(),
+                                        usage: None,
+                                    },
+                                );
                                 return AgentState::Idle;
                             }
                         } else {
@@ -579,7 +725,11 @@ pub fn finish_response(
                                 output: {
                                     let preview: String = content.chars().take(2000).collect();
                                     if content.len() > 2000 {
-                                        format!("{}... (truncated, was {} bytes)", preview, content.len())
+                                        format!(
+                                            "{}... (truncated, was {} bytes)",
+                                            preview,
+                                            content.len()
+                                        )
                                     } else {
                                         content.clone()
                                     }
@@ -588,7 +738,11 @@ pub fn finish_response(
                         );
 
                         if call.name == "bash" {
-                            let exit_code = if is_error { 1 } else { parse_exit_code(&content) };
+                            let exit_code = if is_error {
+                                1
+                            } else {
+                                parse_exit_code(&content)
+                            };
                             let bash_entry = Entry::BashExec {
                                 id: agent_core::util::generate_entry_id(),
                                 parent_id: leaf_id.clone(),
@@ -612,11 +766,20 @@ pub fn finish_response(
 
                         let tool_result_msg = make_tool_result_message(&call.id, &call.name, &res);
                         let result_msg_id = agent_core::util::generate_entry_id();
-                        write_message_entry(store, out, &result_msg_id, leaf_id.as_deref(), &tool_result_msg);
+                        write_message_entry(
+                            store,
+                            out,
+                            &result_msg_id,
+                            leaf_id.as_deref(),
+                            &tool_result_msg,
+                        );
                         leaf_id = Some(result_msg_id);
                         messages.push(tool_result_msg);
                     }
-                    ToolOutput::PendingLsp { request_id, lang_id } => {
+                    ToolOutput::PendingLsp {
+                        request_id,
+                        lang_id,
+                    } => {
                         pending_lsp_tools.push(PendingLspTool {
                             request_id,
                             lang_id,
@@ -633,17 +796,29 @@ pub fn finish_response(
                         "Max tool call rounds ({}) reached for tree {}",
                         max_per_turn, tree_id
                     );
-                    emit_notification(out, NotificationLevel::Error, format!("Max tool call rounds ({}) reached", max_per_turn));
-                    emit_event(out, ServerEvent::Done { status: "error".into(), usage: None });
+                    emit_notification(
+                        out,
+                        NotificationLevel::Error,
+                        format!("Max tool call rounds ({}) reached", max_per_turn),
+                    );
+                    emit_event(
+                        out,
+                        ServerEvent::Done {
+                            status: "error".into(),
+                            usage: None,
+                        },
+                    );
                 }
                 return AgentState::Idle;
             }
 
             // Check if we need LSP wait
             let dirty = std::mem::take(&mut ctx.lsp_dirty);
-            let needs_lsp_wait = lsp_cfg.enabled && (!dirty.is_empty() || !pending_lsp_tools.is_empty());
+            let needs_lsp_wait =
+                lsp_cfg.enabled && (!dirty.is_empty() || !pending_lsp_tools.is_empty());
             if needs_lsp_wait {
-                let (timeout_ms, silence_ms) = notify_lsp_saves(ctx, lsp_cfg, &dirty, &pending_lsp_tools, out);
+                let (timeout_ms, silence_ms) =
+                    notify_lsp_saves(ctx, lsp_cfg, &dirty, &pending_lsp_tools, out);
                 let now = std::time::Instant::now();
                 let deadline = now + std::time::Duration::from_millis(timeout_ms);
                 // Give the LSP server up to 2s to send its first notification
@@ -653,12 +828,22 @@ pub fn finish_response(
                 // resets to now+silence_ms and the normal heuristic takes over.
                 let initial_wait_ms = 1000u64.min(timeout_ms);
                 return AgentState::Streaming {
-                    messages, leaf_id,
-                    response_text: String::new(), thinking_text: String::new(),
-                    in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
-                    tool_calls_buf: vec![], finish_reason: None,
-                    tool_call_round, tool_calls_this_turn, consecutive_failures,
-                    cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
+                    messages,
+                    leaf_id,
+                    response_text: String::new(),
+                    thinking_text: String::new(),
+                    in_thinking: false,
+                    saw_reasoning_field: false,
+                    thinking_phase_done: false,
+                    tool_calls_buf: vec![],
+                    finish_reason: None,
+                    tool_call_round,
+                    tool_calls_this_turn,
+                    consecutive_failures,
+                    cum_prompt_tokens,
+                    cum_completion_tokens,
+                    cum_cached_tokens,
+                    seen_cached_tokens,
                     lsp_wait: Some(LspWaitState {
                         deadline,
                         silence_until: now + std::time::Duration::from_millis(initial_wait_ms),
@@ -670,26 +855,52 @@ pub fn finish_response(
             }
 
             if crate::SIGTERM_RECEIVED.load(Ordering::Relaxed) {
-                emit_event(out, ServerEvent::Done { status: "aborted".into(), usage: None });
+                emit_event(
+                    out,
+                    ServerEvent::Done {
+                        status: "aborted".into(),
+                        usage: None,
+                    },
+                );
                 return AgentState::Idle;
             }
 
             let definitions = collect_tool_definitions(tools);
             *req_id += 1;
-            send_llm_request(out, messages.clone(), definitions, *req_id, Some(store.tree_id().to_string()));
+            send_llm_request(
+                out,
+                messages.clone(),
+                definitions,
+                *req_id,
+                Some(store.tree_id().to_string()),
+            );
 
             AgentState::Streaming {
-                messages, leaf_id,
-                response_text: String::new(), thinking_text: String::new(),
-                in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
-                tool_calls_buf: vec![], finish_reason: None,
-                tool_call_round, tool_calls_this_turn, consecutive_failures,
-                cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
+                messages,
+                leaf_id,
+                response_text: String::new(),
+                thinking_text: String::new(),
+                in_thinking: false,
+                saw_reasoning_field: false,
+                thinking_phase_done: false,
+                tool_calls_buf: vec![],
+                finish_reason: None,
+                tool_call_round,
+                tool_calls_this_turn,
+                consecutive_failures,
+                cum_prompt_tokens,
+                cum_completion_tokens,
+                cum_cached_tokens,
+                seen_cached_tokens,
                 lsp_wait: None,
             }
         }
         reason @ (StopReason::Stop | StopReason::Length) => {
-            let status = if matches!(reason, StopReason::Length) { "length" } else { "stop" };
+            let status = if matches!(reason, StopReason::Length) {
+                "length"
+            } else {
+                "stop"
+            };
             let usage = if cum_prompt_tokens > 0 || cum_completion_tokens > 0 {
                 Some(agent_core::types::TokenUsage {
                     prompt_tokens: cum_prompt_tokens,
@@ -700,11 +911,21 @@ pub fn finish_response(
             } else {
                 None
             };
-            emit_event(out, ServerEvent::Done { status: status.into(), usage });
+            emit_event(
+                out,
+                ServerEvent::Done {
+                    status: status.into(),
+                    usage,
+                },
+            );
 
             if !response_text.is_empty() {
                 let msg_id = agent_core::util::generate_entry_id();
-                let thinking = if thinking_text.is_empty() { None } else { Some(thinking_text.clone()) };
+                let thinking = if thinking_text.is_empty() {
+                    None
+                } else {
+                    Some(thinking_text.clone())
+                };
                 let assistant_msg = make_assistant_message(response_text.clone(), None, thinking);
                 write_message_entry(store, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
                 leaf_id = Some(msg_id);
@@ -720,7 +941,13 @@ pub fn finish_response(
         }
         reason => {
             warn!("Unhandled finish reason {:?} for tree {}", reason, tree_id);
-            emit_event(out, ServerEvent::Done { status: "stop".into(), usage: None });
+            emit_event(
+                out,
+                ServerEvent::Done {
+                    status: "stop".into(),
+                    usage: None,
+                },
+            );
             AgentState::Idle
         }
     }
@@ -735,23 +962,44 @@ pub fn resolve_lsp_wait_into(
     routing_id: Option<String>,
 ) -> AgentState {
     let AgentState::Streaming {
-        mut messages, leaf_id, tool_call_round,
-        tool_calls_this_turn, consecutive_failures, lsp_wait,
-        cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
+        mut messages,
+        leaf_id,
+        tool_call_round,
+        tool_calls_this_turn,
+        consecutive_failures,
+        lsp_wait,
+        cum_prompt_tokens,
+        cum_completion_tokens,
+        cum_cached_tokens,
+        seen_cached_tokens,
         ..
-    } = state else { return state };
+    } = state
+    else {
+        return state;
+    };
 
     let dirty_by_call = lsp_wait.map(|w| w.dirty_by_call).unwrap_or_default();
     let dirty_paths: Vec<&std::path::PathBuf> = dirty_by_call.iter().map(|(p, _)| p).collect();
 
+    log::info!(
+        "[resolve_lsp_wait_into] {} dirty paths, {} lsp clients",
+        dirty_paths.len(),
+        lsp_clients.len()
+    );
+
     for client in lsp_clients.values_mut() {
         // Display: new vs seen split, updates shown snapshot inside.
+        log::info!("[resolve_lsp_wait_into] client lang={}, {} files in diagnostics", client.lang_id, client.diagnostics.len());
         let display_files = client.take_new_for_display(&dirty_paths);
+        log::info!("[resolve_lsp_wait_into] display_files={}", display_files.len());
         if !display_files.is_empty() {
-            emit_event(out, ServerEvent::Diagnostics {
-                source: client.lang_id.clone(),
-                files: display_files.clone(),
-            });
+            emit_event(
+                out,
+                ServerEvent::Diagnostics {
+                    source: client.lang_id.clone(),
+                    files: display_files.clone(),
+                },
+            );
         }
 
         // LLM messages: new diagnostics in full + one-line summary for seen ones.
@@ -764,28 +1012,54 @@ pub fn resolve_lsp_wait_into(
                     path: file.path.clone(),
                     diagnostics: file.diagnostics.clone(),
                 };
-                suffix.push_str(&format!("\n\n[LSP diagnostics]\n{}",
-                    format_diagnostics(std::slice::from_ref(&as_result))));
+                suffix.push_str(&format!(
+                    "\n\n[LSP diagnostics]\n{}",
+                    format_diagnostics(std::slice::from_ref(&as_result))
+                ));
             }
             match (file.seen_errors, file.seen_warnings) {
                 (0, 0) => {}
-                (e, 0) => suffix.push_str(&format!("\n({} seen error{} still unresolved)", e, if e == 1 { "" } else { "s" })),
-                (0, w) => suffix.push_str(&format!("\n({} seen warning{} still unresolved)", w, if w == 1 { "" } else { "s" })),
-                (e, w) => suffix.push_str(&format!("\n({} seen error{}, {} seen warning{} still unresolved)",
-                    e, if e == 1 { "" } else { "s" }, w, if w == 1 { "" } else { "s" })),
+                (e, 0) => suffix.push_str(&format!(
+                    "\n({} seen error{} still unresolved)",
+                    e,
+                    if e == 1 { "" } else { "s" }
+                )),
+                (0, w) => suffix.push_str(&format!(
+                    "\n({} seen warning{} still unresolved)",
+                    w,
+                    if w == 1 { "" } else { "s" }
+                )),
+                (e, w) => suffix.push_str(&format!(
+                    "\n({} seen error{}, {} seen warning{} still unresolved)",
+                    e,
+                    if e == 1 { "" } else { "s" },
+                    w,
+                    if w == 1 { "" } else { "s" }
+                )),
             }
-            if suffix.is_empty() { continue; }
+            if suffix.is_empty() {
+                continue;
+            }
 
-            let diag_path = lsp_types::Url::parse(&file.path).ok().and_then(|u| u.to_file_path().ok());
+            let diag_path = lsp_types::Url::parse(&file.path)
+                .ok()
+                .and_then(|u| u.to_file_path().ok());
             let call_id = diag_path.as_ref().and_then(|dp| {
-                dirty_by_call.iter().find(|(p, _)| p == dp).map(|(_, id)| id.as_str())
+                dirty_by_call
+                    .iter()
+                    .find(|(p, _)| p == dp)
+                    .map(|(_, id)| id.as_str())
             });
             let target = if let Some(id) = call_id {
-                messages.iter_mut().rev().find(|m| m.tool_call_id.as_deref() == Some(id))
+                messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.tool_call_id.as_deref() == Some(id))
             } else {
-                messages.iter_mut().rev().find(|m| {
-                    matches!(m.tool_name.as_deref(), Some("edit") | Some("write"))
-                })
+                messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| matches!(m.tool_name.as_deref(), Some("edit") | Some("write")))
             };
             if let Some(msg) = target {
                 if let MessageContent::Text(ref mut t) = msg.content {
@@ -798,12 +1072,22 @@ pub fn resolve_lsp_wait_into(
     *req_id += 1;
     send_llm_request(out, messages.clone(), definitions, *req_id, routing_id);
     AgentState::Streaming {
-        messages, leaf_id,
-        response_text: String::new(), thinking_text: String::new(),
-        in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
-        tool_calls_buf: vec![], finish_reason: None,
-        tool_call_round, tool_calls_this_turn, consecutive_failures,
-        cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
+        messages,
+        leaf_id,
+        response_text: String::new(),
+        thinking_text: String::new(),
+        in_thinking: false,
+        saw_reasoning_field: false,
+        thinking_phase_done: false,
+        tool_calls_buf: vec![],
+        finish_reason: None,
+        tool_call_round,
+        tool_calls_this_turn,
+        consecutive_failures,
+        cum_prompt_tokens,
+        cum_completion_tokens,
+        cum_cached_tokens,
+        seen_cached_tokens,
         lsp_wait: None,
     }
 }
@@ -817,15 +1101,26 @@ pub fn resolve_lsp_wait_with_timeout(
     routing_id: Option<String>,
 ) -> AgentState {
     let AgentState::Streaming {
-        mut messages, leaf_id, tool_call_round,
-        tool_calls_this_turn, consecutive_failures, lsp_wait: Some(wait),
-        cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
+        mut messages,
+        leaf_id,
+        tool_call_round,
+        tool_calls_this_turn,
+        consecutive_failures,
+        lsp_wait: Some(wait),
+        cum_prompt_tokens,
+        cum_completion_tokens,
+        cum_cached_tokens,
+        seen_cached_tokens,
         ..
-    } = state else { return state };
+    } = state
+    else {
+        return state;
+    };
 
     for pending in &wait.pending_tool_requests {
         let err_msg = make_tool_result_message(
-            &pending.tool_call_id, &pending.tool_name,
+            &pending.tool_call_id,
+            &pending.tool_name,
             &Err("LSP request timed out".into()),
         );
         messages.push(err_msg);
@@ -833,19 +1128,33 @@ pub fn resolve_lsp_wait_with_timeout(
 
     resolve_lsp_wait_into(
         AgentState::Streaming {
-            messages, leaf_id, tool_call_round,
-            tool_calls_this_turn, consecutive_failures,
-            response_text: String::new(), thinking_text: String::new(),
-            in_thinking: false, saw_reasoning_field: false, thinking_phase_done: false,
-            tool_calls_buf: vec![], finish_reason: None,
-            cum_prompt_tokens, cum_completion_tokens, cum_cached_tokens, seen_cached_tokens,
+            messages,
+            leaf_id,
+            tool_call_round,
+            tool_calls_this_turn,
+            consecutive_failures,
+            response_text: String::new(),
+            thinking_text: String::new(),
+            in_thinking: false,
+            saw_reasoning_field: false,
+            thinking_phase_done: false,
+            tool_calls_buf: vec![],
+            finish_reason: None,
+            cum_prompt_tokens,
+            cum_completion_tokens,
+            cum_cached_tokens,
+            seen_cached_tokens,
             lsp_wait: Some(LspWaitState {
                 pending_tool_requests: vec![],
                 dirty_by_call: wait.dirty_by_call,
                 ..wait
             }),
         },
-        &mut ctx.lsp_clients, out, tools, req_id, routing_id,
+        &mut ctx.lsp_clients,
+        out,
+        tools,
+        req_id,
+        routing_id,
     )
 }
 
@@ -864,13 +1173,23 @@ pub fn cancel_turn(
     {
         if !response_text.is_empty() {
             let msg_id = agent_core::util::generate_entry_id();
-            let thinking = if thinking_text.is_empty() { None } else { Some(thinking_text.clone()) };
+            let thinking = if thinking_text.is_empty() {
+                None
+            } else {
+                Some(thinking_text.clone())
+            };
             let assistant_msg = make_assistant_message(response_text.clone(), None, thinking);
             write_message_entry(store, out, &msg_id, leaf_id.as_deref(), &assistant_msg);
         }
     }
 
-    emit_event(out, ServerEvent::Done { status: "cancelled".into(), usage: None });
+    emit_event(
+        out,
+        ServerEvent::Done {
+            status: "cancelled".into(),
+            usage: None,
+        },
+    );
     ctx.stop.store(false, Ordering::Relaxed);
     AgentState::Idle
 }

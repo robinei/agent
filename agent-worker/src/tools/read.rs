@@ -12,10 +12,9 @@ impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read".to_string(),
-            description:
-                "Read the contents of a file. Shows line numbers and enforces a limit of \
+            description: "Read the contents of a file. Shows line numbers and enforces a limit of \
                  2000 lines / 50 KB. If the file is large, use offset to read a portion."
-                    .to_string(),
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -40,10 +39,7 @@ impl Tool for ReadTool {
     }
 
     fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
-        let path_str = match params
-            .get("path")
-            .and_then(|v| v.as_str())
-        {
+        let path_str = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return ToolOutput::Done(Err("Missing required field: path".to_string())),
         };
@@ -135,8 +131,8 @@ impl Tool for ReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn make_ctx(dir: &Path) -> ToolContext {
@@ -171,7 +167,11 @@ mod tests {
         .unwrap();
         let tool = ReadTool;
         let mut ctx = make_ctx(dir.path());
-        let result = run_ok(&tool, serde_json::json!({"path": "test.txt", "offset": 3}), &mut ctx);
+        let result = run_ok(
+            &tool,
+            serde_json::json!({"path": "test.txt", "offset": 3}),
+            &mut ctx,
+        );
         assert!(result.contains("line3"));
         assert!(result.contains("line4"));
         assert!(!result.contains("line1"));
@@ -182,8 +182,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = ReadTool;
         let mut ctx = make_ctx(dir.path());
-        let result =
-            tool.execute(&serde_json::json!({"path": "nope.txt"}), &mut ctx);
+        let result = tool.execute(&serde_json::json!({"path": "nope.txt"}), &mut ctx);
         assert!(matches!(result, ToolOutput::Done(Err(_))));
     }
 
@@ -192,8 +191,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = ReadTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool
-            .execute(&serde_json::json!({"path": "../etc/passwd"}), &mut ctx);
+        let result = tool.execute(&serde_json::json!({"path": "../etc/passwd"}), &mut ctx);
         assert!(matches!(result, ToolOutput::Done(Err(_))));
     }
 }

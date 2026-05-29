@@ -11,10 +11,9 @@ impl Tool for WriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write".to_string(),
-            description:
-                "Write content to a file. Creates parent directories if needed. \
+            description: "Write content to a file. Creates parent directories if needed. \
                  If the file exists, it is overwritten."
-                    .to_string(),
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -33,18 +32,12 @@ impl Tool for WriteTool {
     }
 
     fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
-        let path_str = match params
-            .get("path")
-            .and_then(|v| v.as_str())
-        {
+        let path_str = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return ToolOutput::Done(Err("Missing required field: path".to_string())),
         };
 
-        let content = match params
-            .get("content")
-            .and_then(|v| v.as_str())
-        {
+        let content = match params.get("content").and_then(|v| v.as_str()) {
             Some(c) => c,
             None => return ToolOutput::Done(Err("Missing required field: content".to_string())),
         };
@@ -88,10 +81,10 @@ impl Tool for WriteTool {
             return ToolOutput::Done(Err(e.to_string()));
         }
 
-        ctx.lsp_dirty.push(target.clone());
+        ctx.lsp_dirty.push(target_normalized.clone());
 
         let id = ctx.edit_store.insert(EditRecord {
-            file_path: target.clone(),
+            file_path: target_normalized.clone(),
             pre_snapshot,
             edits: vec![],
             post_snapshot: Some(new_content.clone()),
@@ -111,8 +104,8 @@ impl Tool for WriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn make_ctx(dir: &Path) -> ToolContext {
@@ -131,7 +124,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = WriteTool;
         let mut ctx = make_ctx(dir.path());
-        let result = run_ok(&tool, serde_json::json!({"path": "new.txt", "content": "hello world"}), &mut ctx);
+        let result = run_ok(
+            &tool,
+            serde_json::json!({"path": "new.txt", "content": "hello world"}),
+            &mut ctx,
+        );
         assert!(result.contains("edit_id:"));
         assert!(result.contains("Written:"));
 
@@ -144,7 +141,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = WriteTool;
         let mut ctx = make_ctx(dir.path());
-        let result = run_ok(&tool, serde_json::json!({"path": "sub/dir/file.txt", "content": "test"}), &mut ctx);
+        let result = run_ok(
+            &tool,
+            serde_json::json!({"path": "sub/dir/file.txt", "content": "test"}),
+            &mut ctx,
+        );
         assert!(result.contains("edit_id:"));
         let content = fs::read_to_string(dir.path().join("sub/dir/file.txt")).unwrap();
         assert_eq!(content, "test");
@@ -156,7 +157,10 @@ mod tests {
         fs::write(dir.path().join("existing.txt"), "old").unwrap();
         let tool = WriteTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool.execute(&serde_json::json!({"path": "existing.txt", "content": "new"}), &mut ctx);
+        let result = tool.execute(
+            &serde_json::json!({"path": "existing.txt", "content": "new"}),
+            &mut ctx,
+        );
         assert!(matches!(result, ToolOutput::Done(Ok(_))));
         let content = fs::read_to_string(dir.path().join("existing.txt")).unwrap();
         assert_eq!(content, "new");

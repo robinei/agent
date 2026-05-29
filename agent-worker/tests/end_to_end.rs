@@ -54,7 +54,7 @@ fn worker_round_trip() {
 
     // 4. Spawn worker subprocess (no --config, no AGENT_TEST_STUB — the test
     //    acts as the LLM stub via the PipeIn/PipeOut protocol)
-let mut child = std::process::Command::new(&exe)
+    let mut child = std::process::Command::new(&exe)
         .arg("worker")
         .arg("--tree-id")
         .arg(tree_id)
@@ -158,14 +158,10 @@ let mut child = std::process::Command::new(&exe)
                         id: req.id,
                         data: chunk.to_string(),
                     });
-                    resp_tx
-                        .send(serde_json::to_string(&resp).unwrap())
-                        .unwrap();
+                    resp_tx.send(serde_json::to_string(&resp).unwrap()).unwrap();
                 }
                 let done = PipeIn::Llm(LlmResponse::Done { id: req.id });
-                resp_tx
-                    .send(serde_json::to_string(&done).unwrap())
-                    .unwrap();
+                resp_tx.send(serde_json::to_string(&done).unwrap()).unwrap();
             }
         }
     }

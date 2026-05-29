@@ -8,7 +8,9 @@ use log::{info, warn};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::unistd::read;
 
-use agent_core::types::{Diagnostic, DiagnosticSeverity, DiagnosticsFile, LspServerConfig, Position, Range};
+use agent_core::types::{
+    Diagnostic, DiagnosticSeverity, DiagnosticsFile, LspServerConfig, Position, Range,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LspError {
@@ -19,7 +21,11 @@ pub enum LspError {
     #[error("nix error: {0}")]
     Nix(#[from] nix::Error),
     #[error("spawn LSP {command}: {source}")]
-    Spawn { command: String, #[source] source: std::io::Error },
+    Spawn {
+        command: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("no stdin for LSP process")]
     NoStdin,
     #[error("no stdout for LSP process")]
@@ -80,7 +86,10 @@ impl LspClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| LspError::Spawn { command: command.to_string(), source: e })?;
+            .map_err(|e| LspError::Spawn {
+                command: command.to_string(),
+                source: e,
+            })?;
 
         let stdin = child.stdin.take().ok_or(LspError::NoStdin)?;
         let stdout_fd = child.stdout.take().ok_or(LspError::NoStdout)?.into_raw_fd();
@@ -126,7 +135,11 @@ impl LspClient {
             }
             let mut tmp = [0u8; 4096];
             match read(stdout_fd, &mut tmp) {
-                Ok(0) => return Err(LspError::Other("LSP process exited during initialize".into())),
+                Ok(0) => {
+                    return Err(LspError::Other(
+                        "LSP process exited during initialize".into(),
+                    ))
+                }
                 Ok(n) => buf.extend(&tmp[..n]),
                 Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => {
                     std::thread::sleep(Duration::from_millis(5));
@@ -158,8 +171,10 @@ impl LspClient {
         };
 
         // Snapshot current diagnostics as the pre-edit baseline before sending the edit.
-        self.pre_edit_diagnostics.insert(url.clone(),
-            self.diagnostics.get(&url).cloned().unwrap_or_default());
+        self.pre_edit_diagnostics.insert(
+            url.clone(),
+            self.diagnostics.get(&url).cloned().unwrap_or_default(),
+        );
 
         if self.opened.contains(&url) {
             let change_params = serde_json::json!({
@@ -207,10 +222,17 @@ impl LspClient {
             match read(self.stdout_fd, &mut tmp) {
                 Ok(0) => {
                     info!("LSP client {} EOF", self.lang_id);
+                    drop(std::mem::take(&mut self.read_buf));
                     break;
                 }
-                Ok(n) => self.read_buf.extend(&tmp[..n]),
-                Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => break,
+                Ok(n) => {
+                    let snippet = String::from_utf8_lossy(&tmp[..n.min(500)]);
+                    eprintln!("[LSP_RAW][{}] read {} bytes: {:?}", self.lang_id, n, snippet);
+                    self.read_buf.extend(&tmp[..n])
+                }
+                Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => {
+                    break
+                }
                 Err(e) => {
                     warn!("LSP read error: {}", e);
                     break;
@@ -218,13 +240,21 @@ impl LspClient {
             }
         }
 
+        eprintln!("[LSP_RAW][{}] read_buf len after poll: {}", self.lang_id, self.read_buf.len());
+
         while let Some(frame) = Self::parse_frame(&mut self.read_buf) {
+            eprintln!("[LSP_FRAME][{}] parsed frame: {:?}", self.lang_id, &frame.to_string()[..frame.to_string().len().min(500)]);
             if let Some(method) = frame.get("method").and_then(|v| v.as_str()) {
                 if method == "textDocument/publishDiagnostics" {
                     if let Some(params) = frame.get("params") {
                         if let Some(uri_str) = params.get("uri").and_then(|v| v.as_str()) {
                             if let Ok(url) = lsp_types::Url::parse(uri_str) {
                                 let diags = Self::convert_diagnostics(params.get("diagnostics"));
+                                log::info!(
+                                    "[LSP] publishDiagnostics: {} --- {} diagnostics",
+                                    uri_str,
+                                    diags.len()
+                                );
                                 self.diagnostics.insert(url, diags);
                                 updated = true;
                             }
@@ -232,7 +262,10 @@ impl LspClient {
                     }
                 }
             } else if let Some(id_val) = frame.get("id") {
-                if let Some(id) = id_val.as_u64().or_else(|| id_val.as_i64().map(|i| i as u64)) {
+                if let Some(id) = id_val
+                    .as_u64()
+                    .or_else(|| id_val.as_i64().map(|i| i as u64))
+                {
                     self.pending_responses.insert(id, frame);
                     updated = true;
                 }
@@ -259,11 +292,35 @@ impl LspClient {
     /// Returns diagnostics for dirty files split into new (unseen) and seen counts,
     /// then updates the shown snapshot. Files with no new issues and no seen issues
     /// are omitted.
-    pub fn take_new_for_display(&mut self, dirty_paths: &[&std::path::PathBuf]) -> Vec<DiagnosticsFile> {
-        let dirty_urls: Vec<lsp_types::Url> = self.diagnostics.keys()
+    pub fn take_new_for_display(
+        &mut self,
+        dirty_paths: &[&std::path::PathBuf],
+    ) -> Vec<DiagnosticsFile> {
+        log::info!(
+            "[LSP] take_new_for_display: {} dirty_paths, {} diagnostics entries",
+            dirty_paths.len(),
+            self.diagnostics.len()
+        );
+        for (url, diags) in &self.diagnostics {
+            let fp = url.to_file_path().ok();
+            log::info!(
+                "[LSP]   diag key: {} (file_path={:?}) -> {} diags",
+                url.as_str(),
+                fp,
+                diags.len()
+            );
+        }
+        for dp in dirty_paths {
+            log::info!("[LSP]   dirty_path: {:?}", dp);
+        }
+        let dirty_urls: Vec<lsp_types::Url> = self
+            .diagnostics
+            .keys()
             .filter(|url| {
                 let fp = url.to_file_path().ok();
-                dirty_paths.iter().any(|dp| fp.as_ref().map(|p| p == *dp).unwrap_or(false))
+                dirty_paths
+                    .iter()
+                    .any(|dp| fp.as_ref().map(|p| p == *dp).unwrap_or(false))
             })
             .cloned()
             .collect();
@@ -271,8 +328,13 @@ impl LspClient {
         let mut results = Vec::new();
         for url in &dirty_urls {
             let current: Vec<Diagnostic> = self.diagnostics.get(url).cloned().unwrap_or_default();
+            log::info!("[LSP]   url={} -> {} diagnostics", url.as_str(), current.len());
             let (new_diags, seen_errors, seen_warnings) = {
-                let pre = self.pre_edit_diagnostics.get(url).map(|v| v.as_slice()).unwrap_or(&[]);
+                let pre = self
+                    .pre_edit_diagnostics
+                    .get(url)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
                 let mut new_diags = Vec::new();
                 let mut seen_errors = 0u32;
                 let mut seen_warnings = 0u32;
@@ -332,15 +394,13 @@ impl LspClient {
         let needle = b"\r\n\r\n";
         let pos = buf.windows(4).position(|w| w == needle)?;
         let header_str = std::str::from_utf8(&buf[..pos]).ok()?;
-        let content_length = header_str
-            .lines()
-            .find_map(|l| {
-                if let Some(val) = l.strip_prefix("Content-Length:") {
-                    val.trim().parse::<usize>().ok()
-                } else {
-                    None
-                }
-            })?;
+        let content_length = header_str.lines().find_map(|l| {
+            if let Some(val) = l.strip_prefix("Content-Length:") {
+                val.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })?;
         let body_start = pos + 4;
         if buf.len() < body_start + content_length {
             return None;
@@ -352,37 +412,43 @@ impl LspClient {
     }
 
     fn convert_diagnostics(value: Option<&serde_json::Value>) -> Vec<Diagnostic> {
-        let Some(diags_val) = value else { return vec![] };
-        let Some(arr) = diags_val.as_array() else { return vec![] };
+        let Some(diags_val) = value else {
+            return vec![];
+        };
+        let Some(arr) = diags_val.as_array() else {
+            return vec![];
+        };
 
-        arr.iter().filter_map(|d| {
-            let range = d.get("range")?;
-            let start = range.get("start")?;
-            let end = range.get("end")?;
-            let message = d.get("message")?.as_str()?;
+        arr.iter()
+            .filter_map(|d| {
+                let range = d.get("range")?;
+                let start = range.get("start")?;
+                let end = range.get("end")?;
+                let message = d.get("message")?.as_str()?;
 
-            Some(Diagnostic {
-                range: Range {
-                    start: Position {
-                        line: start.get("line")?.as_u64()? as u32,
-                        character: start.get("character")?.as_u64()? as u32,
+                Some(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line: start.get("line")?.as_u64()? as u32,
+                            character: start.get("character")?.as_u64()? as u32,
+                        },
+                        end: Position {
+                            line: end.get("line")?.as_u64()? as u32,
+                            character: end.get("character")?.as_u64()? as u32,
+                        },
                     },
-                    end: Position {
-                        line: end.get("line")?.as_u64()? as u32,
-                        character: end.get("character")?.as_u64()? as u32,
-                    },
-                },
-                severity: d.get("severity").and_then(|s| match s.as_u64()? {
-                    1 => Some(DiagnosticSeverity::Error),
-                    2 => Some(DiagnosticSeverity::Warning),
-                    3 => Some(DiagnosticSeverity::Information),
-                    4 => Some(DiagnosticSeverity::Hint),
-                    _ => None,
-                }),
-                message: message.to_string(),
-                code: d.get("code").and_then(|c| c.as_str().map(String::from)),
+                    severity: d.get("severity").and_then(|s| match s.as_u64()? {
+                        1 => Some(DiagnosticSeverity::Error),
+                        2 => Some(DiagnosticSeverity::Warning),
+                        3 => Some(DiagnosticSeverity::Information),
+                        4 => Some(DiagnosticSeverity::Hint),
+                        _ => None,
+                    }),
+                    message: message.to_string(),
+                    code: d.get("code").and_then(|c| c.as_str().map(String::from)),
+                })
             })
-        }).collect()
+            .collect()
     }
 }
 
@@ -478,7 +544,11 @@ pub fn format_diagnostics(results: &[LspFileResult]) -> String {
                 Some(DiagnosticSeverity::Hint) => "hint",
                 None => "note",
             };
-            let code_str = d.code.as_ref().map(|c| format!("[{}] ", c)).unwrap_or_default();
+            let code_str = d
+                .code
+                .as_ref()
+                .map(|c| format!("[{}] ", c))
+                .unwrap_or_default();
             let line = format!(
                 "{}:{}:{}: {}{}: {}",
                 path,

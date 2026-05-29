@@ -23,7 +23,8 @@ pub mod write;
 use agent_core::types::ToolDefinition;
 
 /// Result type for tool execution.
-pub type ToolResult = Result<agent_core::types::ToolOutput, Box<dyn std::error::Error + Send + Sync>>;
+pub type ToolResult =
+    Result<agent_core::types::ToolOutput, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Tool execution output: either a completed result or a pending LSP request.
 pub enum ToolOutput {
@@ -143,8 +144,8 @@ pub fn resolve_path(cwd: &Path, requested: &str) -> Result<std::path::PathBuf, S
     } else {
         cwd.join(requested)
     };
-    let cwd_canonical = std::fs::canonicalize(cwd)
-        .map_err(|e| format!("Cannot resolve repo root: {}", e))?;
+    let cwd_canonical =
+        std::fs::canonicalize(cwd).map_err(|e| format!("Cannot resolve repo root: {}", e))?;
 
     // Lexical escape check: resolves `..` without filesystem access so that
     // traversal attempts against non-existent targets still get the right error.
@@ -177,7 +178,9 @@ fn normalize_path_lexical(path: &Path) -> std::path::PathBuf {
     let mut result = std::path::PathBuf::new();
     for component in path.components() {
         match component {
-            Component::ParentDir => { result.pop(); }
+            Component::ParentDir => {
+                result.pop();
+            }
             Component::CurDir => {}
             c => result.push(c),
         }
@@ -186,7 +189,11 @@ fn normalize_path_lexical(path: &Path) -> std::path::PathBuf {
 }
 
 /// Truncate output to the given limits, setting `truncated` if exceeded.
-pub fn truncate_output(content: &str, max_lines: usize, max_bytes: usize) -> agent_core::types::ToolOutput {
+pub fn truncate_output(
+    content: &str,
+    max_lines: usize,
+    max_bytes: usize,
+) -> agent_core::types::ToolOutput {
     let original_size = content.len();
     let mut truncated = false;
     let result = if content.len() > max_bytes {
@@ -198,7 +205,11 @@ pub fn truncate_output(content: &str, max_lines: usize, max_bytes: usize) -> age
         let line_count = content.lines().count();
         if line_count > max_lines {
             truncated = true;
-            let mut s: String = content.lines().take(max_lines).collect::<Vec<_>>().join("\n");
+            let mut s: String = content
+                .lines()
+                .take(max_lines)
+                .collect::<Vec<_>>()
+                .join("\n");
             s.push_str(&format!(
                 "\n\n[Output truncated: {} lines (limit {})]",
                 line_count, max_lines

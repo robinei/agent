@@ -53,19 +53,16 @@ pub(super) fn apply_edit(
     let norm_old = fuzzy_normalize(old_text);
 
     if let Some(pos) = norm_original.find(&norm_old) {
-        let orig_pos =
-            map_normalized_pos(original, &norm_original, pos).ok_or_else(|| {
-                format!("Edit #{}: could not map fuzzy match position", index + 1)
-            })?;
+        let orig_pos = map_normalized_pos(original, &norm_original, pos)
+            .ok_or_else(|| format!("Edit #{}: could not map fuzzy match position", index + 1))?;
 
-        let orig_end =
-            map_normalized_pos(original, &norm_original, pos + norm_old.len())
-                .ok_or_else(|| {
-                    format!(
-                        "Edit #{}: could not map fuzzy match end position",
-                        index + 1
-                    )
-                })?;
+        let orig_end = map_normalized_pos(original, &norm_original, pos + norm_old.len())
+            .ok_or_else(|| {
+                format!(
+                    "Edit #{}: could not map fuzzy match end position",
+                    index + 1
+                )
+            })?;
 
         let mut result = String::with_capacity(original.len() + new_text.len());
         result.push_str(&original[..orig_pos]);
@@ -115,10 +112,7 @@ fn get_line_range(content: &str, byte_start: usize, byte_end: usize) -> (usize, 
 /// Returns a set of 1-indexed line numbers that contain the changed text.
 /// Uses a simple non-overlapping search so duplicate new_text values
 /// don't collide.
-pub(super) fn find_changed_lines(
-    final_content: &str,
-    new_texts: &[String],
-) -> HashSet<usize> {
+pub(super) fn find_changed_lines(final_content: &str, new_texts: &[String]) -> HashSet<usize> {
     let mut claimed: Vec<std::ops::Range<usize>> = Vec::new();
     let mut changed: HashSet<usize> = HashSet::new();
 
@@ -161,13 +155,20 @@ pub(super) fn build_context_window(
     let total_lines = lines.len();
 
     if changed_lines.is_empty() {
-        return format!("edit_id: {}\n{} edit(s) applied to {}\n", edit_id, edit_count, file_path);
+        return format!(
+            "edit_id: {}\n{} edit(s) applied to {}\n",
+            edit_id, edit_count, file_path
+        );
     }
 
     let mut windows: Vec<(usize, usize)> = changed_lines
         .iter()
         .map(|&ln| {
-            let s2 = if ln > CONTEXT_LINES { ln - CONTEXT_LINES } else { 1 };
+            let s2 = if ln > CONTEXT_LINES {
+                ln - CONTEXT_LINES
+            } else {
+                1
+            };
             let e2 = (ln + CONTEXT_LINES).min(total_lines);
             (s2, e2)
         })
@@ -185,9 +186,15 @@ pub(super) fn build_context_window(
         merged.push((s, e));
     }
 
-    let mut result = format!("edit_id: {}\n{} edit(s) applied to {}\n", edit_id, edit_count, file_path);
+    let mut result = format!(
+        "edit_id: {}\n{} edit(s) applied to {}\n",
+        edit_id, edit_count, file_path
+    );
     let first = merged.first().map(|&(s, _)| s > 1).unwrap_or(false);
-    let last = merged.last().map(|&(_, e)| e < total_lines).unwrap_or(false);
+    let last = merged
+        .last()
+        .map(|&(_, e)| e < total_lines)
+        .unwrap_or(false);
     if first {
         result.push_str("...\n");
     }

@@ -101,11 +101,15 @@ impl Tool for EditTool {
             for (i, edit_val) in edits_arr.iter().enumerate() {
                 let old_text = match edit_val.get("oldText").and_then(|v| v.as_str()) {
                     Some(t) => t.to_string(),
-                    None => return ToolOutput::Done(Err(format!("Edit #{}: missing oldText", i + 1))),
+                    None => {
+                        return ToolOutput::Done(Err(format!("Edit #{}: missing oldText", i + 1)))
+                    }
                 };
                 let new_text = match edit_val.get("newText").and_then(|v| v.as_str()) {
                     Some(t) => t.to_string(),
-                    None => return ToolOutput::Done(Err(format!("Edit #{}: missing newText", i + 1))),
+                    None => {
+                        return ToolOutput::Done(Err(format!("Edit #{}: missing newText", i + 1)))
+                    }
                 };
                 edits.push(EditInput { old_text, new_text });
             }
@@ -189,8 +193,8 @@ impl Tool for EditTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn make_ctx(dir: &Path) -> ToolContext {

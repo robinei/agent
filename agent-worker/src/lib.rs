@@ -16,11 +16,18 @@ pub(crate) static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 use log::warn;
 
-use agent_core::rpc::{LlmResponse, PipeIn, WsCommand};
 use crate::store::Store;
-use agent_core::types::{Entry, LspConfig, Message, NotificationLevel, ServerEvent, SessionStatus, TreeMeta};
-use crate::turn::{begin_turn, cancel_turn, finish_response, process_chunk, resolve_lsp_wait_into, resolve_lsp_wait_with_timeout};
-use crate::util::{emit_notification, parse_tree_id, read_config, resolve_repo_path, WorkerError, WorkerResult};
+use crate::turn::{
+    begin_turn, cancel_turn, finish_response, process_chunk, resolve_lsp_wait_into,
+    resolve_lsp_wait_with_timeout,
+};
+use crate::util::{
+    emit_notification, parse_tree_id, read_config, resolve_repo_path, WorkerError, WorkerResult,
+};
+use agent_core::rpc::{LlmResponse, PipeIn, WsCommand};
+use agent_core::types::{
+    Entry, LspConfig, Message, NotificationLevel, ServerEvent, SessionStatus, TreeMeta,
+};
 
 pub(crate) enum AgentState {
     Idle,
@@ -85,7 +92,9 @@ fn read_stdin_into_buf(fd: std::os::fd::RawFd, buf: &mut Vec<u8>) -> bool {
         match nix::unistd::read(fd, &mut tmp) {
             Ok(0) => return false,
             Ok(n) => buf.extend(&tmp[..n]),
-            Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => break,
+            Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => {
+                break
+            }
             Err(e) => {
                 warn!("stdin read error: {}", e);
                 break;
@@ -123,20 +132,18 @@ fn dispatch_pipe_in(
     req_id: &mut u64,
 ) {
     match msg {
-        PipeIn::Cmd(WsCommand::Message { params }) => {
-            match state {
-                AgentState::Idle => {
-                    *state = begin_turn(
-                        params.text, store, session_cfg,
-                        tools, ctx, out, req_id,
-                    );
-                }
-                AgentState::AutoTitling { .. } => {
-                    log::warn!("[worker] dropping message while auto-titling: {}", params.text);
-                }
-                _ => {}
+        PipeIn::Cmd(WsCommand::Message { params }) => match state {
+            AgentState::Idle => {
+                *state = begin_turn(params.text, store, session_cfg, tools, ctx, out, req_id);
             }
-        }
+            AgentState::AutoTitling { .. } => {
+                log::warn!(
+                    "[worker] dropping message while auto-titling: {}",
+                    params.text
+                );
+            }
+            _ => {}
+        },
         PipeIn::Cmd(WsCommand::Stop) => {
             if matches!(state, AgentState::Streaming { .. }) {
                 *state = cancel_turn(std::mem::replace(state, AgentState::Idle), store, ctx, out);
@@ -155,43 +162,63 @@ fn dispatch_pipe_in(
             for entry in to_emit {
                 crate::util::emit_event(out, ServerEvent::Entry(entry.clone()));
             }
-            crate::util::emit_event(out, ServerEvent::Done { status: "history".into(), usage: None });
+            crate::util::emit_event(
+                out,
+                ServerEvent::Done {
+                    status: "history".into(),
+                    usage: None,
+                },
+            );
             out.flush().ok();
         }
         PipeIn::Cmd(WsCommand::AutoTitle) => {
-            if !matches!(state, AgentState::Idle) { return; }
+            if !matches!(state, AgentState::Idle) {
+                return;
+            }
             let meta = match store.get_tree().ok() {
                 Some(m) => m,
                 None => return,
             };
-            if meta.title.is_some() { return; }
+            if meta.title.is_some() {
+                return;
+            }
             let entries = store.read_all_entries().unwrap_or_default();
             let leaf_id = match &meta.leaf_id {
                 Some(id) => id.clone(),
                 None => return,
             };
             let mut messages = crate::agent::build_context(&entries, &leaf_id);
-            messages.insert(0, Message {
-                role: agent_core::types::MessageRole::System,
-                content: agent_core::types::MessageContent::Text(
-                    "Generate a concise title (6 words or fewer) for this coding \
+            messages.insert(
+                0,
+                Message {
+                    role: agent_core::types::MessageRole::System,
+                    content: agent_core::types::MessageContent::Text(
+                        "Generate a concise title (6 words or fewer) for this coding \
                      conversation. Return ONLY the title text, no quotes, no \
-                     punctuation, no explanation.".into()
-                ),
-                tool_calls: None,
-                tool_call_id: None,
-                tool_name: None,
-                usage: None,
-                stop_reason: None,
-                is_error: None,
-                thinking: None,
-            });
+                     punctuation, no explanation."
+                            .into(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                    usage: None,
+                    stop_reason: None,
+                    is_error: None,
+                    thinking: None,
+                },
+            );
             *req_id += 1;
-            let llm_req = agent_core::rpc::LlmRequest { id: *req_id, messages, tools: vec![], routing_id: None };
-            agent_core::rpc::write_json_line(out, &agent_core::rpc::PipeOut::Llm(llm_req))
-                .ok();
+            let llm_req = agent_core::rpc::LlmRequest {
+                id: *req_id,
+                messages,
+                tools: vec![],
+                routing_id: None,
+            };
+            agent_core::rpc::write_json_line(out, &agent_core::rpc::PipeOut::Llm(llm_req)).ok();
             out.flush().ok();
-            *state = AgentState::AutoTitling { accumulated: String::new() };
+            *state = AgentState::AutoTitling {
+                accumulated: String::new(),
+            };
         }
         PipeIn::Llm(LlmResponse::Chunk { id, data, .. }) => {
             if id != *req_id {
@@ -201,7 +228,10 @@ fn dispatch_pipe_in(
                 AgentState::Streaming { .. } => {
                     process_chunk(&data, state, out);
                 }
-                AgentState::AutoTitling { ref mut accumulated, .. } => {
+                AgentState::AutoTitling {
+                    ref mut accumulated,
+                    ..
+                } => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
                         if let Some(t) = v["delta_text"].as_str() {
                             accumulated.push_str(t);
@@ -218,19 +248,25 @@ fn dispatch_pipe_in(
             match state {
                 AgentState::Streaming { .. } => {
                     let old = std::mem::replace(state, AgentState::Idle);
-                    *state = finish_response(
-                        old, store, session_cfg,
-                        tools, ctx, out, lsp_cfg, req_id,
-                    );
+                    *state =
+                        finish_response(old, store, session_cfg, tools, ctx, out, lsp_cfg, req_id);
                 }
-                AgentState::AutoTitling { ref accumulated, .. } => {
+                AgentState::AutoTitling {
+                    ref accumulated, ..
+                } => {
                     let title = accumulated.trim().trim_matches('"').to_string();
                     if !title.is_empty() {
                         if let Ok(mut meta) = store.get_tree() {
                             meta.title = Some(title.clone());
                             let _ = store.save_tree_meta(&meta);
                         }
-                        crate::util::emit_event(out, ServerEvent::MetaUpdate { title: Some(title), model: None });
+                        crate::util::emit_event(
+                            out,
+                            ServerEvent::MetaUpdate {
+                                title: Some(title),
+                                model: None,
+                            },
+                        );
                         out.flush().ok();
                     }
                     *state = AgentState::Idle;
@@ -305,17 +341,16 @@ fn startup_writes(store: &Store) -> Result<(), WorkerError> {
     store.append_entry(&session_start)?;
 
     // Update meta.leaf_id to point at the new SessionStart
-    let mut meta: TreeMeta = store.get_tree()
-        .unwrap_or_else(|_| TreeMeta {
-            id: tree_id.to_string(),
-            parent_id: None,
-            repo_path: None,
-            title: None,
-            created_at: chrono::Utc::now().timestamp(),
-            updated_at: chrono::Utc::now().timestamp(),
-            leaf_id: None,
-            sandbox: Default::default(),
-        });
+    let mut meta: TreeMeta = store.get_tree().unwrap_or_else(|_| TreeMeta {
+        id: tree_id.to_string(),
+        parent_id: None,
+        repo_path: None,
+        title: None,
+        created_at: chrono::Utc::now().timestamp(),
+        updated_at: chrono::Utc::now().timestamp(),
+        leaf_id: None,
+        sandbox: Default::default(),
+    });
     meta.leaf_id = Some(session_start.id().to_string());
     meta.updated_at = chrono::Utc::now().timestamp();
     store.save_tree_meta(&meta)?;
@@ -381,14 +416,23 @@ pub fn run() -> WorkerResult<()> {
         let msgs = parse_pipe_messages(&mut stdin_buf);
         for msg in msgs {
             dispatch_pipe_in(
-                msg, &mut state, &store,
-                &session_cfg, &tools, &mut ctx, &mut out,
-                &config.lsp, &mut req_id,
+                msg,
+                &mut state,
+                &store,
+                &session_cfg,
+                &tools,
+                &mut ctx,
+                &mut out,
+                &config.lsp,
+                &mut req_id,
             );
         }
 
         let timeout = match &state {
-            AgentState::Streaming { lsp_wait: Some(wait), .. } => {
+            AgentState::Streaming {
+                lsp_wait: Some(wait),
+                ..
+            } => {
                 let until = wait.silence_until.min(wait.deadline);
                 let ms = until.saturating_duration_since(Instant::now()).as_millis();
                 nix::poll::PollTimeout::from(std::cmp::min(ms, u16::MAX as u128) as u16)
@@ -401,28 +445,34 @@ pub fn run() -> WorkerResult<()> {
             nix::poll::PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(stdin_fd) },
                 nix::poll::PollFlags::POLLIN,
-            )
-        ).chain(
-            ctx.lsp_clients.values().map(|c|
+            ),
+        )
+        .chain(ctx.lsp_clients.values().map(|c|
                 // SAFETY: c.stdout_fd is owned by LspClient which lives in ctx for the loop.
                 nix::poll::PollFd::new(
                     unsafe { BorrowedFd::borrow_raw(c.stdout_fd) },
                     nix::poll::PollFlags::POLLIN,
-                )
-            )
-        ).collect();
+                )))
+        .collect();
 
         nix::poll::poll(&mut pollfds, timeout).ok();
 
         if SIGTERM_RECEIVED.load(Ordering::Relaxed) {
             if matches!(state, AgentState::Streaming { .. }) {
-                crate::util::emit_event(&mut out, agent_core::types::ServerEvent::Done { status: "aborted".into(), usage: None });
+                crate::util::emit_event(
+                    &mut out,
+                    agent_core::types::ServerEvent::Done {
+                        status: "aborted".into(),
+                        usage: None,
+                    },
+                );
             }
             break;
         }
 
         // Read more stdin data if available; break on EOF.
-        let stdin_flags = pollfds.first()
+        let stdin_flags = pollfds
+            .first()
             .and_then(|p| p.revents())
             .unwrap_or(nix::poll::PollFlags::empty());
         if stdin_flags.intersects(nix::poll::PollFlags::POLLIN | nix::poll::PollFlags::POLLHUP) {
@@ -432,9 +482,15 @@ pub fn run() -> WorkerResult<()> {
                 let msgs = parse_pipe_messages(&mut stdin_buf);
                 for msg in msgs {
                     dispatch_pipe_in(
-                        msg, &mut state, &store,
-                        &session_cfg, &tools, &mut ctx, &mut out,
-                        &config.lsp, &mut req_id,
+                        msg,
+                        &mut state,
+                        &store,
+                        &session_cfg,
+                        &tools,
+                        &mut ctx,
+                        &mut out,
+                        &config.lsp,
+                        &mut req_id,
                     );
                 }
                 break;
@@ -449,56 +505,122 @@ pub fn run() -> WorkerResult<()> {
                 if poll_idx >= pollfds.len() {
                     break;
                 }
-                if pollfds[poll_idx].revents().map_or(false, |r| r.contains(nix::poll::PollFlags::POLLIN)) {
-                    let updated = ctx.lsp_clients.get_mut(lang_id).unwrap().read_available();
-                    if updated {
-                        if let AgentState::Streaming { lsp_wait: Some(ref mut wait), ref mut messages, .. } = state {
-                            wait.silence_until = Instant::now() + Duration::from_millis(wait.silence_ms);
-                            let mut resolved_indices: Vec<usize> = Vec::new();
-                            let mut resolved_responses: Vec<(serde_json::Value, String, String)> = Vec::new();
-                            for (j, pending) in wait.pending_tool_requests.iter().enumerate() {
-                                if let Some(client) = ctx.lsp_clients.get_mut(&pending.lang_id) {
-                                    if let Some(response) = client.pending_responses.remove(&pending.request_id) {
-                                        resolved_indices.push(j);
-                                        resolved_responses.push((
-                                            response,
-                                            pending.tool_name.clone(),
-                                            pending.tool_call_id.clone(),
+                if pollfds[poll_idx]
+                    .revents()
+                    .map_or(false, |r| r.contains(nix::poll::PollFlags::POLLIN))
+                {
+                    log::info!("[LSP poll] POLLIN for lang={}", lang_id);
+                    if let Some(client) = ctx.lsp_clients.get_mut(lang_id) {
+                        let updated = client.read_available();
+                        if updated {
+                            if let AgentState::Streaming {
+                                lsp_wait: Some(ref mut wait),
+                                ref mut messages,
+                                ..
+                            } = state
+                            {
+                                // Only reset the silence timer when we receive non-empty
+                                // diagnostics. LSP servers often send an empty
+                                // publishDiagnostics first (to clear previous state) before
+                                // computing and sending actual diagnostics. Starting the
+                                // silence countdown on the empty clear would cause us to
+                                // resolve the wait before the real diagnostics arrive.
+                                let has_content =
+                                    client.diagnostics.values().any(|d| !d.is_empty());
+                                if has_content {
+                                    wait.silence_until =
+                                        Instant::now() + Duration::from_millis(wait.silence_ms);
+                                }
+                                let mut resolved_indices: Vec<usize> = Vec::new();
+                                let mut resolved_responses: Vec<(
+                                    serde_json::Value,
+                                    String,
+                                    String,
+                                )> = Vec::new();
+                                for (j, pending) in wait.pending_tool_requests.iter().enumerate() {
+                                    if let Some(client) = ctx.lsp_clients.get_mut(&pending.lang_id)
+                                    {
+                                        if let Some(response) =
+                                            client.pending_responses.remove(&pending.request_id)
+                                        {
+                                            resolved_indices.push(j);
+                                            resolved_responses.push((
+                                                response,
+                                                pending.tool_name.clone(),
+                                                pending.tool_call_id.clone(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                for (response, tool_name, tool_call_id) in resolved_responses {
+                                    if let Some(tool) = tools.iter().find(|t| t.name() == tool_name)
+                                    {
+                                        let result = tool.resume(response, &mut ctx);
+                                        messages.push(crate::turn::make_tool_result_message(
+                                            &tool_call_id,
+                                            &tool_name,
+                                            &result,
                                         ));
                                     }
                                 }
-                            }
-                            for (response, tool_name, tool_call_id) in resolved_responses {
-                                if let Some(tool) = tools.iter().find(|t| t.name() == tool_name) {
-                                    let result = tool.resume(response, &mut ctx);
-                                    messages.push(crate::turn::make_tool_result_message(&tool_call_id, &tool_name, &result));
+                                for j in resolved_indices.into_iter().rev() {
+                                    wait.pending_tool_requests.swap_remove(j);
                                 }
-                            }
-                            for j in resolved_indices.into_iter().rev() {
-                                wait.pending_tool_requests.swap_remove(j);
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Resolve LSP wait if ready
-        if let AgentState::Streaming { lsp_wait: Some(ref wait), .. } = state {
-            let now = Instant::now();
-            let tools_done = wait.pending_tool_requests.is_empty();
-            if tools_done && (now >= wait.silence_until || now >= wait.deadline) {
-                let old = std::mem::replace(&mut state, AgentState::Idle);
-                state = resolve_lsp_wait_into(old, &mut ctx.lsp_clients, &mut out, &tools, &mut req_id, Some(store.tree_id().to_string()));
-            } else if !tools_done && now >= wait.deadline {
-                let old = std::mem::replace(&mut state, AgentState::Idle);
-                state = resolve_lsp_wait_with_timeout(old, &mut ctx, &mut out, &tools, &mut req_id, Some(store.tree_id().to_string()));
+            // Resolve LSP wait if ready
+            if let AgentState::Streaming {
+                lsp_wait: Some(ref wait),
+                ..
+            } = state
+            {
+                let now = Instant::now();
+                let tools_done = wait.pending_tool_requests.is_empty();
+                log::info!(
+                    "[LSP poll] tools_done={} now={:?} silence_until={:?} deadline={:?} silence_remaining={:?}",
+                    tools_done,
+                    now,
+                    wait.silence_until,
+                    wait.deadline,
+                    wait.silence_until.saturating_duration_since(now)
+                );
+                if tools_done && (now >= wait.silence_until || now >= wait.deadline) {
+                    let old = std::mem::replace(&mut state, AgentState::Idle);
+                    state = resolve_lsp_wait_into(
+                        old,
+                        &mut ctx.lsp_clients,
+                        &mut out,
+                        &tools,
+                        &mut req_id,
+                        Some(store.tree_id().to_string()),
+                    );
+                } else if !tools_done && now >= wait.deadline {
+                    let old = std::mem::replace(&mut state, AgentState::Idle);
+                    state = resolve_lsp_wait_with_timeout(
+                        old,
+                        &mut ctx,
+                        &mut out,
+                        &tools,
+                        &mut req_id,
+                        Some(store.tree_id().to_string()),
+                    );
+                }
             }
-        }
 
-        // Re-poll immediately if lsp_wait was just resolved to a new Streaming state.
-        if matches!(state, AgentState::Streaming { lsp_wait: Some(_), .. }) {
-            continue;
+            // Re-poll immediately if lsp_wait was just resolved to a new Streaming state.
+            if matches!(
+                state,
+                AgentState::Streaming {
+                    lsp_wait: Some(_),
+                    ..
+                }
+            ) {
+                continue;
+            }
         }
     }
     Ok(())

@@ -58,10 +58,7 @@ impl Tool for BashTool {
     }
 
     fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
-        let command = match params
-            .get("command")
-            .and_then(|v| v.as_str())
-        {
+        let command = match params.get("command").and_then(|v| v.as_str()) {
             Some(c) => c,
             None => return ToolOutput::Done(Err("Missing required field: command".to_string())),
         };
@@ -173,7 +170,13 @@ impl Tool for BashTool {
 }
 
 impl BashTool {
-    fn combine_output(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>, kill_reason: Option<KillReason>, timeout_secs: u64) -> String {
+    fn combine_output(
+        stdout: &[u8],
+        stderr: &[u8],
+        exit_code: Option<i32>,
+        kill_reason: Option<KillReason>,
+        timeout_secs: u64,
+    ) -> String {
         let stdout_str = String::from_utf8_lossy(stdout);
         let stderr_str = String::from_utf8_lossy(stderr);
         let failed = exit_code.map_or(false, |c| c != 0);
@@ -220,8 +223,8 @@ impl BashTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn make_ctx(dir: &Path) -> ToolContext {
@@ -240,7 +243,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool;
         let mut ctx = make_ctx(dir.path());
-        let result = run_ok(&tool, serde_json::json!({"command": "echo hello world"}), &mut ctx);
+        let result = run_ok(
+            &tool,
+            serde_json::json!({"command": "echo hello world"}),
+            &mut ctx,
+        );
         assert!(result.contains("hello world"));
     }
 
@@ -258,7 +265,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool;
         let mut ctx = make_ctx(dir.path());
-        let result = run_ok(&tool, serde_json::json!({"command": "echo error >&2"}), &mut ctx);
+        let result = run_ok(
+            &tool,
+            serde_json::json!({"command": "echo error >&2"}),
+            &mut ctx,
+        );
         assert!(result.contains("error"));
     }
 
@@ -268,7 +279,11 @@ mod tests {
         fs::write(dir.path().join("marker.txt"), "present").unwrap();
         let tool = BashTool;
         let mut ctx = make_ctx(dir.path());
-        let result = run_ok(&tool, serde_json::json!({"command": "ls marker.txt"}), &mut ctx);
+        let result = run_ok(
+            &tool,
+            serde_json::json!({"command": "ls marker.txt"}),
+            &mut ctx,
+        );
         assert!(result.contains("marker.txt"));
     }
 
@@ -277,7 +292,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool;
         let mut ctx = make_ctx(dir.path());
-        let result = run_ok(&tool, serde_json::json!({"command": "sleep 10", "timeout": 1}), &mut ctx);
+        let result = run_ok(
+            &tool,
+            serde_json::json!({"command": "sleep 10", "timeout": 1}),
+            &mut ctx,
+        );
         assert!(result.contains("timed out"));
     }
 
@@ -286,7 +305,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = BashTool;
         let mut ctx = make_ctx(dir.path());
-        let result = run_ok(&tool, serde_json::json!({"command": "nonexistent_command_xyz123"}), &mut ctx);
+        let result = run_ok(
+            &tool,
+            serde_json::json!({"command": "nonexistent_command_xyz123"}),
+            &mut ctx,
+        );
         assert!(result.contains("exit_code: 127") || result.contains("not found"));
     }
 

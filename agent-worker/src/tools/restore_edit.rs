@@ -31,8 +31,7 @@ impl Tool for RestoreEditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "restore_edit".to_string(),
-            description:
-                "Restore a file to a state relative to a previously recorded edit. \
+            description: "Restore a file to a state relative to a previously recorded edit. \
                  Use this instead of git checkout when an edit needs to be undone. \
                  Modes:\n\
                  - revert_patch (default): surgically undo the edit by reversing the \
@@ -42,7 +41,7 @@ impl Tool for RestoreEditTool {
                  - pre_snapshot: restore the full file to its state before the edit\n\
                  - post_snapshot: restore the full file to its state immediately after \
                    the edit"
-                    .to_string(),
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -62,12 +61,11 @@ impl Tool for RestoreEditTool {
     }
 
     fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
-        let id = match params
-            .get("id")
-            .and_then(|v| v.as_u64())
-        {
+        let id = match params.get("id").and_then(|v| v.as_u64()) {
             Some(i) => i,
-            None => return ToolOutput::Done(Err("Missing or invalid required field: id".to_string())),
+            None => {
+                return ToolOutput::Done(Err("Missing or invalid required field: id".to_string()))
+            }
         };
 
         let mode = params
@@ -117,7 +115,10 @@ impl Tool for RestoreEditTool {
                 if let Err(e) = std::fs::write(&resolved, &content) {
                     return ToolOutput::Done(Err(e.to_string()));
                 }
-                ToolOutput::Done(Ok(format!("Restored file to post-edit snapshot (edit {})", id)))
+                ToolOutput::Done(Ok(format!(
+                    "Restored file to post-edit snapshot (edit {})",
+                    id
+                )))
             }
 
             "apply_patch" => {

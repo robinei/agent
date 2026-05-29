@@ -94,10 +94,18 @@ pub fn emit_event(out: &mut BufWriter<std::io::Stdout>, event: ServerEvent) {
         ServerEvent::TextChunk { content } => format!("TextChunk(len={})", content.len()),
         ServerEvent::ThinkingChunk { content } => format!("ThinkingChunk(len={})", content.len()),
         ServerEvent::ToolStart { tool, .. } => format!("ToolStart({})", tool),
-        ServerEvent::ToolResult { tool, exit, .. } => format!("ToolResult({}, exit={})", tool, exit),
+        ServerEvent::ToolResult { tool, exit, .. } => {
+            format!("ToolResult({}, exit={})", tool, exit)
+        }
         ServerEvent::Entry(e) => format!("Entry({})", e.id()),
-        ServerEvent::ContextUpdate { status, pct, estimated } => format!("ContextUpdate({:?},{}%,{}t)", status, pct, estimated),
-        ServerEvent::Notification { level, message } => format!("Notification({:?}, {})", level, message),
+        ServerEvent::ContextUpdate {
+            status,
+            pct,
+            estimated,
+        } => format!("ContextUpdate({:?},{}%,{}t)", status, pct, estimated),
+        ServerEvent::Notification { level, message } => {
+            format!("Notification({:?}, {})", level, message)
+        }
         ServerEvent::Done { status, usage: _ } => format!("Done({})", status),
         ServerEvent::FileChanged { path, kind } => format!("FileChanged({},{})", kind, path),
         ServerEvent::MetaUpdate { .. } => "MetaUpdate".into(),
@@ -114,7 +122,11 @@ pub fn emit_event(out: &mut BufWriter<std::io::Stdout>, event: ServerEvent) {
     }
 }
 
-pub fn emit_notification(out: &mut BufWriter<std::io::Stdout>, level: NotificationLevel, message: String) {
+pub fn emit_notification(
+    out: &mut BufWriter<std::io::Stdout>,
+    level: NotificationLevel,
+    message: String,
+) {
     emit_event(out, ServerEvent::Notification { level, message });
 }
 
@@ -127,8 +139,18 @@ pub fn send_llm_request(
 ) {
     let n_msg = messages.len();
     let n_tools = tools.len();
-    log::info!("send_llm_request: id={} {} messages, {} tools", req_id, n_msg, n_tools);
-    let req = PipeOut::Llm(LlmRequest { id: req_id, messages, tools, routing_id });
+    log::info!(
+        "send_llm_request: id={} {} messages, {} tools",
+        req_id,
+        n_msg,
+        n_tools
+    );
+    let req = PipeOut::Llm(LlmRequest {
+        id: req_id,
+        messages,
+        tools,
+        routing_id,
+    });
     if let Ok(json) = serde_json::to_string(&req) {
         log::debug!(
             "send_llm_request pipe out: {}",

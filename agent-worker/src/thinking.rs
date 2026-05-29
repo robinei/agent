@@ -108,7 +108,9 @@ mod tests {
         let mut in_thinking = false;
         let result = split_thinking_chunks("uses `<think>` and `</think>`", &mut in_thinking);
         assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], ThinkingSegment::Text(t) if t == "uses `<think>` and `</think>`"));
+        assert!(
+            matches!(&result[0], ThinkingSegment::Text(t) if t == "uses `<think>` and `</think>`")
+        );
         assert!(!in_thinking);
     }
 
