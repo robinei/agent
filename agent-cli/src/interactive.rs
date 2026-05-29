@@ -300,7 +300,13 @@ fn apply_entry(entry: &Entry, state: &mut AppState) {
                 MessageContent::Text(t) => t.clone(),
                 _ => "[content blocks]".into(),
             };
-            state.push_history(HistoryItem::User(text));
+            // Skip duplicate: the Submit handler already pushed this locally.
+            let is_dup = state.history.last()
+                .map(|item| matches!(item, HistoryItem::User(t) if t == &text))
+                .unwrap_or(false);
+            if !is_dup {
+                state.push_history(HistoryItem::User(text));
+            }
         }
 
         Entry::Message { message, .. } => {
@@ -572,8 +578,10 @@ pub async fn run_interactive(
     // ── Establish persistent WebSocket connection ────────────────────────
     //
     // We keep one WS connection alive for the entire interactive session.
-    // Split it into read/write halves so the select! loop can poll the read
-    // half while the terminal handler writes through the write half.
+    // Wrapped in Arc<Mutex<>> so both the terminal handler (for sending)
+    // and the select! WS branch (for receiving) can access it. We do NOT
+    // split the stream — session.next_event() handles ping/pong internally
+    // and is cancel-safe, so it works directly in select!.
 
     let mut session = backend
         .connect_session(&current_tree_id)
@@ -582,12 +590,7 @@ pub async fn run_interactive(
 
     // Replay history: drain the initial `GetEntries` replay stream.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut replay_md = MarkdownEmitter::new();
-    let mut replay_state = StreamingState {
-        last_tool_args: None,
-        last_spinner: Instant::now(),
-        md: MarkdownEmitter::new(),
-    };
+    let mut replay_state = StreamingState::new();
     loop {
         if tokio::time::Instant::now() >= deadline {
             break;
@@ -607,9 +610,9 @@ pub async fn run_interactive(
     }
     app.draw(&mut state).map_err(|e| e.to_string())?;
 
-    // Split the WS stream into read/write halves for the select! loop.
+    // Wrap session in Arc<Mutex> for shared access between branches.
+    let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
     use tokio_tungstenite::tungstenite::Message;
-    let (mut ws_write, mut ws_read) = session.ws.split();
 
     // ── "Are we waiting for a response?" state ───────────────────────────
     let mut streaming: Option<StreamingState> = None;
@@ -625,7 +628,8 @@ pub async fn run_interactive(
             if streaming.is_some() {
                 // Send stop to the worker.
                 let cmd = serde_json::to_string(&agent_core::rpc::WsCommand::Stop).unwrap();
-                let _ = ws_write.send(Message::Text(cmd.into())).await;
+                let mut guard = session.lock().await;
+                let _ = guard.ws.send(Message::Text(cmd.into())).await;
             } else {
                 break; // idle + Ctrl+C → quit
             }
@@ -671,7 +675,8 @@ pub async fn run_interactive(
                                         params: agent_core::rpc::MessageParams { text: text.clone() },
                                     };
                                     let s = serde_json::to_string(&cmd).unwrap();
-                                    if ws_write.send(Message::Text(s.into())).await.is_err() {
+                                    let mut guard = session.lock().await;
+                                    if guard.ws.send(Message::Text(s.into())).await.is_err() {
                                         ws_open = false;
                                         break;
                                     }
@@ -689,7 +694,8 @@ pub async fn run_interactive(
                                 if streaming.is_some() {
                                     // Send stop command.
                                     let cmd = serde_json::to_string(&agent_core::rpc::WsCommand::Stop).unwrap();
-                                    let _ = ws_write.send(Message::Text(cmd.into())).await;
+                                    let mut guard = session.lock().await;
+                                    let _ = guard.ws.send(Message::Text(cmd.into())).await;
                                     state.push_history(HistoryItem::Notification {
                                         level: NotificationLevel::Info,
                                         message: "⏸ Cancelling…".into(),
@@ -716,52 +722,42 @@ pub async fn run_interactive(
             }
 
             // WebSocket events (server responses)
-            ws_msg = ws_read.next() => {
-                match ws_msg {
-                    Some(Ok(Message::Text(s))) => {
-                        match serde_json::from_str::<ServerEvent>(&s) {
-                            Ok(ev) => {
-                                let is_done = matches!(&ev, ServerEvent::Done { .. });
-                                let is_fatal = matches!(&ev, ServerEvent::Notification {
-                                    level: NotificationLevel::Fatal, ..
-                                });
+            // session.next_event() handles ping/pong internally and is cancel-safe.
+            ws_event = async { session.lock().await.next_event().await } => {
+                match ws_event {
+                    Some(Ok(ev)) => {
+                        let is_done = matches!(&ev, ServerEvent::Done { .. });
+                        let is_fatal = matches!(&ev, ServerEvent::Notification {
+                            level: NotificationLevel::Fatal, ..
+                        });
 
-                                // Skip replay entries in the live stream (applied by replay above).
-                                if !matches!(&ev, ServerEvent::Done { status, .. } if status == "history") {
-                                    if let Some(ref mut s) = streaming {
-                                        apply_event(&ev, &mut state, s, &mut persistent, width);
-                                    } else {
-                                        // Events arriving without an active turn (e.g. MetaUpdate)
-                                        let mut dummy = StreamingState::new();
-                                        apply_event(&ev, &mut state, &mut dummy, &mut persistent, width);
-                                    }
-                                }
-
-                                if is_done {
-                                    streaming = None;
-                                    state.spinner_active = false;
-                                    build_status(&mut state, &mut persistent);
-                                } else if is_fatal {
-                                    streaming = None;
-                                    state.spinner_active = false;
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("WS parse error: {}", e);
+                        // Skip replay entries in the live stream (applied by replay above).
+                        if !matches!(&ev, ServerEvent::Done { status, .. } if status == "history") {
+                            if let Some(ref mut s) = streaming {
+                                apply_event(&ev, &mut state, s, &mut persistent, width);
+                            } else {
+                                // Events arriving without an active turn (e.g. MetaUpdate)
+                                let mut dummy = StreamingState::new();
+                                apply_event(&ev, &mut state, &mut dummy, &mut persistent, width);
                             }
                         }
-                    }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws_write.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        ws_open = false;
+
+                        if is_done {
+                            streaming = None;
+                            state.spinner_active = false;
+                            build_status(&mut state, &mut persistent);
+                        } else if is_fatal {
+                            streaming = None;
+                            state.spinner_active = false;
+                        }
                     }
                     Some(Err(e)) => {
                         eprintln!("WS error: {}", e);
                         ws_open = false;
                     }
-                    _ => {} // binary messages, etc.
+                    None => {
+                        ws_open = false;
+                    }
                 }
             }
 
