@@ -149,7 +149,12 @@ async fn resolve_backend(server: &str, explicit: bool) -> Backend {
 
     // No server found — start embedded on a random port.
     eprintln!("No server at {server}, starting embedded server...");
-    let config = Arc::new(agent_core::config::load_config());
+    let mut config = agent_core::config::load_config();
+
+    // Disable stderr logging for the embedded server — the TUI owns the
+    // terminal and log lines would corrupt the alternate-screen display.
+    config.logging.to_stderr = false;
+    let config = Arc::new(config);
 
     // Bind to a random loopback port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
