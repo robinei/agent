@@ -22,7 +22,7 @@ pub mod write;
 
 use agent_core::types::ToolDefinition;
 
-/// Result type for tool execution.
+/// Result type for tool execution (async).
 pub type ToolResult =
     Result<agent_core::types::ToolOutput, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -99,16 +99,17 @@ impl EditStore {
 
 /// A tool that the LLM can invoke.
 ///
-/// Tools are synchronous, Send, and use real filesystem calls.
+/// Tools are async, Send, and use tokio::fs / tokio::process.
+#[async_trait::async_trait]
 pub trait Tool: Send {
     /// Returns the tool's JSON Schema definition (sent to the LLM).
     fn definition(&self) -> ToolDefinition;
 
     /// Execute the tool with the given JSON parameters and shared context.
-    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput;
+    async fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput;
 
     /// Resume a tool that was paused for an LSP response.
-    fn resume(
+    async fn resume(
         &self,
         _response: serde_json::Value,
         _ctx: &mut ToolContext,

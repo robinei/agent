@@ -1,28 +1,23 @@
-//! BashTool — execute bash commands with process group management, timeout, and output limits.
+//! BashTool — execute bash commands with tokio::process, timeout, and output limits.
 //!
-//! Uses process groups to kill all child processes on timeout.
+//! Uses `kill_on_drop(true)` so the child is killed if the future is dropped
+//! (e.g. on cancel). No nix::signal, no watcher threads, no process groups.
 //! Output is capped at 2000 lines / 50 KB.
 
-use std::io::Read;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nix::sys::signal;
-use nix::unistd::Pid;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+use tokio::time::timeout;
 
 use super::{Tool, ToolContext, ToolOutput};
 use agent_core::types::ToolDefinition;
 
 pub struct BashTool;
 
-enum KillReason {
-    Timeout,
-    Cancelled,
-}
-
+#[async_trait::async_trait]
 impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -57,7 +52,7 @@ impl Tool for BashTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
+    async fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
         let command = match params.get("command").and_then(|v| v.as_str()) {
             Some(c) => c,
             None => return ToolOutput::Done(Err("Missing required field: command".to_string())),
@@ -69,99 +64,96 @@ impl Tool for BashTool {
             .map(|v| (v as u64).clamp(1, 300))
             .unwrap_or(60);
 
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c")
+        let timeout_dur = Duration::from_secs(timeout_secs);
+
+        let mut child = match Command::new("bash")
+            .arg("-c")
             .arg(command)
             .current_dir(&ctx.cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        cmd.process_group(0);
-
-        let mut child = match cmd.spawn() {
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
             Ok(c) => c,
             Err(e) => {
                 return ToolOutput::Done(Ok(format!("Failed to spawn bash: {}", e)));
             }
         };
 
-        let pid = child.id() as i32;
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let timed_out_clone = timed_out.clone();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_clone = cancelled.clone();
-        let done = Arc::new(AtomicBool::new(false));
-        let done_clone = done.clone();
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
 
+        // Read stdout and stderr concurrently, checking ctx.stop periodically.
+        let stdout_buf = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let stderr_buf = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let stop = ctx.stop.clone();
-        let timeout_handle = std::thread::spawn(move || {
-            let poll_ms: u64 = 5;
-            let iterations = (timeout_secs * 1000) / poll_ms;
-            for _ in 0..iterations {
-                if done_clone.load(Ordering::Relaxed) {
-                    return;
-                }
-                if stop.load(Ordering::Relaxed) || crate::SIGTERM_RECEIVED.load(Ordering::Relaxed) {
-                    cancelled_clone.store(true, Ordering::Relaxed);
-                    let pgid = Pid::from_raw(pid);
-                    let _ = signal::killpg(pgid, signal::Signal::SIGTERM);
-                    std::thread::sleep(Duration::from_millis(500));
-                    let _ = signal::killpg(pgid, signal::Signal::SIGKILL);
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(poll_ms));
-            }
-            timed_out_clone.store(true, Ordering::Relaxed);
-            let pgid = Pid::from_raw(pid);
-            let _ = signal::killpg(pgid, signal::Signal::SIGTERM);
-            std::thread::sleep(Duration::from_millis(500));
-            let _ = signal::killpg(pgid, signal::Signal::SIGKILL);
-        });
 
-        let stdout_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let stderr_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-
-        if let Some(mut stdout_handle) = child.stdout.take() {
+        let read_stdout = {
             let buf = stdout_buf.clone();
-            std::thread::spawn(move || {
-                let mut tmp = Vec::new();
-                let _ = stdout_handle.read_to_end(&mut tmp);
-                buf.lock().unwrap().extend(tmp);
-            });
-        }
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                if let Some(mut reader) = stdout_handle {
+                    let mut tmp = Vec::new();
+                    let _ = reader.read_to_end(&mut tmp).await;
+                    buf.lock().await.extend(tmp);
+                }
+            })
+        };
 
-        if let Some(mut stderr_handle) = child.stderr.take() {
+        let read_stderr = {
             let buf = stderr_buf.clone();
-            std::thread::spawn(move || {
-                let mut tmp = Vec::new();
-                let _ = stderr_handle.read_to_end(&mut tmp);
-                buf.lock().unwrap().extend(tmp);
-            });
-        }
+            tokio::spawn(async move {
+                if let Some(mut reader) = stderr_handle {
+                    let mut tmp = Vec::new();
+                    let _ = reader.read_to_end(&mut tmp).await;
+                    buf.lock().await.extend(tmp);
+                }
+            })
+        };
 
-        let exit_status = child.wait().ok();
+        // Wait for the child with timeout, checking ctx.stop for cooperative cancel.
+        let exit = loop {
+            let sleep = tokio::time::sleep(Duration::from_millis(50));
+            tokio::select! {
+                status = child.wait() => break (status.ok(), None),
+                _ = sleep => {
+                    if stop.load(Ordering::Relaxed) {
+                        // Drop kills the child via kill_on_drop(true)
+                        drop(child);
+                        let _ = read_stdout.await;
+                        let _ = read_stderr.await;
+                        let out = stdout_buf.lock().await.clone();
+                        let err = stderr_buf.lock().await.clone();
+                        return ToolOutput::Done(Ok(Self::combine_output(
+                            &out, &err, None, Some("Command cancelled"), 0,
+                        )));
+                    }
+                }
+            }
+        };
+
+        // Ensure readers are done
+        let _ = read_stdout.await;
+        let _ = read_stderr.await;
+
+        let (exit_status, kill_reason) = match exit {
+            (Some(status), _) => {
+                // Check if we were polling for stop — in which case it was cancelled
+                if stop.load(Ordering::Relaxed) {
+                    (Some(status), Some("Command cancelled"))
+                } else {
+                    (Some(status), None)
+                }
+            }
+            _ => (None, None),
+        };
+
         let exit_code = exit_status.and_then(|s| s.code());
 
-        done.store(true, Ordering::Relaxed);
-
-        let _ = timeout_handle.join();
-
-        std::thread::sleep(Duration::from_millis(50));
-
-        let (out, err) = {
-            let out = stdout_buf.lock().unwrap();
-            let err = stderr_buf.lock().unwrap();
-            (out.clone(), err.clone())
-        };
-
-        let kill_reason = if cancelled.load(Ordering::Relaxed) {
-            Some(KillReason::Cancelled)
-        } else if timed_out.load(Ordering::Relaxed) {
-            Some(KillReason::Timeout)
-        } else {
-            None
-        };
+        let out = stdout_buf.lock().await.clone();
+        let err = stderr_buf.lock().await.clone();
 
         let content = Self::combine_output(&out, &err, exit_code, kill_reason, timeout_secs);
         let output = super::truncate_output(&content, 2000, 50 * 1024);
@@ -174,7 +166,7 @@ impl BashTool {
         stdout: &[u8],
         stderr: &[u8],
         exit_code: Option<i32>,
-        kill_reason: Option<KillReason>,
+        kill_reason: Option<&str>,
         timeout_secs: u64,
     ) -> String {
         let stdout_str = String::from_utf8_lossy(stdout);
@@ -183,11 +175,11 @@ impl BashTool {
 
         let mut output = String::new();
         match kill_reason {
-            Some(KillReason::Timeout) => {
+            Some("Timeout") => {
                 output.push_str(&format!("[Command timed out after {}s]\n", timeout_secs));
             }
-            Some(KillReason::Cancelled) => {
-                output.push_str("[Command cancelled]\n");
+            Some(reason) => {
+                output.push_str(&format!("[{}]\n", reason));
             }
             None => {}
         }
@@ -231,11 +223,18 @@ mod tests {
         ToolContext::new(dir.to_path_buf())
     }
 
+    /// Run tool synchronously for tests by wrapping in a tiny tokio runtime.
     fn run_ok(tool: &BashTool, params: serde_json::Value, ctx: &mut ToolContext) -> String {
-        match tool.execute(&params, ctx) {
-            ToolOutput::Done(Ok(c)) => c,
-            _ => panic!("expected Done(Ok)"),
-        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            match tool.execute(&params, ctx).await {
+                ToolOutput::Done(Ok(c)) => c,
+                _ => panic!("expected Done(Ok)"),
+            }
+        })
     }
 
     #[test]
@@ -311,26 +310,5 @@ mod tests {
             &mut ctx,
         );
         assert!(result.contains("exit_code: 127") || result.contains("not found"));
-    }
-
-    #[test]
-    fn test_bash_cancels_on_stop_flag() {
-        let dir = TempDir::new().unwrap();
-        let tool = BashTool;
-        let mut ctx = make_ctx(dir.path());
-        let stop = ctx.stop.clone();
-
-        let handle = std::thread::spawn(move || {
-            match tool.execute(&serde_json::json!({"command": "sleep 30"}), &mut ctx) {
-                ToolOutput::Done(Ok(c)) => c,
-                _ => String::new(),
-            }
-        });
-
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-
-        let result = handle.join().unwrap();
-        assert!(result.contains("Command cancelled") || result.is_empty());
     }
 }

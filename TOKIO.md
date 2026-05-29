@@ -200,21 +200,21 @@ On completion: delete this entry, then commit code + PLAN3.md together with:
 
 ---
 
-### Phase 1: foundations, reqwest LLM client, async tree_io
+### Phase 1: foundations, reqwest LLM client, async tree_io ✅
 
-- [ ] Add `tokio` (`rt`, `macros`, `io-util`, `net`, `process`, `signal`,
+- [x] Add `tokio` (`rt`, `macros`, `io-util`, `net`, `process`, `signal`,
       `time`, `sync`, `fs`) to `agent-core`, `agent-server`, `agent-worker`,
       `agent-cli`.
-- [ ] Add `reqwest` (`default-features = false`, features
+- [x] Add `reqwest` (`default-features = false`, features
       `["rustls-tls", "json", "stream"]`) and `tokio-util` (`io`) to
       `agent-server`.
-- [ ] Write `agent-server/src/llm_client.rs` — `reqwest` replacement for
+- [x] Write `agent-server/src/llm_client.rs` — `reqwest` replacement for
       `llm_handler.rs` (515 lines of hand-rolled TLS/chunked/HTTP it deletes).
-- [ ] Trim the provider trait: keep `build_body` + `parse_stream_event`;
+- [x] Trim the provider trait: keep `build_body` + `parse_stream_event`;
       **delete `Provider::chat` and `OpenAiProvider::chat_raw`** (the two
       `ureq::post` callsites at `provider.rs:190` and `:772`).
-- [ ] Make `tree_io` functions `async` (backed by `tokio::fs`).
-- [ ] Write `agent-core/src/child_io.rs` — `ChildLines` over
+- [x] Make `tree_io` functions `async` (backed by `tokio::fs`).
+- [x] Write `agent-core/src/child_io.rs` — `ChildLines` over
       `tokio::process::ChildStdout`.
 
 **Goal:** stand up the shared async building blocks; delete the largest block
@@ -296,16 +296,16 @@ cargo test -p agent-core -p agent-server
 
 ---
 
-### Phase 2: agent-server
+### Phase 2: agent-server ✅
 
-- [ ] Replace `http.rs` + `ws.rs` with an axum `Router`.
-- [ ] Replace `worker_loop.rs` + `worker_ctx.rs` with an async worker task.
-- [ ] Replace `ws_client.rs` (the `ws_clients: Vec` + manual `broadcast()`
+- [x] Replace `http.rs` + `ws.rs` with an axum `Router`.
+- [x] Replace `worker_loop.rs` + `worker_ctx.rs` with an async worker task.
+- [x] Replace `ws_client.rs` (the `ws_clients: Vec` + manual `broadcast()`
       loop) with `tokio::sync::broadcast`.
-- [ ] Replace `llm_handler.rs` calls with `LlmClient::stream_completion`.
-- [ ] Replace the `mpsc + notify-pipe` wakeup with `tokio::sync::mpsc`.
-- [ ] Replace `signal_hook` with `tokio::signal`.
-- [ ] Remove deps: `nix`, `signal-hook`, `tungstenite`, `httparse`, `rustls`,
+- [x] Replace `llm_handler.rs` calls with `LlmClient::stream_completion`.
+- [x] Replace the `mpsc + notify-pipe` wakeup with `tokio::sync::mpsc`.
+- [x] Replace `signal_hook` with `tokio::signal`.
+- [x] Remove deps: `nix`, `signal-hook`, `tungstenite`, `httparse`, `rustls`,
       `webpki-roots`, `ureq`. Delete files: `http.rs`, `ws.rs`, `ws_client.rs`,
       `worker_loop.rs`, `worker_ctx.rs`, `llm_handler.rs`.
 
@@ -417,7 +417,7 @@ cargo test -p agent-server
 - [ ] Replace the `nix::poll` loop with the event-funnel pattern: `tokio::spawn`
       forwarder tasks for async stdin, each LSP child stdout, and a
       `tokio::signal` shutdown task, all into `mpsc`s.
-- [ ] Add `agent-worker/src/llm.rs` — **`WorkerLlmClient`**, a pipe proxy that
+- [x] Add `agent-worker/src/llm.rs` — **`WorkerLlmClient`**, a pipe proxy that
       hides `PipeIn`/`PipeOut` behind a streaming async API, correlating by the
       existing `LlmRequest.id`.
 - [ ] **Rewrite `turn.rs` / `agent.rs`**: delete the explicit `AgentState`
@@ -425,7 +425,7 @@ cargo test -p agent-server
       `WorkerLlmClient` directly. Cancellation = dropping the turn future.
 - [ ] Auto-title becomes `llm.complete(prompt).await?` — delete the
       `AutoTitling` state.
-- [ ] Make the `Tool` trait async (`#[async_trait]`, keep the `Tool: Send`
+- [x] Make the `Tool` trait async (`#[async_trait]`, keep the `Tool: Send`
       bound): `async fn execute(&self, params, ctx: &mut ToolContext) -> ToolOutput`.
 - [ ] Rewrite `bash.rs` on `tokio::process::Command` (`.kill_on_drop(true)`,
       async stdout/stderr, `tokio::time::timeout`); delete its two `std::thread`
