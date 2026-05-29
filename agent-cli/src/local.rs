@@ -106,7 +106,7 @@ impl LocalClient {
     }
 
     pub fn stop_agent(&self, tree_id: &str) -> Result<(), LocalClientError> {
-        agent_server::spawner::worker_stop(tree_id)
+        Self::block_on(agent_server::spawner::worker_stop(tree_id))
             .map_err(|e| LocalClientError::Other(e.to_string()))
     }
 }

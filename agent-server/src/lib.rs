@@ -1,87 +1,39 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+//! Agent server — axum-based async HTTP/WS server.
+//!
+//! Phase 2: runs on a `current_thread` tokio runtime via `block_on`.
+//! No hand-rolled HTTP, no nix::poll, no signal_hook.
+
 use std::sync::Arc;
 
 use agent_core::config::Config;
 
-pub mod handlers;
-pub mod http;
 pub mod llm_client;
-pub mod sandbox;
-pub mod spawner;
-mod llm_handler;
 pub mod provider;
-mod routes;
-pub mod worker_ctx;
-pub mod worker_loop;
-mod ws;
-pub mod ws_client;
+pub mod sandbox;
+pub mod server;
+pub mod spawner;
+pub mod worker_task;
 
 /// Initialise shared state: index rebuild, session recovery, startup hooks.
 /// Does not bind any socket or register signal handlers.
 /// Called by both `run()` and the CLI's embedded boot path.
-pub fn embed_init(config: Arc<Config>, to_stderr: bool) {
+pub async fn embed_init(config: Arc<Config>, to_stderr: bool) {
     let log_file = config.logging.to_file.as_ref().and_then(|p| p.to_str());
     agent_core::logging::init_logging(log_file, &config.logging.level, to_stderr);
 
-    // Phase 1 bridge: block_on the async tree_io call in a sync context.
-    // Phase 2 will make embed_init itself async.
-    let trees = (|| -> Result<Vec<_>, String> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        rt.block_on(agent_core::tree_io::list_trees(&agent_core::config::agent_dir()))
-            .map_err(|e| e.to_string())
-    })();
-    match trees {
+    match agent_core::tree_io::list_trees(&agent_core::config::agent_dir()).await {
         Ok(trees) => log::info!("Rebuilt index: {} trees loaded", trees.len()),
         Err(e) => log::warn!("Index rebuild issue: {}", e),
     }
 }
 
-/// Bind the TCP listener and run the accept loop (blocks until shutdown signal).
-/// Spawns one thread per connection, same as today.
-/// `shutdown` is set by the caller (via signal handlers in `run()`, or simply
-/// never set when called from the embedded CLI path).
-pub fn serve(config: Arc<Config>, shutdown: Arc<AtomicBool>) {
-    let bind = format!("{}:{}", config.server.host, config.server.port);
-    let listener = std::net::TcpListener::bind(&bind).expect("bind");
-    log::debug!("Listening on http://{}", bind);
-    listener.set_nonblocking(true).ok();
+/// Serve on an already-bound TCP listener. Used by both `run_async` and
+/// the CLI's embedded server path.
+pub async fn serve_on(listener: tokio::net::TcpListener, config: Arc<Config>) {
+    embed_init(config.clone(), config.logging.to_stderr).await;
 
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            log::info!("[lifecycle] shutting down (signal received)");
-            break;
-        }
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let cfg = config.clone();
-                std::thread::spawn(move || http::handle_connection(stream, cfg));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            Err(e) => {
-                log::warn!("[serve] accept error: {e}");
-                continue;
-            }
-        }
-    }
-
-    spawner::shutdown_all();
-    log::info!("[lifecycle] server stopped");
-}
-
-pub fn run(args: Vec<String>) {
-    let _ = args;
-
-    let config = Arc::new(agent_core::config::load_config());
-
-    let log_file = config.logging.to_file.as_ref().and_then(|p| p.to_str());
-    agent_core::logging::init_logging(log_file, &config.logging.level, config.logging.to_stderr);
-
-    log::info!("Starting agent-server...");
+    let local_addr = listener.local_addr().ok();
+    log::info!("Starting agent-server on {:?}...", local_addr);
     log::info!(
         "Config: host={}, port={}, model={}",
         config.server.host,
@@ -89,14 +41,93 @@ pub fn run(args: Vec<String>) {
         config.provider.model
     );
 
-    embed_init(config.clone(), config.logging.to_stderr);
+    let app_state = server::AppState {
+        workers: std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        llm: llm_client::LlmClient::new(),
+        cfg: config.clone(),
+    };
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGINT, shutdown.clone()) {
-        log::warn!("Failed to register SIGINT handler: {}", e);
+    let app = server::build_router(app_state);
+
+    // Shutdown signal handling
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // SIGINT
+    #[cfg(unix)]
+    {
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(()) = tokio::signal::ctrl_c().await {
+                log::info!("[lifecycle] SIGINT received, shutting down");
+                let _ = tx.send(true);
+            }
+        });
     }
-    if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.clone()) {
-        log::warn!("Failed to register SIGTERM handler: {}", e);
+
+    // SIGTERM
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("Failed to register SIGTERM handler: {}", e);
+                    return;
+                }
+            };
+            term.recv().await;
+            log::info!("[lifecycle] SIGTERM received, shutting down");
+            let _ = tx.send(true);
+        });
     }
-    serve(config, shutdown);
+
+    // Serve with graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            loop {
+                if *shutdown_rx.borrow_and_update() {
+                    break;
+                }
+                shutdown_rx.changed().await.ok();
+            }
+        })
+        .await
+        .ok();
+
+    spawner::shutdown_all().await;
+    log::info!("[lifecycle] server stopped");
+}
+
+/// Run the async server. Binds to the configured host:port and calls `serve_on`.
+pub async fn run_async(config: Arc<Config>) {
+    let bind = format!("{}:{}", config.server.host, config.server.port);
+    let listener = match tokio::net::TcpListener::bind(&bind).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("Failed to bind to {}: {}", bind, e);
+            return;
+        }
+    };
+    serve_on(listener, config).await;
+}
+
+/// Sync entry point. Creates a `current_thread` tokio runtime and blocks
+/// on it. Used by the binary's `main()` and by `agent-cli` embedded path.
+pub fn serve(cfg: Arc<Config>) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to build tokio runtime")
+        .block_on(run_async(cfg))
+}
+
+/// CLI entry point — parses args, loads config, runs the server.
+pub fn run(args: Vec<String>) {
+    let _ = args;
+    let config = Arc::new(agent_core::config::load_config());
+    serve(config);
 }

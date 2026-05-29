@@ -153,14 +153,18 @@ fn resolve_backend(server: &str, explicit: bool) -> Backend {
     // No server found — start embedded.
     eprintln!("No server at {server}, hosting server");
     let config = Arc::new(agent_core::config::load_config());
-    agent_server::embed_init(config.clone(), false);
-    // Start TCP listener in background so other clients can connect later.
-    // Pass a never-signalled AtomicBool — the embedded server runs until the
-    // CLI process exits; the CLI owns SIGINT via ctrlc and must not fight the
-    // server's signal handler for it.
-    let cc = config.clone();
-    let no_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    std::thread::spawn(move || agent_server::serve(cc, no_shutdown));
+
+    // Run embed_init (now async) in a quick block_on
+    let cfg_init = config.clone();
+    let to_stderr = config.logging.to_stderr;
+    std::thread::spawn(move || {
+        // Each embedded server gets its own current_thread tokio runtime
+        agent_server::serve(cfg_init);
+    });
+
+    // Give the server a moment to bind before the CLI tries to connect.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
     Backend::Local(LocalClient::new(config))
 }
 
@@ -176,10 +180,14 @@ fn default_server_addr() -> std::net::SocketAddr {
 
 // ── Socketpair session ──
 
+/// Create an embedded WS session by connecting through a socketpair.
+/// The server end runs the axum Router via `serve_single_connection`.
 pub fn embedded_session(
     tree_id: &str,
     config: Arc<agent_core::config::Config>,
 ) -> Result<AgentSession, CliError> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
     let (client_fd, server_fd) = nix::sys::socket::socketpair(
         nix::sys::socket::AddressFamily::Unix,
         nix::sys::socket::SockType::Stream,
@@ -187,12 +195,25 @@ pub fn embedded_session(
         nix::sys::socket::SockFlag::empty(),
     )
     .map_err(|e| CliError::Other(e.to_string()))?;
-    let server_stream = unsafe { TcpStream::from_raw_fd(server_fd.into_raw_fd()) };
-    let client_stream = unsafe { TcpStream::from_raw_fd(client_fd.into_raw_fd()) };
+
+    // SAFETY: we own these fds from socketpair
+    let server_stream = tokio::net::TcpStream::from_std(
+        std::net::TcpStream::from(unsafe { OwnedFd::from_raw_fd(server_fd.into_raw_fd()) }),
+    )
+    .expect("convert std TcpStream to tokio TcpStream");
+    let client_stream = unsafe { std::net::TcpStream::from_raw_fd(client_fd.into_raw_fd()) };
+
     let cfg_for_server = config.clone();
     std::thread::spawn(move || {
-        agent_server::http::handle_connection(server_stream, cfg_for_server);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime for embedded session");
+        rt.block_on(async move {
+            agent_server::server::serve_single_connection(server_stream, cfg_for_server).await;
+        });
     });
+
     Ok(AgentSession::from_stream(client_stream, tree_id)?)
 }
 

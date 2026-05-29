@@ -26,6 +26,7 @@ pub enum LlmError {
 /// Replaces `LlmHandler` (~515 lines of hand-rolled TLS + chunked HTTP).
 /// `reqwest` with `rustls-tls` handles TLS, HTTP, chunked transfer, and
 /// connection reuse. No C deps.
+#[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
 }
