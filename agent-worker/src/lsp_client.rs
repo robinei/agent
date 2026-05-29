@@ -225,11 +225,7 @@ impl LspClient {
                     drop(std::mem::take(&mut self.read_buf));
                     break;
                 }
-                Ok(n) => {
-                    let snippet = String::from_utf8_lossy(&tmp[..n.min(500)]);
-                    eprintln!("[LSP_RAW][{}] read {} bytes: {:?}", self.lang_id, n, snippet);
-                    self.read_buf.extend(&tmp[..n])
-                }
+                Ok(n) => self.read_buf.extend(&tmp[..n]),
                 Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => {
                     break
                 }
@@ -240,21 +236,13 @@ impl LspClient {
             }
         }
 
-        eprintln!("[LSP_RAW][{}] read_buf len after poll: {}", self.lang_id, self.read_buf.len());
-
         while let Some(frame) = Self::parse_frame(&mut self.read_buf) {
-            eprintln!("[LSP_FRAME][{}] parsed frame: {:?}", self.lang_id, &frame.to_string()[..frame.to_string().len().min(500)]);
             if let Some(method) = frame.get("method").and_then(|v| v.as_str()) {
                 if method == "textDocument/publishDiagnostics" {
                     if let Some(params) = frame.get("params") {
                         if let Some(uri_str) = params.get("uri").and_then(|v| v.as_str()) {
                             if let Ok(url) = lsp_types::Url::parse(uri_str) {
                                 let diags = Self::convert_diagnostics(params.get("diagnostics"));
-                                log::info!(
-                                    "[LSP] publishDiagnostics: {} --- {} diagnostics",
-                                    uri_str,
-                                    diags.len()
-                                );
                                 self.diagnostics.insert(url, diags);
                                 updated = true;
                             }
@@ -296,23 +284,6 @@ impl LspClient {
         &mut self,
         dirty_paths: &[&std::path::PathBuf],
     ) -> Vec<DiagnosticsFile> {
-        log::info!(
-            "[LSP] take_new_for_display: {} dirty_paths, {} diagnostics entries",
-            dirty_paths.len(),
-            self.diagnostics.len()
-        );
-        for (url, diags) in &self.diagnostics {
-            let fp = url.to_file_path().ok();
-            log::info!(
-                "[LSP]   diag key: {} (file_path={:?}) -> {} diags",
-                url.as_str(),
-                fp,
-                diags.len()
-            );
-        }
-        for dp in dirty_paths {
-            log::info!("[LSP]   dirty_path: {:?}", dp);
-        }
         let dirty_urls: Vec<lsp_types::Url> = self
             .diagnostics
             .keys()
@@ -328,7 +299,11 @@ impl LspClient {
         let mut results = Vec::new();
         for url in &dirty_urls {
             let current: Vec<Diagnostic> = self.diagnostics.get(url).cloned().unwrap_or_default();
-            log::info!("[LSP]   url={} -> {} diagnostics", url.as_str(), current.len());
+            log::info!(
+                "[LSP]   url={} -> {} diagnostics",
+                url.as_str(),
+                current.len()
+            );
             let (new_diags, seen_errors, seen_warnings) = {
                 let pre = self
                     .pre_edit_diagnostics

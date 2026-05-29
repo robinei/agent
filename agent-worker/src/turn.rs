@@ -981,17 +981,9 @@ pub fn resolve_lsp_wait_into(
     let dirty_by_call = lsp_wait.map(|w| w.dirty_by_call).unwrap_or_default();
     let dirty_paths: Vec<&std::path::PathBuf> = dirty_by_call.iter().map(|(p, _)| p).collect();
 
-    log::info!(
-        "[resolve_lsp_wait_into] {} dirty paths, {} lsp clients",
-        dirty_paths.len(),
-        lsp_clients.len()
-    );
-
     for client in lsp_clients.values_mut() {
         // Display: new vs seen split, updates shown snapshot inside.
-        log::info!("[resolve_lsp_wait_into] client lang={}, {} files in diagnostics", client.lang_id, client.diagnostics.len());
         let display_files = client.take_new_for_display(&dirty_paths);
-        log::info!("[resolve_lsp_wait_into] display_files={}", display_files.len());
         if !display_files.is_empty() {
             emit_event(
                 out,

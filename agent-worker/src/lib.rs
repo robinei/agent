@@ -509,7 +509,6 @@ pub fn run() -> WorkerResult<()> {
                     .revents()
                     .map_or(false, |r| r.contains(nix::poll::PollFlags::POLLIN))
                 {
-                    log::info!("[LSP poll] POLLIN for lang={}", lang_id);
                     if let Some(client) = ctx.lsp_clients.get_mut(lang_id) {
                         let updated = client.read_available();
                         if updated {
@@ -571,56 +570,50 @@ pub fn run() -> WorkerResult<()> {
                     }
                 }
             }
+        }
 
-            // Resolve LSP wait if ready
-            if let AgentState::Streaming {
-                lsp_wait: Some(ref wait),
-                ..
-            } = state
-            {
-                let now = Instant::now();
-                let tools_done = wait.pending_tool_requests.is_empty();
-                log::info!(
-                    "[LSP poll] tools_done={} now={:?} silence_until={:?} deadline={:?} silence_remaining={:?}",
-                    tools_done,
-                    now,
-                    wait.silence_until,
-                    wait.deadline,
-                    wait.silence_until.saturating_duration_since(now)
+        // Resolve LSP wait if ready (must be outside the is_empty guard — if all
+        // LSP clients failed to spawn, we still need to resolve the wait and
+        // continue with the conversation).
+        if let AgentState::Streaming {
+            lsp_wait: Some(ref wait),
+            ..
+        } = state
+        {
+            let now = Instant::now();
+            let tools_done = wait.pending_tool_requests.is_empty();
+            if tools_done && (now >= wait.silence_until || now >= wait.deadline) {
+                let old = std::mem::replace(&mut state, AgentState::Idle);
+                state = resolve_lsp_wait_into(
+                    old,
+                    &mut ctx.lsp_clients,
+                    &mut out,
+                    &tools,
+                    &mut req_id,
+                    Some(store.tree_id().to_string()),
                 );
-                if tools_done && (now >= wait.silence_until || now >= wait.deadline) {
-                    let old = std::mem::replace(&mut state, AgentState::Idle);
-                    state = resolve_lsp_wait_into(
-                        old,
-                        &mut ctx.lsp_clients,
-                        &mut out,
-                        &tools,
-                        &mut req_id,
-                        Some(store.tree_id().to_string()),
-                    );
-                } else if !tools_done && now >= wait.deadline {
-                    let old = std::mem::replace(&mut state, AgentState::Idle);
-                    state = resolve_lsp_wait_with_timeout(
-                        old,
-                        &mut ctx,
-                        &mut out,
-                        &tools,
-                        &mut req_id,
-                        Some(store.tree_id().to_string()),
-                    );
-                }
+            } else if !tools_done && now >= wait.deadline {
+                let old = std::mem::replace(&mut state, AgentState::Idle);
+                state = resolve_lsp_wait_with_timeout(
+                    old,
+                    &mut ctx,
+                    &mut out,
+                    &tools,
+                    &mut req_id,
+                    Some(store.tree_id().to_string()),
+                );
             }
+        }
 
-            // Re-poll immediately if lsp_wait was just resolved to a new Streaming state.
-            if matches!(
-                state,
-                AgentState::Streaming {
-                    lsp_wait: Some(_),
-                    ..
-                }
-            ) {
-                continue;
+        // Re-poll immediately if lsp_wait was just resolved to a new Streaming state.
+        if matches!(
+            state,
+            AgentState::Streaming {
+                lsp_wait: Some(_),
+                ..
             }
+        ) {
+            continue;
         }
     }
     Ok(())
