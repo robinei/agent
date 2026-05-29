@@ -1,13 +1,13 @@
 //! ReadTool — read a file with line/byte limits.
 
-use std::fs;
-use std::io::{BufRead, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::{resolve_path, Tool, ToolContext, ToolOutput};
 use agent_core::types::ToolDefinition;
 
 pub struct ReadTool;
 
+#[async_trait::async_trait]
 impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -38,13 +38,13 @@ impl Tool for ReadTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
+    async fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
         let path_str = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return ToolOutput::Done(Err("Missing required field: path".to_string())),
         };
 
-        let resolved = match resolve_path(&ctx.cwd, path_str) {
+        let resolved = match resolve_path(&ctx.cwd, path_str).await {
             Ok(p) => p,
             Err(e) => return ToolOutput::Done(Err(e)),
         };
@@ -65,7 +65,7 @@ impl Tool for ReadTool {
             .map(|v| v.max(1) as usize)
             .unwrap_or(2000);
 
-        let file = match fs::File::open(&resolved) {
+        let file = match tokio::fs::File::open(&resolved).await {
             Ok(f) => f,
             Err(e) => return ToolOutput::Done(Err(e.to_string())),
         };
@@ -73,21 +73,34 @@ impl Tool for ReadTool {
         let mut lines: Vec<String> = Vec::new();
         let mut total_size = 0usize;
         let max_bytes = 50 * 1024;
+        let mut line_iter = reader.lines();
 
-        for line_result in reader.lines().skip(offset - 1).take(max_lines + 1) {
-            let line = match line_result {
-                Ok(l) => l,
+        // Skip lines before offset
+        for _ in 1..offset {
+            match line_iter.next_line().await {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
                 Err(e) => return ToolOutput::Done(Err(e.to_string())),
-            };
-            let line_bytes = line.len() + 1;
-            if total_size + line_bytes > max_bytes || lines.len() >= max_lines {
-                break;
             }
-            total_size += line_bytes;
-            lines.push(line);
         }
 
-        let file_content = match fs::read_to_string(&resolved) {
+        // Read up to max_lines
+        for _ in 0..max_lines {
+            match line_iter.next_line().await {
+                Ok(Some(line)) => {
+                    let line_bytes = line.len() + 1;
+                    if total_size + line_bytes > max_bytes {
+                        break;
+                    }
+                    total_size += line_bytes;
+                    lines.push(line);
+                }
+                Ok(None) => break,
+                Err(e) => return ToolOutput::Done(Err(e.to_string())),
+            }
+        }
+
+        let file_content = match tokio::fs::read_to_string(&resolved).await {
             Ok(c) => c,
             Err(e) => return ToolOutput::Done(Err(e.to_string())),
         };
@@ -139,11 +152,21 @@ mod tests {
         ToolContext::new(dir.to_path_buf())
     }
 
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
     fn run_ok(tool: &ReadTool, params: serde_json::Value, ctx: &mut ToolContext) -> String {
-        match tool.execute(&params, ctx) {
-            ToolOutput::Done(Ok(c)) => c,
-            _ => panic!("expected Done(Ok)"),
-        }
+        block_on(async {
+            match tool.execute(&params, ctx).await {
+                ToolOutput::Done(Ok(c)) => c,
+                _ => panic!("expected Done(Ok)"),
+            }
+        })
     }
 
     #[test]
@@ -182,7 +205,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = ReadTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool.execute(&serde_json::json!({"path": "nope.txt"}), &mut ctx);
+        let result = block_on(async { tool.execute(&serde_json::json!({"path": "nope.txt"}), &mut ctx).await });
         assert!(matches!(result, ToolOutput::Done(Err(_))));
     }
 
@@ -191,7 +214,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = ReadTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool.execute(&serde_json::json!({"path": "../etc/passwd"}), &mut ctx);
+        let result = block_on(async { tool.execute(&serde_json::json!({"path": "../etc/passwd"}), &mut ctx).await });
         assert!(matches!(result, ToolOutput::Done(Err(_))));
     }
 }

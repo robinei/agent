@@ -24,6 +24,7 @@ struct EditInput {
     new_text: String,
 }
 
+#[async_trait::async_trait]
 impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -75,7 +76,7 @@ impl Tool for EditTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
+    async fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
         let file_path = params
             .get("file_path")
             .and_then(|v| v.as_str())
@@ -86,7 +87,7 @@ impl Tool for EditTool {
             Err(e) => return ToolOutput::Done(Err(e)),
         };
 
-        let resolved = match resolve_path(&ctx.cwd, file_path) {
+        let resolved = match resolve_path(&ctx.cwd, file_path).await {
             Ok(p) => p,
             Err(e) => return ToolOutput::Done(Err(e)),
         };
@@ -129,7 +130,7 @@ impl Tool for EditTool {
             return ToolOutput::Done(Err("No edits provided".into()));
         }
 
-        let raw = match std::fs::read_to_string(&resolved) {
+        let raw = match tokio::fs::read_to_string(&resolved).await {
             Ok(c) => c,
             Err(e) => return ToolOutput::Done(Err(e.to_string())),
         };
@@ -162,7 +163,7 @@ impl Tool for EditTool {
 
         let pre_snapshot = Some(original.clone());
 
-        if let Err(e) = std::fs::write(&resolved, &content) {
+        if let Err(e) = tokio::fs::write(&resolved, &content).await {
             return ToolOutput::Done(Err(e.to_string()));
         }
 
@@ -201,11 +202,21 @@ mod tests {
         ToolContext::new(dir.to_path_buf())
     }
 
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
     fn run_ok(tool: &EditTool, params: serde_json::Value, ctx: &mut ToolContext) -> String {
-        match tool.execute(&params, ctx) {
-            ToolOutput::Done(Ok(c)) => c,
-            _ => panic!("expected Done(Ok)"),
-        }
+        block_on(async {
+            match tool.execute(&params, ctx).await {
+                ToolOutput::Done(Ok(c)) => c,
+                _ => panic!("expected Done(Ok)"),
+            }
+        })
     }
 
     #[test]
@@ -311,14 +322,17 @@ mod tests {
         fs::write(dir.path().join("test.rs"), "hello world").unwrap();
         let tool = EditTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool.execute(
-            &serde_json::json!({
-                "file_path": "test.rs",
-                "old_text": "zzzzzz",
-                "new_text": "yyyyyy"
-            }),
-            &mut ctx,
-        );
+        let result = block_on(async {
+            tool.execute(
+                &serde_json::json!({
+                    "file_path": "test.rs",
+                    "old_text": "zzzzzz",
+                    "new_text": "yyyyyy"
+                }),
+                &mut ctx,
+            )
+            .await
+        });
         assert!(matches!(result, ToolOutput::Done(Err(_))));
     }
 
@@ -327,14 +341,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = EditTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool.execute(
-            &serde_json::json!({
-                "file_path": "../etc/passwd",
-                "old_text": "root",
-                "new_text": "nope"
-            }),
-            &mut ctx,
-        );
+        let result = block_on(async {
+            tool.execute(
+                &serde_json::json!({
+                    "file_path": "../etc/passwd",
+                    "old_text": "root",
+                    "new_text": "nope"
+                }),
+                &mut ctx,
+            )
+            .await
+        });
         assert!(matches!(result, ToolOutput::Done(Err(_))));
     }
 
@@ -351,14 +368,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = EditTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool.execute(
-            &serde_json::json!({
-                "file_path": "nope.txt",
-                "old_text": "x",
-                "new_text": "y"
-            }),
-            &mut ctx,
-        );
+        let result = block_on(async {
+            tool.execute(
+                &serde_json::json!({
+                    "file_path": "nope.txt",
+                    "old_text": "x",
+                    "new_text": "y"
+                }),
+                &mut ctx,
+            )
+            .await
+        });
         assert!(matches!(result, ToolOutput::Done(Err(_))));
     }
 }

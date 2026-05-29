@@ -238,7 +238,7 @@ pub fn begin_turn(
     AgentState::new_streaming(messages, leaf_id, 0, 0, 0)
 }
 
-fn execute_tool(
+async fn execute_tool(
     tools: &[Box<dyn crate::tools::Tool>],
     name: &str,
     args: &serde_json::Value,
@@ -249,12 +249,11 @@ fn execute_tool(
         None => return Err(format!("Unknown tool '{}'", name)),
     };
 
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.execute(args, ctx))) {
-        Ok(ToolOutput::Done(result)) => result,
-        Ok(ToolOutput::PendingLsp { .. }) => {
+    match tool.execute(args, ctx).await {
+        ToolOutput::Done(result) => result,
+        ToolOutput::PendingLsp { .. } => {
             Err("unexpected PendingLsp from tool that doesn't implement LSP".into())
         }
-        Err(_) => Err(format!("Tool '{}' panicked", name)),
     }
 }
 
@@ -634,54 +633,16 @@ pub fn finish_response(
                 };
 
                 let pre_dirty_len = ctx.lsp_dirty.len();
-                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tool.execute(&call.arguments, ctx)
-                })) {
-                    Ok(output) => output,
-                    Err(_) => {
-                        emit_event(
-                            out,
-                            ServerEvent::ToolResult {
-                                tool: call.name.clone(),
-                                exit: 1,
-                                output: format!("Tool '{}' panicked", call.name),
-                            },
-                        );
-                        let err_msg = make_tool_result_message(
-                            &call.id,
-                            &call.name,
-                            &Err(format!("Tool '{}' panicked", call.name)),
-                        );
-                        let result_msg_id = agent_core::util::generate_entry_id();
-                        write_message_entry(
-                            store,
-                            out,
-                            &result_msg_id,
-                            leaf_id.as_deref(),
-                            &err_msg,
-                        );
-                        leaf_id = Some(result_msg_id);
-                        messages.push(err_msg);
-                        consecutive_failures += 1;
-                        if consecutive_failures >= 3 {
-                            warn!("3 consecutive tool failures for tree {}", tree_id);
-                            emit_notification(
-                                out,
-                                NotificationLevel::Error,
-                                "3 consecutive tool failures, aborting turn".into(),
-                            );
-                            emit_event(
-                                out,
-                                ServerEvent::Done {
-                                    status: "error".into(),
-                                    usage: None,
-                                },
-                            );
-                            return AgentState::Idle;
-                        }
-                        continue;
-                    }
-                };
+                // Phase 3 bridge: block_on for the async tool call in a sync context.
+                // Lazily creates one current_thread runtime shared across all tool calls.
+                static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
+                    std::sync::LazyLock::new(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                    });
+                let result = RUNTIME.block_on(tool.execute(&call.arguments, ctx));
 
                 for path in ctx.lsp_dirty[pre_dirty_len..].iter() {
                     dirty_by_call.push((path.clone(), call.id.clone()));

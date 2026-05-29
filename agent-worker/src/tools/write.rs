@@ -1,12 +1,11 @@
 //! WriteTool — write content to a file.
 
-use std::fs;
-
 use super::{EditRecord, Tool, ToolContext, ToolOutput};
 use agent_core::types::ToolDefinition;
 
 pub struct WriteTool;
 
+#[async_trait::async_trait]
 impl Tool for WriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -31,7 +30,7 @@ impl Tool for WriteTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
+    async fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
         let path_str = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return ToolOutput::Done(Err("Missing required field: path".to_string())),
@@ -44,7 +43,7 @@ impl Tool for WriteTool {
 
         let target = ctx.cwd.join(path_str);
 
-        let cwd_canon = match fs::canonicalize(&ctx.cwd) {
+        let cwd_canon = match tokio::fs::canonicalize(&ctx.cwd).await {
             Ok(p) => p,
             Err(e) => return ToolOutput::Done(Err(format!("Cannot resolve repo root: {}", e))),
         };
@@ -68,16 +67,16 @@ impl Tool for WriteTool {
             )));
         }
 
-        let pre_snapshot = fs::read_to_string(&target).ok();
+        let pre_snapshot = tokio::fs::read_to_string(&target).await.ok();
 
         if let Some(parent) = target.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return ToolOutput::Done(Err(e.to_string()));
             }
         }
 
         let new_content = content.to_string();
-        if let Err(e) = fs::write(&target, &new_content) {
+        if let Err(e) = tokio::fs::write(&target, &new_content).await {
             return ToolOutput::Done(Err(e.to_string()));
         }
 
@@ -104,7 +103,6 @@ impl Tool for WriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -112,11 +110,21 @@ mod tests {
         ToolContext::new(dir.to_path_buf())
     }
 
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
     fn run_ok(tool: &WriteTool, params: serde_json::Value, ctx: &mut ToolContext) -> String {
-        match tool.execute(&params, ctx) {
-            ToolOutput::Done(Ok(c)) => c,
-            _ => panic!("expected Done(Ok)"),
-        }
+        block_on(async {
+            match tool.execute(&params, ctx).await {
+                ToolOutput::Done(Ok(c)) => c,
+                _ => panic!("expected Done(Ok)"),
+            }
+        })
     }
 
     #[test]
@@ -132,7 +140,7 @@ mod tests {
         assert!(result.contains("edit_id:"));
         assert!(result.contains("Written:"));
 
-        let content = fs::read_to_string(dir.path().join("new.txt")).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("new.txt")).unwrap();
         assert_eq!(content, "hello world");
     }
 
@@ -147,22 +155,24 @@ mod tests {
             &mut ctx,
         );
         assert!(result.contains("edit_id:"));
-        let content = fs::read_to_string(dir.path().join("sub/dir/file.txt")).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("sub/dir/file.txt")).unwrap();
         assert_eq!(content, "test");
     }
 
     #[test]
     fn test_write_overwrites() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("existing.txt"), "old").unwrap();
+        std::fs::write(dir.path().join("existing.txt"), "old").unwrap();
         let tool = WriteTool;
         let mut ctx = make_ctx(dir.path());
-        let result = tool.execute(
-            &serde_json::json!({"path": "existing.txt", "content": "new"}),
-            &mut ctx,
-        );
+        let result = block_on(async {
+            tool.execute(
+                &serde_json::json!({"path": "existing.txt", "content": "new"}),
+                &mut ctx,
+            ).await
+        });
         assert!(matches!(result, ToolOutput::Done(Ok(_))));
-        let content = fs::read_to_string(dir.path().join("existing.txt")).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("existing.txt")).unwrap();
         assert_eq!(content, "new");
     }
 }

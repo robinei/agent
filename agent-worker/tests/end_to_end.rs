@@ -196,7 +196,8 @@ fn worker_round_trip() {
 
     // 11. Tree data.jsonl should contain the user message and assistant message
     let store = agent_worker::store::Store::new(agent_dir, tree_id);
-    let entries = store.read_all_entries().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let entries = rt.block_on(store.read_all_entries()).unwrap();
     let has_user = entries.iter().any(|e| {
         matches!(
             e,

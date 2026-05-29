@@ -38,7 +38,7 @@ pub struct ToolContext {
     pub edit_store: EditStore,
     pub stop: Arc<AtomicBool>,
     pub lsp_dirty: Vec<PathBuf>,
-    pub lsp_clients: HashMap<String, crate::lsp_client::LspClient>,
+
 }
 
 impl ToolContext {
@@ -48,7 +48,7 @@ impl ToolContext {
             edit_store: EditStore::new(),
             stop: Arc::new(AtomicBool::new(false)),
             lsp_dirty: Vec::new(),
-            lsp_clients: HashMap::new(),
+
         }
     }
 }
@@ -101,7 +101,7 @@ impl EditStore {
 ///
 /// Tools are async, Send, and use tokio::fs / tokio::process.
 #[async_trait::async_trait]
-pub trait Tool: Send {
+pub trait Tool: Send + Sync {
     /// Returns the tool's JSON Schema definition (sent to the LLM).
     fn definition(&self) -> ToolDefinition;
 
@@ -139,14 +139,15 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
 ///
 /// Returns `None` if the resolved path is outside `cwd` (prevents
 /// directory traversal attacks / accidental escapes).
-pub fn resolve_path(cwd: &Path, requested: &str) -> Result<std::path::PathBuf, String> {
+pub async fn resolve_path(cwd: &Path, requested: &str) -> Result<std::path::PathBuf, String> {
     let joined = if requested.is_empty() {
         cwd.to_path_buf()
     } else {
         cwd.join(requested)
     };
-    let cwd_canonical =
-        std::fs::canonicalize(cwd).map_err(|e| format!("Cannot resolve repo root: {}", e))?;
+    let cwd_canonical = tokio::fs::canonicalize(cwd)
+        .await
+        .map_err(|e| format!("Cannot resolve repo root: {}", e))?;
 
     // Lexical escape check: resolves `..` without filesystem access so that
     // traversal attempts against non-existent targets still get the right error.
@@ -159,7 +160,8 @@ pub fn resolve_path(cwd: &Path, requested: &str) -> Result<std::path::PathBuf, S
     }
 
     // Canonicalize to resolve symlinks (also confirms the path exists).
-    let canonical = std::fs::canonicalize(&joined)
+    let canonical = tokio::fs::canonicalize(&joined)
+        .await
         .map_err(|_| format!("Path '{}' does not exist", requested))?;
 
     // Re-check after symlink resolution to prevent symlink escapes.
@@ -234,11 +236,18 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
     fn test_resolve_path_within_cwd() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("test.txt"), "hello").unwrap();
-        let resolved = resolve_path(dir.path(), "test.txt");
+        let resolved = block_on(resolve_path(dir.path(), "test.txt"));
         assert!(resolved.is_ok());
         assert!(resolved.unwrap().ends_with("test.txt"));
     }
@@ -246,7 +255,7 @@ mod tests {
     #[test]
     fn test_resolve_path_escape_rejected() {
         let dir = TempDir::new().unwrap();
-        let resolved = resolve_path(dir.path(), "../etc/passwd");
+        let resolved = block_on(resolve_path(dir.path(), "../etc/passwd"));
         assert!(resolved.is_err());
         assert!(resolved.unwrap_err().contains("outside the repo root"));
     }
@@ -254,7 +263,7 @@ mod tests {
     #[test]
     fn test_resolve_path_not_found() {
         let dir = TempDir::new().unwrap();
-        let resolved = resolve_path(dir.path(), "nonexistent.txt");
+        let resolved = block_on(resolve_path(dir.path(), "nonexistent.txt"));
         assert!(resolved.is_err());
         assert!(resolved.unwrap_err().contains("does not exist"));
     }

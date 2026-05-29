@@ -1,22 +1,11 @@
 use std::cell::RefCell;
-use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use log::warn;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use agent_core::config::agent_dir;
 use agent_core::types::{Entry, TreeHeader, TreeMeta};
-
-/// Helper to run a small async future synchronously inside a sync context.
-/// Creates a fresh `current_thread` runtime for each call. Only use this for
-/// the bridge phase (Phase 1); the worker loop becomes async in Phase 3.
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(f)
-}
 
 // ── Error type ──
 
@@ -40,6 +29,9 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 ///
 /// Each worker owns exactly one tree, identified at construction.
 /// Metadata is cached: `None` = uncached, `Some(None)` = confirmed absent, `Some(Some(_))` = loaded.
+///
+/// All I/O is async (tokio::fs). Store is `!Send` (RefCell cache) but that's fine:
+/// it lives inside the `block_on` main loop where `!Send` state is permitted.
 #[derive(Debug)]
 pub struct Store {
     base_dir: PathBuf,
@@ -78,19 +70,21 @@ impl Store {
 
     // ── Tree metadata I/O ──
 
-    fn load_tree_meta(&self) -> Result<Option<TreeMeta>> {
-        block_on(agent_core::tree_io::read_meta(&self.base_dir, &self.tree_id))
+    async fn load_tree_meta(&self) -> Result<Option<TreeMeta>> {
+        agent_core::tree_io::read_meta(&self.base_dir, &self.tree_id)
+            .await
             .map_err(|e| StoreError::Io(std::io::Error::other(e)))
     }
 
-    pub fn save_tree_meta(&self, meta: &TreeMeta) -> Result<()> {
-        block_on(agent_core::tree_io::write_meta(&self.base_dir, meta))
+    pub async fn save_tree_meta(&self, meta: &TreeMeta) -> Result<()> {
+        agent_core::tree_io::write_meta(&self.base_dir, meta)
+            .await
             .map_err(|e| StoreError::Io(std::io::Error::other(e)))?;
         *self.meta_cache.borrow_mut() = Some(Some(meta.clone()));
         Ok(())
     }
 
-    pub fn get_tree(&self) -> Result<TreeMeta> {
+    pub async fn get_tree(&self) -> Result<TreeMeta> {
         // Check cache first
         if let Some(Some(ref meta)) = *self.meta_cache.borrow() {
             return Ok(meta.clone());
@@ -100,7 +94,7 @@ impl Store {
             return Err(StoreError::NotFound(self.tree_id.clone()));
         }
         // Cache miss: load from disk and cache the result.
-        match self.load_tree_meta()? {
+        match self.load_tree_meta().await? {
             Some(meta) => {
                 *self.meta_cache.borrow_mut() = Some(Some(meta.clone()));
                 Ok(meta)
@@ -114,10 +108,10 @@ impl Store {
 
     // ── Tree file (JSONL) I/O ──
 
-    pub fn create_tree_file(&self) -> Result<()> {
+    pub async fn create_tree_file(&self) -> Result<()> {
         let path = self.jsonl_path();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
         let header = TreeHeader {
             kind: "meta".to_string(),
@@ -126,32 +120,33 @@ impl Store {
         };
         let mut line = serde_json::to_string(&header)?;
         line.push('\n');
-        std::fs::write(&path, line.as_bytes())?;
+        tokio::fs::write(&path, line.as_bytes()).await?;
         Ok(())
     }
 
-    pub fn append_entry(&self, entry: &Entry) -> Result<()> {
+    pub async fn append_entry(&self, entry: &Entry) -> Result<()> {
         let path = self.jsonl_path();
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)?;
+            .open(&path)
+            .await?;
         let mut line = serde_json::to_string(entry)?;
         line.push('\n');
-        file.write_all(line.as_bytes())?;
-        file.sync_all()?;
+        file.write_all(line.as_bytes()).await?;
+        file.sync_all().await?;
         Ok(())
     }
 
-    pub fn read_all_entries(&self) -> Result<Vec<Entry>> {
+    pub async fn read_all_entries(&self) -> Result<Vec<Entry>> {
         let path = self.jsonl_path();
-        let file = std::fs::File::open(&path)?;
-        let reader = std::io::BufReader::new(file);
+        let file = tokio::fs::File::open(&path).await?;
+        let reader = BufReader::new(file);
         let mut lines = reader.lines();
 
         // Line 1: header (skip, but validate)
-        match lines.next() {
-            Some(Ok(line)) => {
+        match lines.next_line().await? {
+            Some(line) => {
                 if let Ok(header) = serde_json::from_str::<TreeHeader>(&line) {
                     if header.kind != "meta" {
                         warn!(
@@ -161,14 +156,12 @@ impl Store {
                     }
                 }
             }
-            Some(Err(e)) => return Err(StoreError::Io(e)),
             None => return Ok(Vec::new()),
         }
 
         // Remaining lines: entries
         let mut entries = Vec::new();
-        for line in lines {
-            let line = line?;
+        while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
@@ -198,12 +191,20 @@ mod tests {
         (store, dir)
     }
 
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
     #[test]
     fn test_create_tree_writes_subdir() {
         let tree_id = "subdir-001";
         let (store, dir) = make_store("subdir", tree_id);
 
-        store.create_tree_file().unwrap();
+        block_on(store.create_tree_file()).unwrap();
 
         let meta = TreeMeta {
             id: tree_id.to_string(),
@@ -215,7 +216,7 @@ mod tests {
             leaf_id: None,
             sandbox: TreeSandbox::default(),
         };
-        store.save_tree_meta(&meta).unwrap();
+        block_on(store.save_tree_meta(&meta)).unwrap();
 
         let tree_dir = dir.path().join("trees").join(tree_id);
         assert!(
@@ -232,9 +233,9 @@ mod tests {
     fn test_create_and_read_tree() {
         let (store, _dir) = make_store("create_read", "test-001");
 
-        store.create_tree_file().unwrap();
+        block_on(store.create_tree_file()).unwrap();
 
-        let entries = store.read_all_entries().unwrap();
+        let entries = block_on(store.read_all_entries()).unwrap();
         assert_eq!(entries.len(), 0);
     }
 
@@ -242,14 +243,14 @@ mod tests {
     fn test_append_and_read_entries() {
         let (store, _dir) = make_store("append_read", "test-002");
 
-        store.create_tree_file().unwrap();
+        block_on(store.create_tree_file()).unwrap();
 
         let entry = Entry::SessionStart {
             id: "00000001".into(),
             parent_id: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
         };
-        store.append_entry(&entry).unwrap();
+        block_on(store.append_entry(&entry)).unwrap();
 
         let msg = Message {
             role: MessageRole::User,
@@ -268,9 +269,9 @@ mod tests {
             timestamp: "2026-01-01T00:00:01Z".into(),
             message: msg,
         };
-        store.append_entry(&entry2).unwrap();
+        block_on(store.append_entry(&entry2)).unwrap();
 
-        let entries = store.read_all_entries().unwrap();
+        let entries = block_on(store.read_all_entries()).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id(), "00000001");
         assert_eq!(entries[1].id(), "00000002");
@@ -292,13 +293,13 @@ mod tests {
             sandbox: TreeSandbox::default(),
         };
 
-        store.save_tree_meta(&meta).unwrap();
+        block_on(store.save_tree_meta(&meta)).unwrap();
 
-        let loaded = store.load_tree_meta().unwrap().unwrap();
+        let loaded = block_on(store.load_tree_meta()).unwrap().unwrap();
         assert_eq!(loaded.id, tree_id);
         assert_eq!(loaded.title.unwrap(), "Test Tree");
 
-        let cached = store.get_tree().unwrap();
+        let cached = block_on(store.get_tree()).unwrap();
         assert_eq!(cached.created_at, 1000);
     }
 
@@ -307,7 +308,7 @@ mod tests {
         let tree_id = "test-004";
         let (store, _dir) = make_store("header_immutable", tree_id);
 
-        store.create_tree_file().unwrap();
+        block_on(store.create_tree_file()).unwrap();
 
         // Header should contain only structural fields
         let content = std::fs::read_to_string(store.jsonl_path()).unwrap();

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::time;
 
 use super::{Tool, ToolContext, ToolOutput};
 use agent_core::types::ToolDefinition;
@@ -114,10 +114,27 @@ impl Tool for BashTool {
         };
 
         // Wait for the child with timeout, checking ctx.stop for cooperative cancel.
+        let timeout_sleep = tokio::time::sleep(timeout_dur);
+        tokio::pin!(timeout_sleep);
         let exit = loop {
             let sleep = tokio::time::sleep(Duration::from_millis(50));
             tokio::select! {
-                status = child.wait() => break (status.ok(), None),
+                status = child.wait() => {
+                    let ok: Option<std::process::ExitStatus> = status.ok();
+                    let none: Option<&str> = None;
+                    break (ok, none);
+                },
+                _ = &mut timeout_sleep => {
+                    // Timeout reached — kill the child via kill_on_drop
+                    drop(child);
+                    let _ = read_stdout.await;
+                    let _ = read_stderr.await;
+                    let out = stdout_buf.lock().await.clone();
+                    let err = stderr_buf.lock().await.clone();
+                    return ToolOutput::Done(Ok(Self::combine_output(
+                        &out, &err, None, Some("Timeout"), timeout_secs,
+                    )));
+                },
                 _ = sleep => {
                     if stop.load(Ordering::Relaxed) {
                         // Drop kills the child via kill_on_drop(true)

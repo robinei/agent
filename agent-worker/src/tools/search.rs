@@ -140,6 +140,7 @@ fn truncate_snippet(s: &str, max_len: usize) -> String {
     }
 }
 
+#[async_trait::async_trait]
 impl Tool for SearchMessagesTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -171,7 +172,7 @@ impl Tool for SearchMessagesTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, _ctx: &mut ToolContext) -> ToolOutput {
+    async fn execute(&self, params: &serde_json::Value, _ctx: &mut ToolContext) -> ToolOutput {
         let query = match params.get("query").and_then(|v| v.as_str()) {
             Some(q) => q,
             None => return ToolOutput::Done(Err("Missing required field: query".to_string())),
@@ -184,9 +185,16 @@ impl Tool for SearchMessagesTool {
             .map(|v| (v as usize).clamp(1, 100))
             .unwrap_or(20);
 
-        let results = match Self::search_trees(query, tree_id, limit) {
-            Ok(r) => r,
-            Err(e) => return ToolOutput::Done(Err(format!("Search failed: {}", e))),
+        let query_owned = query.to_string();
+        let tree_id_owned = tree_id.map(|s| s.to_string());
+        let results = match tokio::task::spawn_blocking(move || {
+            Self::search_trees(&query_owned, tree_id_owned.as_deref(), limit)
+        })
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return ToolOutput::Done(Err(format!("Search failed: {}", e))),
+            Err(e) => return ToolOutput::Done(Err(format!("Search task failed: {}", e))),
         };
 
         if results.is_empty() {
@@ -256,16 +264,26 @@ mod tests {
         ToolContext::new(PathBuf::from("/tmp"))
     }
 
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
     fn run_ok(
         tool: &SearchMessagesTool,
         params: serde_json::Value,
         ctx: &mut ToolContext,
     ) -> String {
-        match tool.execute(&params, ctx) {
-            ToolOutput::Done(Ok(c)) => c,
-            ToolOutput::Done(Err(e)) => panic!("search failed: {}", e),
-            _ => panic!("expected Done"),
-        }
+        block_on(async {
+            match tool.execute(&params, ctx).await {
+                ToolOutput::Done(Ok(c)) => c,
+                ToolOutput::Done(Err(e)) => panic!("search failed: {}", e),
+                _ => panic!("expected Done"),
+            }
+        })
     }
 
     #[test]
@@ -283,7 +301,8 @@ mod tests {
         with_temp_agent_dir("find", |path| {
             let tree_id = "search-test-001";
             let store = Store::new(path.clone(), tree_id);
-            store.create_tree_file().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(store.create_tree_file()).unwrap();
 
             let msg = Message {
                 role: MessageRole::User,
@@ -302,7 +321,7 @@ mod tests {
                 timestamp: "2026-01-01T00:00:00Z".into(),
                 message: msg,
             };
-            store.append_entry(&entry).unwrap();
+            rt.block_on(store.append_entry(&entry)).unwrap();
 
             let tool = SearchMessagesTool;
             let mut ctx = make_ctx();
@@ -317,7 +336,8 @@ mod tests {
         with_temp_agent_dir("by_tree", |path| {
             let tree_id = "search-test-002";
             let store = Store::new(path.clone(), tree_id);
-            store.create_tree_file().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(store.create_tree_file()).unwrap();
 
             let msg = Message {
                 role: MessageRole::User,
@@ -336,7 +356,7 @@ mod tests {
                 timestamp: "2026-01-01T00:00:00Z".into(),
                 message: msg,
             };
-            store.append_entry(&entry).unwrap();
+            rt.block_on(store.append_entry(&entry)).unwrap();
 
             let tool = SearchMessagesTool;
             let mut ctx = make_ctx();

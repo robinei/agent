@@ -15,40 +15,53 @@ pub struct ContextFile {
     pub depth: usize,
 }
 
+/// Check if a path exists (async).
+async fn path_exists(path: &Path) -> bool {
+    tokio::fs::metadata(path).await.is_ok()
+}
+
+/// Check if a path is a directory (async).
+async fn is_dir(path: &Path) -> bool {
+    tokio::fs::metadata(path).await.map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// Read a file to string if it exists and is non-empty, returning None otherwise.
+async fn read_if_exists(path: &Path) -> Option<String> {
+    if !path_exists(path).await {
+        return None;
+    }
+    match tokio::fs::read_to_string(path).await {
+        Ok(c) if !c.trim().is_empty() => Some(c),
+        _ => None,
+    }
+}
+
 /// Walk up from `cwd` to root, collecting context files.
 /// The closest file to cwd comes last (highest precedence).
-pub fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
+pub async fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     let mut files = Vec::new();
 
     // Check global context files first (~/.agent/AGENTS.md and ~/.agent/skills/*/SKILL.md)
     let global_path = agent_dir.join("AGENTS.md");
-    if global_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&global_path) {
-            if !content.trim().is_empty() {
-                files.push(ContextFile {
-                    path: global_path,
-                    content,
-                    depth: usize::MAX,
-                });
-            }
-        }
+    if let Some(content) = read_if_exists(&global_path).await {
+        files.push(ContextFile {
+            path: global_path,
+            content,
+            depth: usize::MAX,
+        });
     }
 
     let global_skills_dir = agent_dir.join("skills");
-    if global_skills_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&global_skills_dir) {
-            for entry in entries.flatten() {
+    if is_dir(&global_skills_dir).await {
+        if let Ok(mut entries) = tokio::fs::read_dir(&global_skills_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
                 let skill_md = entry.path().join("SKILL.md");
-                if skill_md.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                        if !content.trim().is_empty() {
-                            files.push(ContextFile {
-                                path: skill_md,
-                                content,
-                                depth: usize::MAX,
-                            });
-                        }
-                    }
+                if let Some(content) = read_if_exists(&skill_md).await {
+                    files.push(ContextFile {
+                        path: skill_md,
+                        content,
+                        depth: usize::MAX,
+                    });
                 }
             }
         }
@@ -61,37 +74,29 @@ pub fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     for (depth, dir) in ancestors.iter().enumerate() {
         for name in &["AGENTS.md", "CLAUDE.md"] {
             let path = dir.join(name);
-            if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if !content.trim().is_empty() {
-                        files.push(ContextFile {
-                            path,
-                            content,
-                            depth,
-                        });
-                    }
-                }
+            if let Some(content) = read_if_exists(&path).await {
+                files.push(ContextFile {
+                    path,
+                    content,
+                    depth,
+                });
             }
         }
 
         // Also check .agent/skills/ directories
         let skills_dir = dir.join(".agent").join("skills");
-        if skills_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&skills_dir) {
-                for entry in entries.flatten() {
+        if is_dir(&skills_dir).await {
+            if let Ok(mut entries) = tokio::fs::read_dir(&skills_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
                     let skill_path = entry.path();
-                    if skill_path.is_dir() {
+                    if is_dir(&skill_path).await {
                         let skill_md = skill_path.join("SKILL.md");
-                        if skill_md.exists() {
-                            if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                                if !content.trim().is_empty() {
-                                    files.push(ContextFile {
-                                        path: skill_md,
-                                        content,
-                                        depth,
-                                    });
-                                }
-                            }
+                        if let Some(content) = read_if_exists(&skill_md).await {
+                            files.push(ContextFile {
+                                path: skill_md,
+                                content,
+                                depth,
+                            });
                         }
                     }
                 }
@@ -135,10 +140,18 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
     #[test]
     fn test_load_context_files_none() {
         let dir = TempDir::new().unwrap();
-        let files = load_context_files(dir.path(), dir.path());
+        let files = block_on(load_context_files(dir.path(), dir.path()));
         assert!(files.is_empty());
     }
 
@@ -147,7 +160,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let agent_dir = TempDir::new().unwrap();
         fs::write(dir.path().join("AGENTS.md"), "# Project rules\nUse Rust.").unwrap();
-        let files = load_context_files(dir.path(), agent_dir.path());
+        let files = block_on(load_context_files(dir.path(), agent_dir.path()));
         assert_eq!(files.len(), 1);
         assert!(files[0].content.contains("Use Rust."));
     }
@@ -162,7 +175,7 @@ mod tests {
         // Parent has AGENTS.md, cwd doesn't
         fs::write(dir.path().join("AGENTS.md"), "# Root rules\n").unwrap();
 
-        let files = load_context_files(&subdir, agent_dir.path());
+        let files = block_on(load_context_files(&subdir, agent_dir.path()));
         assert!(!files.is_empty(), "Should find AGENTS.md in parent dir");
     }
 

@@ -38,6 +38,16 @@ pub enum LlmResponse {
     Error { id: u64, message: String },
 }
 
+impl LlmResponse {
+    pub fn id(&self) -> u64 {
+        match self {
+            LlmResponse::Chunk { id, .. } => *id,
+            LlmResponse::Done { id, .. } => *id,
+            LlmResponse::Error { id, .. } => *id,
+        }
+    }
+}
+
 // Envelope for worker stdout → server
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "ch", content = "msg", rename_all = "snake_case")]

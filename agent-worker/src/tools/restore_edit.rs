@@ -1,7 +1,5 @@
 //! RestoreEditTool — undo or redo previously recorded edits.
 
-use std::fs;
-
 use super::util::{apply_edit, count_fuzzy_matches};
 use super::{resolve_path, EditRecord, Tool, ToolContext, ToolOutput};
 use agent_core::types::ToolDefinition;
@@ -10,11 +8,11 @@ use log::warn;
 pub struct RestoreEditTool;
 
 /// Restore a file to its pre-edit state (or delete it if it didn't exist).
-fn restore_pre(resolved: &std::path::Path, record: &EditRecord) -> Result<(), std::io::Error> {
+async fn restore_pre(resolved: &std::path::Path, record: &EditRecord) -> Result<(), std::io::Error> {
     match &record.pre_snapshot {
-        Some(content) => fs::write(resolved, content),
+        Some(content) => tokio::fs::write(resolved, content).await,
         None => {
-            let _ = fs::remove_file(resolved);
+            let _ = tokio::fs::remove_file(resolved).await;
             Ok(())
         }
     }
@@ -27,6 +25,7 @@ fn restore_pre_msg(record: &EditRecord, id: u64) -> String {
     }
 }
 
+#[async_trait::async_trait]
 impl Tool for RestoreEditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -60,7 +59,7 @@ impl Tool for RestoreEditTool {
         }
     }
 
-    fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
+    async fn execute(&self, params: &serde_json::Value, ctx: &mut ToolContext) -> ToolOutput {
         let id = match params.get("id").and_then(|v| v.as_u64()) {
             Some(i) => i,
             None => {
@@ -78,7 +77,7 @@ impl Tool for RestoreEditTool {
             None => return ToolOutput::Done(Err(format!("No edit with id {} found", id))),
         };
 
-        let resolved = match resolve_path(&ctx.cwd, &record.file_path.to_string_lossy()) {
+        let resolved = match resolve_path(&ctx.cwd, &record.file_path.to_string_lossy()).await {
             Ok(p) => p,
             Err(e) => return ToolOutput::Done(Err(e)),
         };
@@ -88,7 +87,7 @@ impl Tool for RestoreEditTool {
                 if record.reverted {
                     return ToolOutput::Done(Err(format!("Edit {} has already been reverted", id)));
                 }
-                if let Err(e) = restore_pre(&resolved, &record) {
+                if let Err(e) = restore_pre(&resolved, &record).await {
                     return ToolOutput::Done(Err(e.to_string()));
                 }
                 if let Some(r) = ctx.edit_store.get_mut(id) {
@@ -112,7 +111,7 @@ impl Tool for RestoreEditTool {
                         c
                     }
                 };
-                if let Err(e) = std::fs::write(&resolved, &content) {
+                if let Err(e) = tokio::fs::write(&resolved, &content).await {
                     return ToolOutput::Done(Err(e.to_string()));
                 }
                 ToolOutput::Done(Ok(format!(
@@ -137,7 +136,7 @@ impl Tool for RestoreEditTool {
                             c
                         }
                     };
-                    if let Err(e) = std::fs::write(&resolved, &content) {
+                    if let Err(e) = tokio::fs::write(&resolved, &content).await {
                         return ToolOutput::Done(Err(e.to_string()));
                     }
                     if let Some(r) = ctx.edit_store.get_mut(id) {
@@ -146,7 +145,7 @@ impl Tool for RestoreEditTool {
                     return ToolOutput::Done(Ok(format!("Re-applied (write) for edit {}", id)));
                 }
 
-                let current = match std::fs::read_to_string(&resolved) {
+                let current = match tokio::fs::read_to_string(&resolved).await {
                     Ok(c) => c,
                     Err(e) => return ToolOutput::Done(Err(e.to_string())),
                 };
@@ -170,7 +169,7 @@ impl Tool for RestoreEditTool {
                         Err(e) => return ToolOutput::Done(Err(e)),
                     }
                 }
-                if let Err(e) = std::fs::write(&resolved, &content) {
+                if let Err(e) = tokio::fs::write(&resolved, &content).await {
                     return ToolOutput::Done(Err(e.to_string()));
                 }
                 if let Some(r) = ctx.edit_store.get_mut(id) {
@@ -185,7 +184,7 @@ impl Tool for RestoreEditTool {
                 }
 
                 if record.edits.is_empty() {
-                    if let Err(e) = restore_pre(&resolved, &record) {
+                    if let Err(e) = restore_pre(&resolved, &record).await {
                         return ToolOutput::Done(Err(e.to_string()));
                     }
                     if let Some(r) = ctx.edit_store.get_mut(id) {
@@ -194,7 +193,7 @@ impl Tool for RestoreEditTool {
                     return ToolOutput::Done(Ok(restore_pre_msg(&record, id)));
                 }
 
-                let current = match std::fs::read_to_string(&resolved) {
+                let current = match tokio::fs::read_to_string(&resolved).await {
                     Ok(c) => c,
                     Err(e) => return ToolOutput::Done(Err(e.to_string())),
                 };
@@ -220,7 +219,7 @@ impl Tool for RestoreEditTool {
                     }
                 }
                 if failed {
-                    if let Err(e) = restore_pre(&resolved, &record) {
+                    if let Err(e) = restore_pre(&resolved, &record).await {
                         return ToolOutput::Done(Err(e.to_string()));
                     }
                     if let Some(r) = ctx.edit_store.get_mut(id) {
@@ -233,7 +232,7 @@ impl Tool for RestoreEditTool {
                         id, id
                     )))
                 } else {
-                    if let Err(e) = std::fs::write(&resolved, &content) {
+                    if let Err(e) = tokio::fs::write(&resolved, &content).await {
                         return ToolOutput::Done(Err(e.to_string()));
                     }
                     if let Some(r) = ctx.edit_store.get_mut(id) {

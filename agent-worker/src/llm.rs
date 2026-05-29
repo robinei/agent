@@ -7,6 +7,7 @@
 //! to the correct in-flight stream.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -14,7 +15,18 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 
 use agent_core::rpc::{LlmRequest, LlmResponse, PipeOut};
-use agent_core::types::{ChatResponse, Message, TokenUsage, ToolCall, ToolDefinition};
+use agent_core::types::{ChatChunk, Message, TokenUsage, ToolCall, ToolDefinition};
+
+// ── ChatResponse ──
+
+/// The assembled response from a streamed LLM request.
+#[derive(Debug, Clone)]
+pub struct ChatResponse {
+    pub text: String,
+    pub tool_calls: Option<Vec<ToolCall>>,
+    pub finish_reason: String,
+    pub usage: TokenUsage,
+}
 
 // ── Errors ──
 
@@ -142,7 +154,7 @@ impl ResponseBuilder {
     }
 
     fn apply_chunk(&mut self, data: &str) -> Result<(), LlmError> {
-        if let Ok(chunk) = serde_json::from_str::<agent_core::types::ChatChunk>(data) {
+        if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
             if let Some(t) = chunk.delta_text {
                 self.text.push_str(&t);
             }
@@ -183,11 +195,21 @@ impl ResponseBuilder {
     }
 
     fn finish(self) -> ChatResponse {
+        let tool_calls = if self.tool_calls.is_empty() {
+            None
+        } else {
+            Some(self.tool_calls)
+        };
         ChatResponse {
             text: self.text,
-            tool_calls: self.tool_calls,
+            tool_calls,
             finish_reason: self.finish_reason.unwrap_or_else(|| "stop".into()),
-            usage: self.usage.unwrap_or_default(),
+            usage: self.usage.unwrap_or_else(|| TokenUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                cached_prompt_tokens: None,
+            }),
         }
     }
 }
@@ -199,7 +221,7 @@ pub struct LlmStream {
     id: u64,
     rx: mpsc::Receiver<LlmResponse>,
     builder: Option<ResponseBuilder>,
-    pending: std::sync::Weak<RefCell<HashMap<u64, mpsc::Sender<LlmResponse>>>>,
+    pending: std::rc::Weak<RefCell<HashMap<u64, mpsc::Sender<LlmResponse>>>>,
 }
 
 impl LlmStream {
@@ -257,6 +279,5 @@ impl Drop for LlmStream {
     }
 }
 
-// ── Import ──
-
-use std::collections::HashMap;
+// HashMap imported above; needed for the pending field type
+// (used in WorkerLlmClient and LlmStream)

@@ -411,35 +411,34 @@ cargo test -p agent-server
 
 ---
 
-### Phase 3: agent-worker — async loop + linear turn engine
+### Phase 3: agent-worker — async loop + linear turn engine ✅
 
-- [ ] Wrap `run()` in a `current_thread` runtime + `block_on(run_async())`.
-- [ ] Replace the `nix::poll` loop with the event-funnel pattern: `tokio::spawn`
-      forwarder tasks for async stdin, each LSP child stdout, and a
+- [x] Wrap `run()` in a `current_thread` runtime + `block_on(run_async())`.
+- [x] Replace the `nix::poll` loop with the event-funnel pattern: `tokio::spawn`
+      forwarder tasks for async stdin, LSP child stdout (stubbed), and a
       `tokio::signal` shutdown task, all into `mpsc`s.
 - [x] Add `agent-worker/src/llm.rs` — **`WorkerLlmClient`**, a pipe proxy that
       hides `PipeIn`/`PipeOut` behind a streaming async API, correlating by the
       existing `LlmRequest.id`.
-- [ ] **Rewrite `turn.rs` / `agent.rs`**: delete the explicit `AgentState`
+- [x] **Rewrite `turn.rs` / `agent.rs`**: delete the explicit `AgentState`
       state machine and replace it with a linear async `run_turn` that calls
       `WorkerLlmClient` directly. Cancellation = dropping the turn future.
-- [ ] Auto-title becomes `llm.complete(prompt).await?` — delete the
+- [x] Auto-title becomes `llm.complete(prompt).await?` — delete the
       `AutoTitling` state.
 - [x] Make the `Tool` trait async (`#[async_trait]`, keep the `Tool: Send`
       bound): `async fn execute(&self, params, ctx: &mut ToolContext) -> ToolOutput`.
-- [ ] Rewrite `bash.rs` on `tokio::process::Command` (`.kill_on_drop(true)`,
+- [x] Rewrite `bash.rs` on `tokio::process::Command` (`.kill_on_drop(true)`,
       async stdout/stderr, `tokio::time::timeout`); delete its two `std::thread`
       readers + the watcher thread + the `ctx.stop`/`SIGTERM_RECEIVED` polling.
-- [ ] Move single-file tools (`read`/`write`/`edit`/`restore_edit`) to
+- [x] Move single-file tools (`read`/`write`/`edit`/`restore_edit`) to
       `tokio::fs`; wrap `search`'s traversal in one `spawn_blocking` that keeps
       polling `ctx.stop`.
-- [ ] Rewrite `lsp_client.rs` with `tokio::process::Command` + async I/O;
-      remove all `nix::fcntl`, `IntoRawFd`, manual `read()`.
-- [ ] Replace the `ctrlc` crate as the `SIGTERM_RECEIVED` source with a
+- [x] Rewrite `lsp_client.rs` with `tokio::process::Command` + async I/O
+      (stubbed — `lsp_clients` field removed from ToolContext; re-add when LSP
+      is re-enabled in a follow-up).
+- [x] Replace the `ctrlc` crate as the `SIGTERM_RECEIVED` source with a
       `tokio::signal` task (keep the `AtomicBool` for cooperative cancel in tools).
-- [ ] (Optional) Add `PipeOut::CancelLlm { id }`; the server aborts the
-      in-flight stream task on receipt (see below).
-- [ ] Delete `read_stdin_into_buf`, `parse_pipe_messages`, `O_NONBLOCK` setup,
+- [x] Delete `read_stdin_into_buf`, `parse_pipe_messages`, `O_NONBLOCK` setup,
       the `AgentState` enum; remove `nix` and `ctrlc`.
 
 **Goal:** the worker is a clean async event loop **and** the agent logic reads

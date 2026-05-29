@@ -23,19 +23,11 @@ pub enum WorkerError {
     MissingTreeId,
     #[error("--tree-id is required")]
     TreeIdRequired,
-    #[error("fcntl error: {0}")]
-    Fcntl(#[source] nix::Error),
     #[error("{0}")]
     Other(String),
 }
 
 pub type WorkerResult<T> = std::result::Result<T, WorkerError>;
-
-impl From<nix::Error> for WorkerError {
-    fn from(e: nix::Error) -> Self {
-        WorkerError::Fcntl(e)
-    }
-}
 
 #[derive(Deserialize)]
 struct ConfigEnvelope {
@@ -70,9 +62,9 @@ pub fn parse_tree_id() -> WorkerResult<String> {
     tree_id.ok_or(WorkerError::TreeIdRequired)
 }
 
-pub fn resolve_repo_path(store: &Store) -> std::path::PathBuf {
+pub async fn resolve_repo_path(store: &Store) -> std::path::PathBuf {
     let tree_id = store.tree_id();
-    match store.get_tree() {
+    match store.get_tree().await {
         Ok(meta) => {
             if let Some(repo_path) = &meta.repo_path {
                 if repo_path.exists() {
@@ -161,7 +153,7 @@ pub fn send_llm_request(
     }
 }
 
-pub fn write_message_entry(
+pub async fn write_message_entry(
     store: &Store,
     out: &mut BufWriter<std::io::Stdout>,
     entry_id: &str,
@@ -175,13 +167,13 @@ pub fn write_message_entry(
         timestamp: chrono::Utc::now().to_rfc3339(),
         message: message.clone(),
     };
-    if let Err(e) = store.append_entry(&entry) {
+    if let Err(e) = store.append_entry(&entry).await {
         error!("Failed to append message entry for tree {}: {}", tree_id, e);
     }
     emit_event(out, ServerEvent::Entry(entry));
 }
 
-pub fn write_session_end(
+pub async fn write_session_end(
     store: &Store,
     out: &mut BufWriter<std::io::Stdout>,
     status: SessionStatus,
@@ -197,7 +189,7 @@ pub fn write_session_end(
         status,
         continuation_brief,
     };
-    if let Err(e) = store.append_entry(&entry) {
+    if let Err(e) = store.append_entry(&entry).await {
         error!("Failed to write session_end for tree {}: {}", tree_id, e);
     }
     emit_event(out, ServerEvent::Entry(entry));
