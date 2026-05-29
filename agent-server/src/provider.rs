@@ -42,15 +42,28 @@ pub trait Provider: Send {
     /// Parse a single SSE line/event into a StreamEvent.
     fn parse_stream_event(&mut self, line: &str) -> StreamEvent;
 
-    /// Non-streaming chat completions call (blocks).
-    fn chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatResponse>;
+    /// Full URL for the chat completions endpoint (e.g. "https://api.openai.com/v1/chat/completions").
+    fn url(&self) -> String;
 
-    /// HTTP endpoint path (e.g. "/chat/completions" or "/v1/messages").
-    fn endpoint_path(&self) -> &str;
+    /// Parse a non-streaming chat response JSON body into a ChatResponse.
+    fn parse_chat_response(&self, data: &serde_json::Value) -> Result<ChatResponse>;
 
-    /// One or more HTTP header lines to include in the request (e.g.
-    /// "Authorization: Bearer {key}\r\n").
-    fn auth_header_lines(&self) -> String;
+    /// Return the endpoint path component (e.g. "/v1/chat/completions").
+    /// Used by the legacy `llm_handler` — will be removed in Phase 2.
+    fn endpoint_path(&self) -> String {
+        self.url()
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(_, p)| format!("/{}", p))
+            .unwrap_or_default()
+    }
+
+    /// Return HTTP auth header lines (without trailing \r\n).
+    /// Used by the legacy `llm_handler` — will be removed in Phase 2.
+    fn auth_header_lines(&self) -> String {
+        String::new()
+    }
 }
 
 // ── ChatResponse (non-streaming) ──
@@ -183,31 +196,6 @@ impl OpenAiProvider {
         obj
     }
 
-    fn chat_raw(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<serde_json::Value> {
-        let body = self.build_body(messages, tools, false);
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-
-        let resp = match ureq::post(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", &format!("Bearer {}", self.api_key))
-            .send_json(&body)
-        {
-            Ok(r) => r,
-            Err(ureq::Error::StatusCode(status)) => {
-                return Err(ProviderError::Api(format!("HTTP {}", status)));
-            }
-            Err(e) => {
-                return Err(ProviderError::Http(format!("{}", e)));
-            }
-        };
-
-        let json: serde_json::Value = resp
-            .into_body()
-            .read_json()
-            .map_err(|e| ProviderError::Http(format!("Failed to parse response: {}", e)))?;
-
-        Ok(json)
-    }
 }
 
 impl Provider for OpenAiProvider {
@@ -331,9 +319,7 @@ impl Provider for OpenAiProvider {
         StreamEvent::Chunk(chunk)
     }
 
-    fn chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatResponse> {
-        let json = self.chat_raw(messages, tools)?;
-
+    fn parse_chat_response(&self, json: &serde_json::Value) -> Result<ChatResponse> {
         let text = json["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
@@ -377,8 +363,13 @@ impl Provider for OpenAiProvider {
         })
     }
 
-    fn endpoint_path(&self) -> &str {
-        "/chat/completions"
+    fn url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        format!("{}/chat/completions", base)
+    }
+
+    fn endpoint_path(&self) -> String {
+        "/chat/completions".to_string()
     }
 
     fn auth_header_lines(&self) -> String {
@@ -423,13 +414,6 @@ impl AnthropicProvider {
             tool_builders: HashMap::new(),
             pending_event: None,
         }
-    }
-
-    fn url(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        // Remove /v1 if present — Anthropic uses /v1/messages directly
-        let base = base.strip_suffix("/v1").unwrap_or(base);
-        format!("{}/v1/messages", base)
     }
 
     fn serialize_messages(&self, messages: &[Message]) -> Vec<serde_json::Value> {
@@ -765,30 +749,7 @@ impl Provider for AnthropicProvider {
         }
     }
 
-    fn chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatResponse> {
-        let body = self.build_body(messages, tools, false);
-        let url = self.url();
-
-        let resp = match ureq::post(&url)
-            .header("Content-Type", "application/json")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .send_json(&body)
-        {
-            Ok(r) => r,
-            Err(ureq::Error::StatusCode(status)) => {
-                return Err(ProviderError::Api(format!("HTTP {}", status)));
-            }
-            Err(e) => {
-                return Err(ProviderError::Http(format!("{}", e)));
-            }
-        };
-
-        let json: serde_json::Value = resp
-            .into_body()
-            .read_json()
-            .map_err(|e| ProviderError::Http(format!("Failed to parse response: {}", e)))?;
-
+    fn parse_chat_response(&self, json: &serde_json::Value) -> Result<ChatResponse> {
         let text = json["content"]
             .as_array()
             .and_then(|arr| {
@@ -844,8 +805,15 @@ impl Provider for AnthropicProvider {
         })
     }
 
-    fn endpoint_path(&self) -> &str {
-        "/v1/messages"
+    fn url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        // Remove /v1 if present — Anthropic uses /v1/messages directly
+        let base = base.strip_suffix("/v1").unwrap_or(base);
+        format!("{}/v1/messages", base)
+    }
+
+    fn endpoint_path(&self) -> String {
+        "/v1/messages".to_string()
     }
 
     fn auth_header_lines(&self) -> String {
@@ -857,8 +825,9 @@ impl Provider for AnthropicProvider {
 
 /// Generate a continuation brief by making a separate LLM call with just the
 /// session's messages as context. Called by the server when a session ends.
-pub fn generate_continuation_brief(
-    provider: &dyn Provider,
+pub async fn generate_continuation_brief(
+    llm: &crate::llm_client::LlmClient,
+    cfg: &agent_core::config::ProviderConfig,
     messages: &[Message],
 ) -> Result<(String, agent_core::types::SessionStatus)> {
     let summary_prompt = Message {
@@ -888,7 +857,15 @@ pub fn generate_continuation_brief(
     let mut brief_messages = vec![summary_prompt];
     brief_messages.extend_from_slice(messages);
 
-    let response = provider.chat(&brief_messages, &[])?;
+    let req = agent_core::rpc::LlmRequest {
+        id: 0,
+        messages: brief_messages,
+        tools: vec![],
+        routing_id: None,
+    };
+
+    let response = llm.complete(&req, cfg).await
+        .map_err(|e| ProviderError::Http(format!("{}", e)))?;
     let text = response.text.trim().to_string();
 
     // Parse status from the last line

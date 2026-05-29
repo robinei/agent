@@ -36,8 +36,18 @@ impl LocalClient {
         agent_core::config::agent_dir()
     }
 
+    /// Helper to run a small async future synchronously. Creates a fresh
+    /// `current_thread` runtime. Only used during the sync→async bridge (Phase 1).
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
     pub fn list_trees(&self) -> Result<Vec<TreeMeta>, LocalClientError> {
-        Ok(agent_core::tree_io::list_trees(&self.agent_dir())?)
+        Ok(Self::block_on(agent_core::tree_io::list_trees(&self.agent_dir()))?)
     }
 
     pub fn create_tree(
@@ -85,13 +95,13 @@ impl LocalClient {
             sandbox,
         };
 
-        agent_core::tree_io::create_tree(&self.agent_dir(), &meta)?;
+        Self::block_on(agent_core::tree_io::create_tree(&self.agent_dir(), &meta))?;
 
         Ok(meta)
     }
 
     pub fn get_tree(&self, id: &str) -> Result<TreeMeta, LocalClientError> {
-        agent_core::tree_io::read_meta(&self.agent_dir(), id)?
+        Self::block_on(agent_core::tree_io::read_meta(&self.agent_dir(), id))?
             .ok_or_else(|| LocalClientError::Other(format!("tree {} not found", id)))
     }
 

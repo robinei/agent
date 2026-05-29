@@ -18,6 +18,10 @@ signal-hook   = "0.3"
 nix           = { version = "0.29", features = ["poll", "fs", "signal", "process"] }
 rustls        = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
 webpki-roots  = "0.26"
+tokio         = { version = "1", features = ["rt", "macros", "net", "process", "sync", "fs", "io-util", "time"] }
+reqwest       = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+tokio-stream = "0.1"
+tokio-util    = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
 tempfile = "3"

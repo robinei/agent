@@ -112,7 +112,12 @@ pub fn spawn_worker(tree_id: &str, cfg: Arc<Config>) -> SpawnResult<()> {
             .join(exe)
     };
 
-    let meta = agent_core::tree_io::read_meta(&agent_dir(), tree_id)?
+    let meta = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| SpawnError::TreeIo(agent_core::tree_io::TreeIoError::Other(e.to_string())))?
+        .block_on(agent_core::tree_io::read_meta(&agent_dir(), tree_id))
+        .map_err(SpawnError::TreeIo)?
         .ok_or_else(|| SpawnError::TreeNotFound(tree_id.to_string()))?;
 
     let (msg_tx, msg_rx) = mpsc::sync_channel::<WorkerMsg>(64);

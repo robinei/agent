@@ -53,8 +53,19 @@ fn agent_dir() -> std::path::PathBuf {
     agent_core::config::agent_dir()
 }
 
+/// Helper to run a small async future synchronously. Creates a fresh
+/// `current_thread` runtime. Only used during the sync→async bridge (Phase 1);
+/// routes become async handlers in Phase 2.
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
+}
+
 fn handle_list_trees() -> (u16, Vec<u8>, &'static str) {
-    match agent_core::tree_io::list_trees(&agent_dir()) {
+    match block_on(agent_core::tree_io::list_trees(&agent_dir())) {
         Ok(trees) => json(200, &trees),
         Err(e) => {
             json(500, &serde_json::json!({"error": e.to_string()}))
@@ -98,7 +109,7 @@ fn handle_create_tree(body: &[u8], cfg: &Config) -> (u16, Vec<u8>, &'static str)
         sandbox,
     };
 
-    if let Err(e) = agent_core::tree_io::create_tree(&agent_dir(), &meta) {
+    if let Err(e) = block_on(agent_core::tree_io::create_tree(&agent_dir(), &meta)) {
         return json(
             500,
             &serde_json::json!({"error": format!("failed to create tree: {}", e)}),
@@ -109,7 +120,7 @@ fn handle_create_tree(body: &[u8], cfg: &Config) -> (u16, Vec<u8>, &'static str)
 }
 
 fn handle_get_tree(id: &str) -> (u16, Vec<u8>, &'static str) {
-    match agent_core::tree_io::read_meta(&agent_dir(), id) {
+    match block_on(agent_core::tree_io::read_meta(&agent_dir(), id)) {
         Ok(Some(meta)) => json(200, &meta),
         Ok(None) => json(404, &serde_json::json!({"error": format!("tree {} not found", id)})),
         Err(e) => json(500, &serde_json::json!({"error": e.to_string()})),
@@ -124,7 +135,7 @@ fn handle_update_tree(id: &str, body: &[u8]) -> (u16, Vec<u8>, &'static str) {
         }
     };
 
-    let mut meta = match agent_core::tree_io::read_meta(&agent_dir(), id) {
+    let mut meta = match block_on(agent_core::tree_io::read_meta(&agent_dir(), id)) {
         Ok(Some(m)) => m,
         Ok(None) => {
             return json(404, &serde_json::json!({"error": format!("tree {} not found", id)}));
@@ -142,7 +153,7 @@ fn handle_update_tree(id: &str, body: &[u8]) -> (u16, Vec<u8>, &'static str) {
     }
     meta.updated_at = chrono::Utc::now().timestamp();
 
-    if let Err(e) = agent_core::tree_io::write_meta(&agent_dir(), &meta) {
+    if let Err(e) = block_on(agent_core::tree_io::write_meta(&agent_dir(), &meta)) {
         return json(
             500,
             &serde_json::json!({"error": format!("failed to update tree: {}", e)}),

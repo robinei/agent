@@ -1,3 +1,4 @@
+pub mod child_io;
 pub mod config;
 pub mod logging;
 pub mod rpc;

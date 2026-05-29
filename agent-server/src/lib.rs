@@ -5,6 +5,7 @@ use agent_core::config::Config;
 
 pub mod handlers;
 pub mod http;
+pub mod llm_client;
 pub mod sandbox;
 pub mod spawner;
 mod llm_handler;
@@ -22,7 +23,17 @@ pub fn embed_init(config: Arc<Config>, to_stderr: bool) {
     let log_file = config.logging.to_file.as_ref().and_then(|p| p.to_str());
     agent_core::logging::init_logging(log_file, &config.logging.level, to_stderr);
 
-    match agent_core::tree_io::list_trees(&agent_core::config::agent_dir()) {
+    // Phase 1 bridge: block_on the async tree_io call in a sync context.
+    // Phase 2 will make embed_init itself async.
+    let trees = (|| -> Result<Vec<_>, String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        rt.block_on(agent_core::tree_io::list_trees(&agent_core::config::agent_dir()))
+            .map_err(|e| e.to_string())
+    })();
+    match trees {
         Ok(trees) => log::info!("Rebuilt index: {} trees loaded", trees.len()),
         Err(e) => log::warn!("Index rebuild issue: {}", e),
     }

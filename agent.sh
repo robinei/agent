@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # ── Customize this ────────────────────────────────────────────────────────────
-AGENT_CMD=(cargo run -p agent-server)
+AGENT_CMD=(pi)
 
 # Additional dirs outside the project the agent may write to.
 WRITABLE_DIRS=(
+    "$HOME/.pi"
     "$HOME/.agent"
-    "$HOME/Code/test"
 )
 
 # Credential/auth dirs to hide from the agent.
@@ -63,4 +63,4 @@ exec bwrap \
     --share-net \
     --new-session \
     --die-with-parent \
-    -- "${AGENT_CMD[@]}" "$@"
+    -- "${AGENT_CMD[@]}"

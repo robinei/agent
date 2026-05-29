@@ -7,6 +7,17 @@ use log::warn;
 use agent_core::config::agent_dir;
 use agent_core::types::{Entry, TreeHeader, TreeMeta};
 
+/// Helper to run a small async future synchronously inside a sync context.
+/// Creates a fresh `current_thread` runtime for each call. Only use this for
+/// the bridge phase (Phase 1); the worker loop becomes async in Phase 3.
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
+}
+
 // ── Error type ──
 
 #[derive(Debug, thiserror::Error)]
@@ -68,12 +79,12 @@ impl Store {
     // ── Tree metadata I/O ──
 
     fn load_tree_meta(&self) -> Result<Option<TreeMeta>> {
-        agent_core::tree_io::read_meta(&self.base_dir, &self.tree_id)
+        block_on(agent_core::tree_io::read_meta(&self.base_dir, &self.tree_id))
             .map_err(|e| StoreError::Io(std::io::Error::other(e)))
     }
 
     pub fn save_tree_meta(&self, meta: &TreeMeta) -> Result<()> {
-        agent_core::tree_io::write_meta(&self.base_dir, meta)
+        block_on(agent_core::tree_io::write_meta(&self.base_dir, meta))
             .map_err(|e| StoreError::Io(std::io::Error::other(e)))?;
         *self.meta_cache.borrow_mut() = Some(Some(meta.clone()));
         Ok(())

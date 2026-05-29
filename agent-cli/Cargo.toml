@@ -20,3 +20,4 @@ unicode-width = "0.2"
 thiserror     = "1"
 ratatui       = "0.29"
 tui-textarea  = { version = "0.7", features = ["ratatui"] }
+tokio         = { version = "1", features = ["rt", "macros", "sync", "time"] }
