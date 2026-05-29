@@ -23,7 +23,7 @@ use crate::app::{AppMode, AppState, CreateTreeStep};
 
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AppEvent {
     Submit(String),
     Cancel,
@@ -88,109 +88,109 @@ impl App {
         Ok(())
     }
 
-    pub fn poll_event(&mut self, state: &mut AppState, timeout: Duration) -> io::Result<Option<AppEvent>> {
+    /// Blocking poll for setup phases (tree selection, tree creation).
+    /// Uses `crossterm::event::poll` + `read` directly (not `EventStream`).
+    /// Returns only after a terminal event or timeout.
+    pub fn poll_event_blocking(&mut self, state: &mut AppState, timeout: Duration) -> io::Result<Option<AppEvent>> {
         if !event::poll(timeout)? {
             return Ok(None);
         }
         let ev = event::read()?;
         match &state.mode {
-            AppMode::Chat => self.handle_chat_event(ev),
-            AppMode::SelectTree { .. } => Ok(handle_select_event(ev)),
+            AppMode::Chat => self.handle_chat_event_raw(&ev),
+            AppMode::SelectTree { .. } => self.handle_select_event(&ev),
             AppMode::CreateTree { .. } => self.handle_create_event(ev),
         }
+        .map_or(Ok(None), |ae| Ok(Some(ae)))
     }
 
-    fn handle_chat_event(&mut self, ev: Event) -> io::Result<Option<AppEvent>> {
+    /// Map a raw crossterm Event during Chat mode to an AppEvent.
+    /// Pure mapping — no side effects on textarea.
+    pub fn handle_chat_event_raw(&self, ev: &Event) -> Option<AppEvent> {
         match ev {
             Event::Key(KeyEvent { code, modifiers, kind: KeyEventKind::Press, .. }) => {
-                match (code, modifiers) {
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(Some(AppEvent::Cancel)),
-                    (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                        return Ok(Some(AppEvent::ToggleThinking));
-                    }
-                    (KeyCode::Enter, KeyModifiers::NONE) => {
-                        let text = self.textarea.lines().join("\n");
-                        let text = text.trim().to_string();
-                        if !text.is_empty() {
-                            self.textarea = TextArea::default();
-                            self.textarea.set_cursor_line_style(Style::default());
-                            self.textarea.set_placeholder_text("Type a message… (Enter to send, Shift+Enter for newline)");
-                            return Ok(Some(AppEvent::Submit(text)));
-                        }
-                        return Ok(None);
-                    }
-                    (KeyCode::Enter, KeyModifiers::SHIFT) => {
-                        self.textarea.insert_newline();
-                        return Ok(None);
-                    }
+                match (*code, *modifiers) {
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(AppEvent::Cancel),
+                    (KeyCode::Char('t'), KeyModifiers::CONTROL) => Some(AppEvent::ToggleThinking),
+                    (KeyCode::Enter, KeyModifiers::NONE) => Some(AppEvent::Submit(String::new())),
+                    (KeyCode::Enter, KeyModifiers::SHIFT) => None, // handled by textarea
                     (KeyCode::Up, KeyModifiers::NONE) => {
                         if self.textarea.lines().len() <= 1 {
                             let cursor_row = self.textarea.cursor().0;
                             if cursor_row == 0 {
-                                return Ok(Some(AppEvent::HistoryPrev));
+                                return Some(AppEvent::HistoryPrev);
                             }
                         }
+                        None
                     }
                     (KeyCode::Down, KeyModifiers::NONE) => {
                         if self.textarea.lines().len() <= 1 {
                             let (row, _) = self.textarea.cursor();
                             if row + 1 >= self.textarea.lines().len() {
-                                return Ok(Some(AppEvent::HistoryNext));
+                                return Some(AppEvent::HistoryNext);
                             }
                         }
+                        None
                     }
-                    (KeyCode::PageUp, _) => return Ok(Some(AppEvent::ScrollUp(10))),
-                    (KeyCode::PageDown, _) => return Ok(Some(AppEvent::ScrollDown(10))),
-                    (KeyCode::Home, _) => return Ok(Some(AppEvent::ScrollToTop)),
-                    (KeyCode::End, _) => return Ok(Some(AppEvent::ScrollToBottom)),
-                    _ => {}
+                    (KeyCode::PageUp, _) => Some(AppEvent::ScrollUp(10)),
+                    (KeyCode::PageDown, _) => Some(AppEvent::ScrollDown(10)),
+                    (KeyCode::Home, _) => Some(AppEvent::ScrollToTop),
+                    (KeyCode::End, _) => Some(AppEvent::ScrollToBottom),
+                    _ => None,
                 }
-                self.textarea.input(ev);
-                Ok(None)
             }
-            Event::Key(_) => Ok(None),
+            Event::Key(_) => None,
             Event::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollUp => Ok(Some(AppEvent::ScrollUp(3))),
-                MouseEventKind::ScrollDown => Ok(Some(AppEvent::ScrollDown(3))),
-                _ => Ok(None),
+                MouseEventKind::ScrollUp => Some(AppEvent::ScrollUp(3)),
+                MouseEventKind::ScrollDown => Some(AppEvent::ScrollDown(3)),
+                _ => None,
             },
-            Event::Resize(_, _) => Ok(Some(AppEvent::Resize)),
-            _ => Ok(None),
+            Event::Resize(_, _) => Some(AppEvent::Resize),
+            _ => None,
         }
     }
 
-    fn handle_create_event(&mut self, ev: Event) -> io::Result<Option<AppEvent>> {
+    /// Handle a crossterm Event for the CreateTree screen.
+    pub fn handle_create_event(&mut self, ev: Event) -> Option<AppEvent> {
         match ev {
             Event::Key(KeyEvent { code, modifiers, kind: KeyEventKind::Press, .. }) => {
                 match (code, modifiers) {
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(Some(AppEvent::Cancel)),
-                    (KeyCode::Enter, KeyModifiers::NONE) => return Ok(Some(AppEvent::Confirm)),
-                    _ => {}
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(AppEvent::Cancel),
+                    (KeyCode::Enter, KeyModifiers::NONE) => Some(AppEvent::Confirm),
+                    _ => {
+                        self.textarea.input(ev);
+                        None
+                    }
                 }
-                self.textarea.input(ev);
-                Ok(None)
             }
-            Event::Key(_) => Ok(None),
-            Event::Resize(_, _) => Ok(Some(AppEvent::Resize)),
-            _ => Ok(None),
+            Event::Key(_) => None,
+            Event::Resize(_, _) => Some(AppEvent::Resize),
+            _ => None,
         }
     }
-}
 
-fn handle_select_event(ev: Event) -> Option<AppEvent> {
-    match ev {
-        Event::Key(KeyEvent { code, modifiers, kind: KeyEventKind::Press, .. }) => {
-            match (code, modifiers) {
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(AppEvent::Cancel),
-                (KeyCode::Up | KeyCode::Char('k'), _) => Some(AppEvent::SelectUp),
-                (KeyCode::Down | KeyCode::Char('j'), _) => Some(AppEvent::SelectDown),
-                (KeyCode::Enter, _) => Some(AppEvent::Confirm),
-                (KeyCode::Char('n'), _) => Some(AppEvent::NewTree),
-                _ => None,
+    /// Forward a raw terminal event to the textarea for normal typing.
+    /// Call after `handle_chat_event_raw` returns None.
+    pub fn handle_textarea_input(&mut self, ev: &Event) {
+        self.textarea.input(ev.clone());
+    }
+
+    /// Map a raw crossterm Event during SelectTree mode.
+    pub fn handle_select_event(&self, ev: &Event) -> Option<AppEvent> {
+        match ev {
+            Event::Key(KeyEvent { code, modifiers, kind: KeyEventKind::Press, .. }) => {
+                match (*code, *modifiers) {
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(AppEvent::Cancel),
+                    (KeyCode::Up | KeyCode::Char('k'), _) => Some(AppEvent::SelectUp),
+                    (KeyCode::Down | KeyCode::Char('j'), _) => Some(AppEvent::SelectDown),
+                    (KeyCode::Enter, _) => Some(AppEvent::Confirm),
+                    (KeyCode::Char('n'), _) => Some(AppEvent::NewTree),
+                    _ => None,
+                }
             }
+            Event::Resize(_, _) => Some(AppEvent::Resize),
+            _ => None,
         }
-        Event::Resize(_, _) => Some(AppEvent::Resize),
-        _ => None,
     }
 }
 

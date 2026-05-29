@@ -635,16 +635,16 @@ cargo test -p agent-worker
 
 ---
 
-### Phase 4: agent-cli
+### Phase 4: agent-cli ✅
 
-- [ ] Wrap the CLI entry in a `current_thread` runtime + `block_on`.
-- [ ] Replace the `nix::poll` loops in `interactive.rs` with `tokio::select!`
+- [x] Wrap the CLI entry in a `current_thread` runtime + `block_on`.
+- [x] Replace the `nix::poll` loops in `interactive.rs` with `tokio::select!`
       over cancel-safe sources (terminal `EventStream`, WS stream, render tick).
-- [ ] Replace `tungstenite` (blocking) with `tokio-tungstenite::connect_async`.
-- [ ] Replace `ureq` REST calls in `client.rs` with `reqwest`.
-- [ ] Replace the embedded-server socketpair (`local.rs`) — see below.
-- [ ] Use `crossterm::event::EventStream` (feature `event-stream`).
-- [ ] Remove deps: `nix`, `ctrlc`, `tungstenite`, `ureq`.
+- [x] Replace `tungstenite` (blocking) with `tokio-tungstenite::connect_async`.
+- [x] Replace `ureq` REST calls in `client.rs` with `reqwest`.
+- [x] Replace the embedded-server socketpair (`local.rs`) — see below.
+- [x] Use `crossterm::event::EventStream` (feature `event-stream`).
+- [x] Remove deps: `nix`, `ctrlc`, `tungstenite`, `ureq`.
 
 **Goal:** the CLI event loop is a single `tokio::select!` over terminal events,
 WebSocket messages, and the 16 ms render tick; no `ureq`, no `nix`.

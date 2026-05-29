@@ -1,20 +1,24 @@
+//! agent-cli library — async CLI for the agent-server.
+//!
+//! Wraps the CLI entry in a `current_thread` tokio runtime. All I/O uses
+//! `reqwest` (HTTP) and `tokio-tungstenite` (WebSocket). Embedded mode
+//! starts the server on a loopback TCP port and connects via the same
+//! HTTP/WS path — no socketpair, no `local.rs`.
+
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::process::Command;
-use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::time::Duration;
 
 use clap::Parser;
 
 mod app;
 mod client;
 mod interactive;
-mod local;
 pub mod markdown;
 mod tui;
 
 use client::{AgentClient, AgentSession, ClientError};
-use local::{LocalClient, LocalClientError};
 
 const EXIT_ERR: i32 = 1;
 
@@ -22,8 +26,6 @@ const EXIT_ERR: i32 = 1;
 pub enum CliError {
     #[error(transparent)]
     Client(#[from] ClientError),
-    #[error(transparent)]
-    Local(#[from] LocalClientError),
     #[error("{0}")]
     Other(String),
 }
@@ -84,20 +86,22 @@ enum SubCommand {
     },
 }
 
-enum Backend {
-    Remote(AgentClient),
-    Local(LocalClient),
+/// Backend abstraction — always remote HTTP/WS. The embedded path starts a
+/// server internally and then uses the same `AgentClient`.
+struct Backend {
+    client: AgentClient,
 }
 
 impl Backend {
-    fn list_trees(&self) -> Result<Vec<agent_core::types::TreeMeta>, CliError> {
-        match self {
-            Backend::Remote(c) => Ok(c.list_trees()?),
-            Backend::Local(c) => Ok(c.list_trees()?),
-        }
+    fn new(client: AgentClient) -> Self {
+        Self { client }
     }
 
-    fn create_tree(
+    async fn list_trees(&self) -> Result<Vec<agent_core::types::TreeMeta>, CliError> {
+        Ok(self.client.list_trees().await?)
+    }
+
+    async fn create_tree(
         &self,
         title: Option<&str>,
         repo_path: Option<&str>,
@@ -107,210 +111,259 @@ impl Backend {
         hide: &[std::path::PathBuf],
         unhide: &[std::path::PathBuf],
     ) -> Result<agent_core::types::TreeMeta, CliError> {
-        match self {
-            Backend::Remote(c) => Ok(c.create_tree(title, repo_path, model, writable, network, hide, unhide)?),
-            Backend::Local(c) => Ok(c.create_tree(title, repo_path, model, writable, network, hide, unhide)?),
-        }
+        Ok(self
+            .client
+            .create_tree(title, repo_path, model, writable, network, hide, unhide)
+            .await?)
     }
 
-    fn get_tree(&self, id: &str) -> Result<agent_core::types::TreeMeta, CliError> {
-        match self {
-            Backend::Remote(c) => Ok(c.get_tree(id)?),
-            Backend::Local(c) => Ok(c.get_tree(id)?),
-        }
+    async fn get_tree(&self, id: &str) -> Result<agent_core::types::TreeMeta, CliError> {
+        Ok(self.client.get_tree(id).await?)
     }
 
-    fn stop_agent(&self, tree_id: &str) -> Result<(), CliError> {
-        match self {
-            Backend::Remote(c) => Ok(c.stop_agent(tree_id)?),
-            Backend::Local(c) => Ok(c.stop_agent(tree_id)?),
-        }
+    async fn stop_agent(&self, tree_id: &str) -> Result<(), CliError> {
+        Ok(self.client.stop_agent(tree_id).await?)
     }
 
-    fn connect_session(&self, tree_id: &str) -> Result<AgentSession, CliError> {
-        match self {
-            Backend::Remote(c) => {
-                let (host, port) = client::parse_host_port(c.server_addr())?;
-                Ok(AgentSession::connect(&format!("{}:{}", host, port), tree_id)?)
-            }
-            Backend::Local(c) => Ok(embedded_session(tree_id, c.config.clone())?),
-        }
+    async fn connect_session(&self, tree_id: &str) -> Result<AgentSession, CliError> {
+        let url = self.client.ws_url_for(tree_id);
+        Ok(AgentSession::connect(&url, "").await?)
     }
 }
 
-// ── Backend resolution ──
+// ── Backend resolution ────────────────────────────────────────────────────
 
-fn resolve_backend(server: &str, explicit: bool) -> Backend {
+/// Resolve the backend: try connecting to an existing server; if none is
+/// running, start an embedded in-process server on a loopback port.
+async fn resolve_backend(server: &str, explicit: bool) -> Backend {
     if explicit {
-        return Backend::Remote(AgentClient::new(server));
+        return Backend::new(AgentClient::new(server));
     }
+
     // Fast TCP probe — succeeds if a server is already running.
     let addr = parse_server_addr(server).unwrap_or_else(|_| default_server_addr());
-    if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)).is_ok() {
+    if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
         eprintln!("Connected to server at {server}");
-        return Backend::Remote(AgentClient::new(server));
+        return Backend::new(AgentClient::new(server));
     }
-    // No server found — start embedded.
-    eprintln!("No server at {server}, hosting server");
+
+    // No server found — start embedded on a random port.
+    eprintln!("No server at {server}, starting embedded server...");
     let config = Arc::new(agent_core::config::load_config());
 
-    // Run embed_init (now async) in a quick block_on
-    let cfg_init = config.clone();
-    let to_stderr = config.logging.to_stderr;
-    std::thread::spawn(move || {
-        // Each embedded server gets its own current_thread tokio runtime
-        agent_server::serve(cfg_init);
+    // Bind to a random loopback port.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind embedded server listener");
+    let port = listener.local_addr().unwrap().port();
+    let server_addr = format!("127.0.0.1:{}", port);
+
+    // Spawn the server on this listener.
+    let cfg_for_server = config.clone();
+    let _server_handle = tokio::spawn(async move {
+        agent_server::serve_on(listener, cfg_for_server).await;
     });
 
-    // Give the server a moment to bind before the CLI tries to connect.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Wait for server readiness with retries.
+    let client = AgentClient::new(&server_addr);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.list_trees().await {
+            Ok(_) => {
+                eprintln!("Embedded server ready on {server_addr}");
+                break;
+            }
+            Err(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    eprintln!("Warning: embedded server not responding after 5s, continuing anyway");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
 
-    Backend::Local(LocalClient::new(config))
+    Backend::new(AgentClient::new(&server_addr))
 }
 
 fn parse_server_addr(server: &str) -> Result<std::net::SocketAddr, CliError> {
-    let s = server.strip_prefix("http://").or_else(|| server.strip_prefix("https://")).unwrap_or(server);
+    let s = server
+        .strip_prefix("http://")
+        .or_else(|| server.strip_prefix("https://"))
+        .unwrap_or(server);
     let s = s.trim_end_matches('/');
-    s.parse().map_err(|e| CliError::Other(format!("invalid server address '{}': {}", server, e)))
+    s.parse()
+        .map_err(|e| CliError::Other(format!("invalid server address '{}': {}", server, e)))
 }
 
 fn default_server_addr() -> std::net::SocketAddr {
-    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080)
+    std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        8080,
+    )
 }
 
-// ── Socketpair session ──
-
-/// Create an embedded WS session by connecting through a socketpair.
-/// The server end runs the axum Router via `serve_single_connection`.
-pub fn embedded_session(
-    tree_id: &str,
-    config: Arc<agent_core::config::Config>,
-) -> Result<AgentSession, CliError> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    let (client_fd, server_fd) = nix::sys::socket::socketpair(
-        nix::sys::socket::AddressFamily::Unix,
-        nix::sys::socket::SockType::Stream,
-        None,
-        nix::sys::socket::SockFlag::empty(),
-    )
-    .map_err(|e| CliError::Other(e.to_string()))?;
-
-    // SAFETY: we own these fds from socketpair
-    let server_stream = tokio::net::TcpStream::from_std(
-        std::net::TcpStream::from(unsafe { OwnedFd::from_raw_fd(server_fd.into_raw_fd()) }),
-    )
-    .expect("convert std TcpStream to tokio TcpStream");
-    let client_stream = unsafe { std::net::TcpStream::from_raw_fd(client_fd.into_raw_fd()) };
-
-    let cfg_for_server = config.clone();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build runtime for embedded session");
-        rt.block_on(async move {
-            agent_server::server::serve_single_connection(server_stream, cfg_for_server).await;
-        });
-    });
-
-    Ok(AgentSession::from_stream(client_stream, tree_id)?)
-}
-
-use std::net::TcpStream;
-
-// ── Entry point ──
+// ── Entry point ───────────────────────────────────────────────────────────
 
 pub fn run(args: Vec<String>) {
     let stop = Arc::new(AtomicBool::new(false));
-    let s = stop.clone();
-    ctrlc::set_handler(move || s.store(true, Ordering::Relaxed)).ok();
 
-    let full_args: Vec<String> = std::iter::once("agent-cli".to_string())
-        .chain(args.clone())
-        .collect();
+    let full_args: Vec<String> =
+        std::iter::once("agent-cli".to_string())
+            .chain(args.clone())
+            .collect();
     let cli = Cli::parse_from(&full_args);
 
-    // Detect if --server was explicitly provided
-    let explicit_server = args.iter().any(|a| a == "--server" || a == "-s");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to build tokio runtime")
+        .block_on(async {
+            // Signal handler: set stop on Ctrl+C.
+            let s = stop.clone();
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.ok();
+                eprintln!("\nInterrupt signal received");
+                s.store(true, Ordering::Relaxed);
+            });
 
-    match &cli.command {
-        Some(SubCommand::Serve { config }) => start_server(config.as_deref()),
-        Some(SubCommand::Trees) => {
-            let backend = resolve_backend(&cli.server, explicit_server);
-            list_trees(&backend);
-        }
-        Some(SubCommand::Create { title, repo_path, model, writable, no_net, net, hide, unhide }) => {
-            let backend = resolve_backend(&cli.server, explicit_server);
-            create_tree(&backend, title, repo_path.as_deref(), model.as_deref(), writable, *no_net, *net, hide, unhide);
-        }
-        Some(SubCommand::Msg { tree_id, message }) => {
-            let backend = resolve_backend(&cli.server, explicit_server);
-            send_and_stream(&backend, tree_id, message, &stop);
-        }
-        Some(SubCommand::Session { repo_path, message }) => {
-            let backend = resolve_backend(&cli.server, explicit_server);
-            session_and_stream(&backend, repo_path, message, &stop);
-        }
-        Some(SubCommand::Stop { tree_id }) => {
-            let backend = resolve_backend(&cli.server, explicit_server);
-            stop_agent(&backend, tree_id);
-        }
-        None => {
-            let backend = resolve_backend(&cli.server, explicit_server);
-            match interactive::run_interactive(&backend, cli.repo_path.clone(), &stop) {
-                Ok(()) => {}
-                Err(e) => { eprintln!("Error: {}", e); std::process::exit(EXIT_ERR); }
+            let explicit_server = args.iter().any(|a| a == "--server" || a == "-s");
+
+            match &cli.command {
+                Some(SubCommand::Serve { config }) => {
+                    start_server(config.as_deref()).await;
+                }
+                Some(SubCommand::Trees) => {
+                    let backend = resolve_backend(&cli.server, explicit_server).await;
+                    list_trees(&backend).await;
+                }
+                Some(SubCommand::Create {
+                    title,
+                    repo_path,
+                    model,
+                    writable,
+                    no_net,
+                    net,
+                    hide,
+                    unhide,
+                }) => {
+                    let backend = resolve_backend(&cli.server, explicit_server).await;
+                    create_tree(
+                        &backend,
+                        title,
+                        repo_path.as_deref(),
+                        model.as_deref(),
+                        writable,
+                        *no_net,
+                        *net,
+                        hide,
+                        unhide,
+                    )
+                    .await;
+                }
+                Some(SubCommand::Msg {
+                    tree_id,
+                    message,
+                }) => {
+                    let backend = resolve_backend(&cli.server, explicit_server).await;
+                    send_and_stream(&backend, tree_id, message, &stop).await;
+                }
+                Some(SubCommand::Session {
+                    repo_path,
+                    message,
+                }) => {
+                    let backend = resolve_backend(&cli.server, explicit_server).await;
+                    session_and_stream(&backend, repo_path, message, &stop).await;
+                }
+                Some(SubCommand::Stop { tree_id }) => {
+                    let backend = resolve_backend(&cli.server, explicit_server).await;
+                    stop_agent(&backend, tree_id).await;
+                }
+                None => {
+                    let backend = resolve_backend(&cli.server, explicit_server).await;
+                    match interactive::run_interactive(&backend, cli.repo_path.clone(), &stop).await
+                    {
+                        Ok(()) => {}
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(EXIT_ERR);
+                        }
+                    }
+                }
             }
-        },
-    }
+        });
 }
 
-fn exit_err(msg: impl std::fmt::Display) -> ! {
-    eprintln!("Error: {}", msg);
-    std::process::exit(EXIT_ERR);
-}
+// ── Server subcommand ────────────────────────────────────────────────────
 
-fn start_server(config_path: Option<&str>) {
+async fn start_server(config_path: Option<&str>) {
     let path = std::env::current_exe()
         .ok()
         .and_then(|p| {
             let dir = p.parent()?;
             let sp = dir.join("agent-server");
-            if sp.exists() { Some(sp) } else { None }
+            if sp.exists() {
+                Some(sp)
+            } else {
+                None
+            }
         })
         .unwrap_or_else(|| "agent-server".into());
 
-    let mut cmd = Command::new(path);
+    let mut cmd = tokio::process::Command::new(&path);
     if let Some(cfg) = config_path {
         cmd.arg("--config");
         cmd.arg(cfg);
     }
 
     println!("Starting agent-server...");
-    let status = cmd.spawn()
-        .unwrap_or_else(|e| { exit_err(&format!("Failed to start server: {e}")); })
+    let status = cmd
+        .spawn()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to start server: {}", e);
+            std::process::exit(EXIT_ERR);
+        })
         .wait()
+        .await
         .expect("Failed to wait on server process");
     std::process::exit(status.code().unwrap_or(EXIT_ERR));
 }
 
-fn list_trees(backend: &Backend) {
-    match backend.list_trees() {
+// ── Command helpers ──────────────────────────────────────────────────────
+
+fn exit_err(msg: impl std::fmt::Display) -> ! {
+    eprintln!("Error: {}", msg);
+    std::process::exit(EXIT_ERR);
+}
+
+async fn list_trees(backend: &Backend) {
+    match backend.list_trees().await {
         Ok(trees) => {
-            if trees.is_empty() { println!("No trees found."); return; }
+            if trees.is_empty() {
+                println!("No trees found.");
+                return;
+            }
             println!("Trees ({}):", trees.len());
             for t in &trees {
                 let sid = if t.id.len() > 8 { &t.id[..8] } else { &t.id };
-                let status = if t.leaf_id.is_some() { "active" } else { "empty" };
-                println!("  {} — {} ({})", sid, t.title.as_deref().unwrap_or("untitled"), status);
+                let status = if t.leaf_id.is_some() {
+                    "active"
+                } else {
+                    "empty"
+                };
+                println!(
+                    "  {} — {} ({})",
+                    sid,
+                    t.title.as_deref().unwrap_or("untitled"),
+                    status
+                );
             }
         }
         Err(e) => exit_err(&e),
     }
 }
 
-fn create_tree(
+async fn create_tree(
     backend: &Backend,
     title: &str,
     repo_path: Option<&str>,
@@ -321,33 +374,40 @@ fn create_tree(
     hide: &[std::path::PathBuf],
     unhide: &[std::path::PathBuf],
 ) {
-    let network = if no_net { Some(false) } else if net { Some(true) } else { None };
-    match backend.create_tree(Some(title), repo_path, model, writable, network, hide, unhide) {
+    let network = if no_net {
+        Some(false)
+    } else if net {
+        Some(true)
+    } else {
+        None
+    };
+    match backend
+        .create_tree(Some(title), repo_path, model, writable, network, hide, unhide)
+        .await
+    {
         Ok(meta) => {
             let sid = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
-            println!("Created tree {} ({})", sid, meta.title.as_deref().unwrap_or("untitled"));
+            println!(
+                "Created tree {} ({})",
+                sid,
+                meta.title.as_deref().unwrap_or("untitled")
+            );
             println!("ID: {}", meta.id);
         }
         Err(e) => exit_err(&e),
     }
 }
 
-fn stop_agent(backend: &Backend, tree_id: &str) {
-    match backend.stop_agent(tree_id) {
+async fn stop_agent(backend: &Backend, tree_id: &str) {
+    match backend.stop_agent(tree_id).await {
         Ok(()) => println!("Stop signaled for tree {}", tree_id),
         Err(e) => exit_err(&e),
     }
 }
 
-fn print_entry_oneshot(entry: &agent_core::types::Entry) {
-    let lines = render_entry_lines(entry);
-    for line in lines {
-        println!("{}", line);
-    }
-}
+// ── Streaming (oneshot Msg / Session commands) ──────────────────────────
 
 /// Render an entry to plain text lines (no terminal styling).
-/// Returns one or more lines ready for printing.
 pub fn render_entry_lines(entry: &agent_core::types::Entry) -> Vec<String> {
     use agent_core::types::*;
     let mut out = Vec::new();
@@ -369,7 +429,9 @@ pub fn render_entry_lines(entry: &agent_core::types::Entry) -> Vec<String> {
         }
         Entry::GoalSet { goal, .. } => out.push(format!("🎯  {}", goal)),
         Entry::ModelSet { model, .. } => out.push(format!("🤖  Model: {}", model)),
-        Entry::SessionEnd { summary, status, .. } => {
+        Entry::SessionEnd {
+            summary, status, ..
+        } => {
             let s = summary.as_deref().unwrap_or("");
             if s.is_empty() {
                 out.push(format!("📝 Session ended ({:?})", status));
@@ -377,7 +439,12 @@ pub fn render_entry_lines(entry: &agent_core::types::Entry) -> Vec<String> {
                 out.push(format!("📝 Session ended ({:?}): {}", status, s));
             }
         }
-        Entry::BashExec { command, output, exit_code, .. } => {
+        Entry::BashExec {
+            command,
+            output,
+            exit_code,
+            ..
+        } => {
             out.push(format!("  🛠  bash: {}", command));
             out.push(format!("  bash (exit: {})", exit_code));
             if !output.is_empty() {
@@ -391,27 +458,40 @@ pub fn render_entry_lines(entry: &agent_core::types::Entry) -> Vec<String> {
     out
 }
 
-fn send_and_stream(backend: &Backend, tree_id: &str, message: &str, stop: &AtomicBool) {
-    use agent_core::types::{DiagnosticSeverity, NotificationLevel, ServerEvent};
-    let mut session = backend.connect_session(tree_id).unwrap_or_else(|e| exit_err(&e));
-    session.send_message(message).unwrap_or_else(|e| exit_err(&e));
+async fn send_and_stream(backend: &Backend, tree_id: &str, message: &str, stop: &AtomicBool) {
+    use agent_core::types::*;
+    let mut session = backend
+        .connect_session(tree_id)
+        .await
+        .unwrap_or_else(|e| exit_err(&e));
+    session
+        .send_message(message)
+        .await
+        .unwrap_or_else(|e| exit_err(&e));
+
     loop {
         if stop.load(Ordering::Relaxed) {
             println!("\nInterrupted");
             break;
         }
-        match session.next_event() {
-            Some(Ok(ServerEvent::TextChunk { content })) => {
-                print!("{content}");
+        match tokio::time::timeout(Duration::from_millis(200), session.next_event()).await {
+            Ok(Some(Ok(ServerEvent::TextChunk { content }))) => {
+                print!("{}", content);
                 io::stdout().flush().ok();
             }
-            Some(Ok(ServerEvent::Done { status, .. })) if status != "history" => { println!(); break; }
-            Some(Ok(ServerEvent::Done { .. })) => {} // history done, ignore
-            Some(Ok(ServerEvent::Notification { level, message })) => {
-                if level == NotificationLevel::Fatal { exit_err(&message); }
-                else { eprintln!("{message}"); }
+            Ok(Some(Ok(ServerEvent::Done { status, .. }))) if status != "history" => {
+                println!();
+                break;
             }
-            Some(Ok(ServerEvent::Diagnostics { source, files })) => {
+            Ok(Some(Ok(ServerEvent::Done { .. }))) => {} // history done, ignore
+            Ok(Some(Ok(ServerEvent::Notification { level, message }))) => {
+                if level == NotificationLevel::Fatal {
+                    exit_err(&message);
+                } else {
+                    eprintln!("{}", message);
+                }
+            }
+            Ok(Some(Ok(ServerEvent::Diagnostics { source, files }))) => {
                 for file in &files {
                     for diag in &file.diagnostics {
                         let sev = match diag.severity {
@@ -419,21 +499,35 @@ fn send_and_stream(backend: &Backend, tree_id: &str, message: &str, stop: &Atomi
                             Some(DiagnosticSeverity::Warning) => "warning",
                             _ => "info",
                         };
-                        eprintln!("[{}] {}:{}  {}: {}", source, file.path, diag.range.start.line + 1, sev, diag.message);
+                        eprintln!(
+                            "[{}] {}:{}  {}: {}",
+                            source,
+                            file.path,
+                            diag.range.start.line + 1,
+                            sev,
+                            diag.message
+                        );
                     }
                 }
             }
-            Some(Ok(ServerEvent::Entry(entry))) => {
-                print_entry_oneshot(&entry);
+            Ok(Some(Ok(ServerEvent::Entry(entry)))) => {
+                for line in render_entry_lines(&entry) {
+                    println!("{}", line);
+                }
             }
-            Some(Err(e)) => { eprintln!("Parse error: {e}"); break; }
-            _ => {}
+            Ok(Some(Ok(_))) => {} // other events (ToolStart, ContextUpdate, etc.)
+            Ok(Some(Err(e))) => {
+                eprintln!("Parse error: {}", e);
+                break;
+            }
+            Ok(None) => break,    // WebSocket closed
+            Err(_) => {}          // timeout — check stop flag and loop
         }
     }
 }
 
-fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &AtomicBool) {
-    use agent_core::types::{NotificationLevel, ServerEvent};
+async fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &AtomicBool) {
+    use agent_core::types::*;
 
     let abs = std::path::Path::new(repo_path);
     let abs = if abs.is_relative() {
@@ -443,40 +537,49 @@ fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &
     };
     let rp = abs.to_string_lossy().to_string();
 
-    let meta = backend.create_tree(
-        None,
-        Some(&rp),
-        None,
-        &[],
-        None,
-        &[],
-        &[],
-    )
-    .unwrap_or_else(|e| exit_err(&e));
-    let sid = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
+    let meta = backend
+        .create_tree(None, Some(&rp), None, &[], None, &[], &[])
+        .await
+        .unwrap_or_else(|e| exit_err(&e));
+    let sid = if meta.id.len() > 8 {
+        &meta.id[..8]
+    } else {
+        &meta.id
+    };
     println!("Created tree {} in {}", sid, rp);
 
-    let mut session = backend.connect_session(&meta.id).unwrap_or_else(|e| exit_err(&e));
-    session.send_message(message).unwrap_or_else(|e| exit_err(&e));
+    let mut session = backend
+        .connect_session(&meta.id)
+        .await
+        .unwrap_or_else(|e| exit_err(&e));
+    session
+        .send_message(message)
+        .await
+        .unwrap_or_else(|e| exit_err(&e));
 
     loop {
         if stop.load(Ordering::Relaxed) {
             println!("\nInterrupted");
             break;
         }
-        match session.next_event() {
-            Some(Ok(ServerEvent::TextChunk { content })) => {
-                print!("{content}");
+        match tokio::time::timeout(Duration::from_millis(200), session.next_event()).await {
+            Ok(Some(Ok(ServerEvent::TextChunk { content }))) => {
+                print!("{}", content);
                 io::stdout().flush().ok();
             }
-            Some(Ok(ServerEvent::Done { status, .. })) if status != "history" => { println!(); break; }
-            Some(Ok(ServerEvent::Done { .. })) => {} // history done, ignore
-            Some(Ok(ServerEvent::Notification { level, message })) => {
-                if level == NotificationLevel::Fatal { exit_err(&message); }
-                else { eprintln!("{message}"); }
+            Ok(Some(Ok(ServerEvent::Done { status, .. }))) if status != "history" => {
+                println!();
+                break;
             }
-            Some(Ok(ServerEvent::Diagnostics { source, files })) => {
-                use agent_core::types::DiagnosticSeverity;
+            Ok(Some(Ok(ServerEvent::Done { .. }))) => {} // history done, ignore
+            Ok(Some(Ok(ServerEvent::Notification { level, message }))) => {
+                if level == NotificationLevel::Fatal {
+                    exit_err(&message);
+                } else {
+                    eprintln!("{}", message);
+                }
+            }
+            Ok(Some(Ok(ServerEvent::Diagnostics { source, files }))) => {
                 for file in &files {
                     for diag in &file.diagnostics {
                         let sev = match diag.severity {
@@ -484,34 +587,52 @@ fn session_and_stream(backend: &Backend, repo_path: &str, message: &str, stop: &
                             Some(DiagnosticSeverity::Warning) => "warning",
                             _ => "info",
                         };
-                        eprintln!("[{}] {}:{}  {}: {}", source, file.path, diag.range.start.line + 1, sev, diag.message);
+                        eprintln!(
+                            "[{}] {}:{}  {}: {}",
+                            source,
+                            file.path,
+                            diag.range.start.line + 1,
+                            sev,
+                            diag.message
+                        );
                     }
                 }
             }
-            Some(Ok(ServerEvent::Entry(entry))) => {
-                print_entry_oneshot(&entry);
+            Ok(Some(Ok(ServerEvent::Entry(entry)))) => {
+                for line in render_entry_lines(&entry) {
+                    println!("{}", line);
+                }
             }
-            Some(Err(e)) => { eprintln!("Parse error: {e}"); break; }
-            _ => {}
+            Ok(Some(Ok(_))) => {} // other events
+            Ok(Some(Err(e))) => {
+                eprintln!("Parse error: {}", e);
+                break;
+            }
+            Ok(None) => break,    // WebSocket closed
+            Err(_) => {}          // timeout — check stop flag and loop
         }
     }
-    
+
     // Listen for MetaUpdate emitted by the worker after auto-title completes.
-    use client::TryEvent;
-    session.set_nonblocking(true).ok();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if stop.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
+        if stop.load(Ordering::Relaxed) || tokio::time::Instant::now() >= deadline {
             break;
         }
-        match session.try_next_event() {
-            TryEvent::Event(ServerEvent::MetaUpdate { title: Some(t), .. }) => {
+        match tokio::time::timeout(Duration::from_millis(100), session.next_event()).await {
+            Ok(Some(Ok(ServerEvent::MetaUpdate {
+                title: Some(t), ..
+            }))) => {
                 println!("\nTitle: {}", t);
                 break;
             }
-            TryEvent::Event(_) => continue,
-            TryEvent::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(100)),
-            TryEvent::Closed | TryEvent::Err(_) => break,
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(e))) => {
+                eprintln!("Parse error: {}", e);
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {} // timeout, loop
         }
     }
 }

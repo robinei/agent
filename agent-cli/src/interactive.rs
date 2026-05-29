@@ -1,17 +1,24 @@
 //! Interactive TUI loop for the agent CLI.
+//!
+//! Uses a single `tokio::select!` over:
+//! - `crossterm::event::EventStream` (terminal input)
+//! - `WebSocketStream::next()` (incoming server events)
+//! - 16 ms render tick (ratatui draw)
+//!
+//! No `nix::poll`, no blocking I/O, no explicit fd tracking.
 
-use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use futures_util::{SinkExt, StreamExt};
 use ratatui::text::{Line, Span};
+use tokio_tungstenite::tungstenite::Message;
 
 use agent_core::types::{
     ContextStatus, Entry, MessageContent, MessageRole, NotificationLevel, ServerEvent,
 };
 
 use crate::app::{AppMode, AppState, CreateTreeStep, HistoryItem};
-use crate::client::{AgentSession, TryEvent};
 use crate::markdown::MarkdownEmitter;
 use crate::tui::{App, AppEvent};
 use crate::Backend;
@@ -336,51 +343,21 @@ fn apply_entry(entry: &Entry, state: &mut AppState) {
     }
 }
 
-// ── Blocking wait on WS fds + stdin ──────────────────────────────────────
-
-#[cfg(unix)]
-fn wait_for_event(ws_fds: &[RawFd], timeout: Duration) {
-    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-    use std::os::unix::io::BorrowedFd;
-    let pt = PollTimeout::from(timeout.as_millis().min(u16::MAX as u128) as u16);
-    // Poll WS fds + stdin so we wake on either network data or a keypress.
-    let all_fds: Vec<RawFd> = std::iter::once(0).chain(ws_fds.iter().copied()).collect();
-    let mut pfds: Vec<PollFd> = all_fds.iter()
-        .map(|&fd| unsafe { PollFd::new(BorrowedFd::borrow_raw(fd), PollFlags::POLLIN) })
-        .collect();
-    let _ = poll(&mut pfds, pt);
-}
-
-#[cfg(not(unix))]
-fn wait_for_event(_ws_fds: &[RawFd], timeout: Duration) {
-    std::thread::sleep(timeout);
-}
-
 // ── Streaming session state ───────────────────────────────────────────────
 
 struct StreamingState {
-    session: AgentSession,
-    ws_fds: Vec<RawFd>,
-    cancel_signalled: bool,
     last_tool_args: Option<(String, serde_json::Value)>,
     last_spinner: Instant,
     md: MarkdownEmitter,
 }
 
 impl StreamingState {
-    fn start(backend: &Backend, tree_id: &str, text: &str) -> Result<Self, String> {
-        let mut session = backend.connect_session(tree_id).map_err(|e| e.to_string())?;
-        session.set_nonblocking(true)?;
-        session.send_message(text).map_err(|e| e.to_string())?;
-        let ws_fds = session.as_raw_fd().into_iter().collect();
-        Ok(Self {
-            session,
-            ws_fds,
-            cancel_signalled: false,
+    fn new() -> Self {
+        Self {
             last_tool_args: None,
             last_spinner: Instant::now(),
             md: MarkdownEmitter::new(),
-        })
+        }
     }
 }
 
@@ -408,69 +385,25 @@ fn handle_nav_event(event: AppEvent, state: &mut AppState, app: &mut App) -> Res
     Ok(true)
 }
 
-// ── History replay ────────────────────────────────────────────────────────
-
-fn replay_entries(
-    backend: &Backend,
-    tree_id: &str,
-    state: &mut AppState,
-    persistent: &mut PersistentCounters,
-) -> Result<(), String> {
-    let mut session = backend.connect_session(tree_id).map_err(|e| e.to_string())?;
-    session.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let ws_fds: Vec<RawFd> = session.as_raw_fd().into_iter().collect();
-    let mut dummy_streaming = StreamingState {
-        session,
-        ws_fds: ws_fds.clone(),
-        cancel_signalled: false,
-        last_tool_args: None,
-        last_spinner: Instant::now(),
-        md: MarkdownEmitter::new(),
-    };
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-
-    loop {
-        loop {
-            match dummy_streaming.session.try_next_event() {
-                TryEvent::Event(ServerEvent::Done { status, .. }) if status == "history" => {
-                    return Ok(());
-                }
-                TryEvent::Event(ev) => {
-                    // Use a dummy width for replay; cache will be re-rendered on first draw.
-                    apply_event(&ev, state, &mut dummy_streaming, persistent, 80);
-                }
-                TryEvent::WouldBlock => break,
-                TryEvent::Closed | TryEvent::Err(_) => return Ok(()),
-            }
-        }
-
-        if std::time::Instant::now() >= deadline { break; }
-
-        let ms = deadline.saturating_duration_since(std::time::Instant::now()).as_millis().min(200) as u64;
-        wait_for_event(&ws_fds, Duration::from_millis(ms));
-    }
-    Ok(())
-}
-
 // ── Tree selection ────────────────────────────────────────────────────────
 
-fn select_or_create_tree(
+async fn select_or_create_tree(
     app: &mut App,
     state: &mut AppState,
     backend: &Backend,
 ) -> Result<String, String> {
     loop {
-        let trees = backend.list_trees().map_err(|e| e.to_string())?;
+        let trees = backend.list_trees().await.map_err(|e| e.to_string())?;
 
         if trees.is_empty() {
-            return create_tree_interactive(app, state, backend);
+            return create_tree_interactive(app, state, backend).await;
         }
 
         state.mode = AppMode::SelectTree { trees: trees.clone(), selected: 0 };
         app.draw(state).map_err(|e| e.to_string())?;
 
         loop {
-            match app.poll_event(state, Duration::from_millis(16))
+            match app.poll_event_blocking(state, Duration::from_millis(16))
                 .map_err(|e| e.to_string())?
             {
                 Some(AppEvent::SelectUp) => {
@@ -494,7 +427,7 @@ fn select_or_create_tree(
                 }
                 Some(AppEvent::NewTree) => {
                     state.mode = AppMode::Chat;
-                    return create_tree_interactive(app, state, backend);
+                    return create_tree_interactive(app, state, backend).await;
                 }
                 Some(AppEvent::Cancel) => {
                     return Err("quit".into());
@@ -505,7 +438,7 @@ fn select_or_create_tree(
     }
 }
 
-fn create_tree_interactive(
+async fn create_tree_interactive(
     app: &mut App,
     state: &mut AppState,
     backend: &Backend,
@@ -529,7 +462,7 @@ fn create_tree_interactive(
         app.draw(state).map_err(|e| e.to_string())?;
 
         let value = loop {
-            match app.poll_event(state, Duration::from_millis(16))
+            match app.poll_event_blocking(state, Duration::from_millis(16))
                 .map_err(|e| e.to_string())?
             {
                 Some(AppEvent::Confirm) => {
@@ -564,12 +497,12 @@ fn create_tree_interactive(
         None,
         &[],
         &[],
-    ).map_err(|e| e.to_string())?;
+    ).await.map_err(|e| e.to_string())?;
 
     state.mode = AppMode::Chat;
     let short_id = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
     state.push_history(HistoryItem::Info(format!(
-        "Created tree {} ({})", short_id, meta.title.as_deref().unwrap_or("untitled")
+        "Created tree {} ({})", short_id, meta.title.as_deref().unwrap_or("untitled"),
     )));
     state.scroll_to_bottom();
 
@@ -578,7 +511,7 @@ fn create_tree_interactive(
 
 // ── Main entry point ──────────────────────────────────────────────────────
 
-pub fn run_interactive(
+pub async fn run_interactive(
     backend: &Backend,
     initial_repo_path: Option<String>,
     stop: &AtomicBool,
@@ -601,6 +534,7 @@ pub fn run_interactive(
         let rp_str = abs.to_string_lossy().to_string();
 
         let meta = backend.create_tree(Some("untitled"), Some(&rp_str), None, &[], None, &[], &[])
+            .await
             .map_err(|e| format!("failed to create tree: {}", e))?;
         let short_id = if meta.id.len() > 8 { &meta.id[..8] } else { &meta.id };
         state.push_history(HistoryItem::Info(format!("Created tree {} in {}", short_id, rp_str)));
@@ -608,7 +542,7 @@ pub fn run_interactive(
         app.draw(&mut state).map_err(|e| e.to_string())?;
         meta.id
     } else {
-        match select_or_create_tree(&mut app, &mut state, backend) {
+        match select_or_create_tree(&mut app, &mut state, backend).await {
             Ok(id) => id,
             Err(e) if e == "quit" => {
                 app.teardown().ok();
@@ -618,7 +552,8 @@ pub fn run_interactive(
         }
     };
 
-    match backend.get_tree(&current_tree_id) {
+    // Show tree info
+    match backend.get_tree(&current_tree_id).await {
         Ok(meta) => {
             let title = meta.title.as_deref().unwrap_or("untitled");
             let short_id = if current_tree_id.len() > 8 { &current_tree_id[..8] } else { &current_tree_id };
@@ -634,207 +569,214 @@ pub fn run_interactive(
         }
     }
 
-    if let Err(e) = replay_entries(backend, &current_tree_id, &mut state, &mut persistent) {
-        state.push_history(HistoryItem::Notification {
-            level: NotificationLevel::Warning,
-            message: format!("Failed to load history: {}", e),
-        });
-        state.scroll_to_bottom();
+    // ── Establish persistent WebSocket connection ────────────────────────
+    //
+    // We keep one WS connection alive for the entire interactive session.
+    // Split it into read/write halves so the select! loop can poll the read
+    // half while the terminal handler writes through the write half.
+
+    let mut session = backend
+        .connect_session(&current_tree_id)
+        .await
+        .map_err(|e| format!("connect session: {}", e))?;
+
+    // Replay history: drain the initial `GetEntries` replay stream.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut replay_md = MarkdownEmitter::new();
+    let mut replay_state = StreamingState {
+        last_tool_args: None,
+        last_spinner: Instant::now(),
+        md: MarkdownEmitter::new(),
+    };
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        match tokio::time::timeout(Duration::from_millis(200), session.next_event()).await {
+            Ok(Some(Ok(ServerEvent::Done { status, .. }))) if status == "history" => break,
+            Ok(Some(Ok(ev))) => {
+                apply_event(&ev, &mut state, &mut replay_state, &mut persistent, 80);
+            }
+            Ok(Some(Err(e))) => {
+                eprintln!("Replay parse error: {}", e);
+                break;
+            }
+            Ok(None) => break,  // WS closed
+            Err(_) => {}        // timeout, loop
+        }
     }
     app.draw(&mut state).map_err(|e| e.to_string())?;
 
-    // ── Unified event loop ────────────────────────────────────────────────
-    //
-    // Each iteration:
-    //   1. wait_for_event: blocks on WS fds + stdin until data arrives or
-    //      the next spinner tick is due (idle: 16 ms so input stays snappy).
-    //   2. Drain all pending WS events.
-    //   3. Drain all pending input events.
-    //   4. Advance spinner (time-based).
-    //   5. Draw once.
+    // Split the WS stream into read/write halves for the select! loop.
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut ws_write, mut ws_read) = session.ws.split();
 
+    // ── "Are we waiting for a response?" state ───────────────────────────
     let mut streaming: Option<StreamingState> = None;
+    let mut ws_open = true;
+
+    // ── Terminal event stream ────────────────────────────────────────────
+    let mut term = crossterm::event::EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(16));
 
     loop {
+        // Check for external stop signal (Ctrl+C from the binary-level handler).
         if stop.load(Ordering::Relaxed) {
-            if let Some(ref mut s) = streaming {
-                if !s.cancel_signalled {
-                    let _ = s.session.send_stop();
-                }
+            if streaming.is_some() {
+                // Send stop to the worker.
+                let cmd = serde_json::to_string(&agent_core::rpc::WsCommand::Stop).unwrap();
+                let _ = ws_write.send(Message::Text(cmd.into())).await;
             } else {
-                state.push_history(HistoryItem::Notification {
-                    level: NotificationLevel::Warning,
-                    message: "Interrupted".into(),
-                });
-                state.scroll_to_bottom();
-                app.draw(&mut state).ok();
-                break;
+                break; // idle + Ctrl+C → quit
             }
         }
 
-        // 1. Wait: block on WS fds + stdin together.
-        let ws_fds: &[RawFd] = streaming.as_ref().map(|s| s.ws_fds.as_slice()).unwrap_or(&[]);
-        let timeout = if streaming.is_some() {
-            let elapsed = streaming.as_ref().unwrap().last_spinner.elapsed();
-            SPINNER_INTERVAL.saturating_sub(elapsed).max(Duration::from_millis(1))
-        } else {
-            Duration::from_millis(16)
-        };
-        wait_for_event(ws_fds, timeout);
-
-        // 2. Drain WS events.
-        let mut became_done = false;
-        if let Some(ref mut s) = streaming {
-            let width = app.width();
-            loop {
-                match s.session.try_next_event() {
-                    TryEvent::Event(ev) => {
-                        let skip = matches!(&ev, ServerEvent::Entry(_))
-                            || matches!(&ev, ServerEvent::Done { status, .. } if status == "history");
-                        if skip { continue; }
-
-                        let is_done = matches!(&ev, ServerEvent::Done { .. });
-                        let is_fatal = matches!(&ev, ServerEvent::Notification {
-                            level: NotificationLevel::Fatal, ..
-                        });
-                        apply_event(&ev, &mut state, s, &mut persistent, width);
-                        if is_done || is_fatal {
-                            became_done = true;
-                            break;
-                        }
-                    }
-                    TryEvent::Closed => {
-                        // Connection closed without Done — finalize whatever we have.
-                        let width = app.width();
-                        if state.active.is_some() {
-                            let active = state.active.as_mut().unwrap();
-                            let _ = s.md.flush(&mut |spans| { active.push_content_spans(spans); Ok(()) }, width as usize);
-                            state.finalize_active();
-                        }
-                        became_done = true;
-                        break;
-                    }
-                    TryEvent::Err(e) => {
-                        state.push_history(HistoryItem::Notification {
-                            level: NotificationLevel::Error,
-                            message: format!("ws error: {}", e),
-                        });
-                        state.scroll_to_bottom();
-                        became_done = true;
-                        break;
-                    }
-                    TryEvent::WouldBlock => break,
-                }
-            }
-        }
-        if became_done {
-            streaming = None;
-            state.spinner_active = false;
-            build_status(&mut state, &persistent);
+        if !ws_open {
+            break;
         }
 
-        // 3. Drain all pending input events.
-        loop {
-            match app.poll_event(&mut state, Duration::ZERO).map_err(|e| e.to_string())? {
-                Some(AppEvent::Submit(text)) if streaming.is_none() => {
-                    if !text.is_empty() && input_history.last().map(|s| s.as_str()) != Some(&text) {
-                        input_history.push(text.clone());
-                    }
-                    history_idx = None;
+        let width = app.width();
 
-                    state.push_history(HistoryItem::User(text.clone()));
-                    state.scroll_to_bottom();
+        // ── Single select! over all event sources ────────────────────────
+        tokio::select! {
+            biased; // prioritise terminal input for snappy UI
 
-                    match StreamingState::start(backend, &current_tree_id, &text) {
-                        Ok(s) => {
-                            state.spinner_active = true;
-                            build_status(&mut state, &persistent);
-                            streaming = Some(s);
-                        }
-                        Err(e) => {
-                            state.push_history(HistoryItem::Notification {
-                                level: NotificationLevel::Error,
-                                message: e,
-                            });
-                            state.scroll_to_bottom();
-                        }
-                    }
-                }
+            // Terminal events (keyboard, mouse, resize)
+            term_event = term.next() => {
+                match term_event {
+                    Some(Ok(ev)) => {
+                        let mut consumed = false;
 
-                Some(AppEvent::Cancel) => {
-                    if let Some(ref mut s) = streaming {
-                        if !s.cancel_signalled {
-                            s.cancel_signalled = true;
-                            state.push_history(HistoryItem::Notification {
-                                level: NotificationLevel::Info,
-                                message: "⏸ Cancelling…".into(),
-                            });
-                            state.scroll_to_bottom();
-                            let _ = s.session.send_stop();
-                        }
-                    } else {
-                        // Ctrl-C while idle → quit
-                        app.teardown().ok();
-                        return Ok(());
-                    }
-                }
+                        // Try navigation/history events first (they apply immediately).
+                        if let Some(app_event) = app.handle_chat_event_raw(&ev) {
+                            let is_submit = matches!(&app_event, AppEvent::Submit(_));
+                            consumed = handle_nav_event(app_event.clone(), &mut state, &mut app)
+                                .unwrap_or(false);
 
-                Some(AppEvent::HistoryPrev) if streaming.is_none() => {
-                    if !input_history.is_empty() {
-                        match history_idx {
-                            None => {
-                                history_draft = app.textarea.lines().join("\n");
-                                history_idx = Some(input_history.len() - 1);
+                            if is_submit && streaming.is_none() {
+                                // User pressed Enter — get the text and send it.
+                                let text = app.textarea.lines().join("\n");
+                                let text = text.trim().to_string();
+                                if !text.is_empty() {
+                                    if input_history.last().map(|s| s.as_str()) != Some(&text) {
+                                        input_history.push(text.clone());
+                                    }
+                                    history_idx = None;
+
+                                    state.push_history(HistoryItem::User(text.clone()));
+                                    state.scroll_to_bottom();
+
+                                    // Send via WS.
+                                    let cmd = agent_core::rpc::WsCommand::Message {
+                                        params: agent_core::rpc::MessageParams { text: text.clone() },
+                                    };
+                                    let s = serde_json::to_string(&cmd).unwrap();
+                                    if ws_write.send(Message::Text(s.into())).await.is_err() {
+                                        ws_open = false;
+                                        break;
+                                    }
+
+                                    state.spinner_active = true;
+                                    streaming = Some(StreamingState::new());
+                                    build_status(&mut state, &mut persistent);
+
+                                    // Clear textarea.
+                                    app.textarea = tui_textarea::TextArea::default();
+                                    app.textarea.set_cursor_line_style(ratatui::style::Style::default());
+                                    app.textarea.set_placeholder_text("Type a message… (Enter to send, Shift+Enter for newline)");
+                                }
+                            } else if matches!(&app_event, AppEvent::Cancel) {
+                                if streaming.is_some() {
+                                    // Send stop command.
+                                    let cmd = serde_json::to_string(&agent_core::rpc::WsCommand::Stop).unwrap();
+                                    let _ = ws_write.send(Message::Text(cmd.into())).await;
+                                    state.push_history(HistoryItem::Notification {
+                                        level: NotificationLevel::Info,
+                                        message: "⏸ Cancelling…".into(),
+                                    });
+                                    state.scroll_to_bottom();
+                                } else {
+                                    // Idle Ctrl+C → quit.
+                                    break;
+                                }
                             }
-                            Some(0) => {}
-                            Some(ref mut i) => *i = i.saturating_sub(1),
                         }
-                        if let Some(i) = history_idx {
-                            app.textarea = tui_textarea::TextArea::from(
-                                input_history[i].lines().map(String::from).collect::<Vec<_>>()
-                            );
-                            app.textarea.set_cursor_line_style(ratatui::style::Style::default());
+
+                        if !consumed {
+                            // Let the textarea process the key.
+                            app.handle_textarea_input(&ev);
                         }
                     }
+                    Some(Err(e)) => {
+                        eprintln!("Terminal event error: {}", e);
+                        break;
+                    }
+                    None => break,
                 }
+            }
 
-                Some(AppEvent::HistoryNext) if streaming.is_none() => {
-                    match history_idx {
-                        None => {}
-                        Some(i) if i + 1 >= input_history.len() => {
-                            history_idx = None;
-                            app.textarea = tui_textarea::TextArea::from(
-                                history_draft.lines().map(String::from).collect::<Vec<_>>()
-                            );
-                            app.textarea.set_cursor_line_style(ratatui::style::Style::default());
-                        }
-                        Some(ref mut i) => {
-                            *i += 1;
-                            let idx = *i;
-                            app.textarea = tui_textarea::TextArea::from(
-                                input_history[idx].lines().map(String::from).collect::<Vec<_>>()
-                            );
-                            app.textarea.set_cursor_line_style(ratatui::style::Style::default());
+            // WebSocket events (server responses)
+            ws_msg = ws_read.next() => {
+                match ws_msg {
+                    Some(Ok(Message::Text(s))) => {
+                        match serde_json::from_str::<ServerEvent>(&s) {
+                            Ok(ev) => {
+                                let is_done = matches!(&ev, ServerEvent::Done { .. });
+                                let is_fatal = matches!(&ev, ServerEvent::Notification {
+                                    level: NotificationLevel::Fatal, ..
+                                });
+
+                                // Skip replay entries in the live stream (applied by replay above).
+                                if !matches!(&ev, ServerEvent::Done { status, .. } if status == "history") {
+                                    if let Some(ref mut s) = streaming {
+                                        apply_event(&ev, &mut state, s, &mut persistent, width);
+                                    } else {
+                                        // Events arriving without an active turn (e.g. MetaUpdate)
+                                        let mut dummy = StreamingState::new();
+                                        apply_event(&ev, &mut state, &mut dummy, &mut persistent, width);
+                                    }
+                                }
+
+                                if is_done {
+                                    streaming = None;
+                                    state.spinner_active = false;
+                                    build_status(&mut state, &mut persistent);
+                                } else if is_fatal {
+                                    streaming = None;
+                                    state.spinner_active = false;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("WS parse error: {}", e);
+                            }
                         }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws_write.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        ws_open = false;
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("WS error: {}", e);
+                        ws_open = false;
+                    }
+                    _ => {} // binary messages, etc.
                 }
+            }
 
-                Some(ev) => { handle_nav_event(ev, &mut state, &mut app)?; }
-
-                None => break,
+            // Render tick (60 fps)
+            _ = tick.tick() => {
+                // Spinner advance
+                if let Some(ref mut s) = streaming {
+                    if s.last_spinner.elapsed() >= SPINNER_INTERVAL {
+                        state.spinner_frame = (state.spinner_frame + 1) % 10;
+                        s.last_spinner = Instant::now();
+                    }
+                }
+                let _ = app.draw(&mut state);
             }
         }
-
-        // 4. Advance spinner (time-based).
-        if let Some(ref mut s) = streaming {
-            if s.last_spinner.elapsed() >= SPINNER_INTERVAL {
-                state.spinner_frame = (state.spinner_frame + 1) % 10;
-                s.last_spinner = Instant::now();
-            }
-        }
-
-        // 5. Draw.
-        app.draw(&mut state).map_err(|e| e.to_string())?;
     }
 
     app.teardown().ok();
